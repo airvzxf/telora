@@ -26,7 +26,23 @@
 ## Core & Stability (Developer & DevOps).
 - [ ] **Modernize IPC**: Replace custom text-based protocol with a structured format (JSON-RPC or Varlink) to support metadata (confidence, durat
 ion, latency).
-- [ ] **Hardware Fallback**: Implement automatic CPU fallback if CUDA initialization fails or is unavailable.
+- [ ] **Implement Launcher Architecture for Hardware Backends**:
+    - [ ] **Phase 1: Launcher Implementation**:
+        - [ ] Rename the current `telora-daemon` to `telora-daemon-cpu` to serve as the base backend.
+        - [ ] Create a new `telora-daemon` binary to act as the lightweight launcher.
+        - [ ] Implement hardware detection, backend downloader (with security checksums), and fallback logic in the launcher.
+    - [ ] **Phase 2: Backend Implementation**:
+        - [ ] **NVIDIA Backend (CUDA)**:
+            - [ ] Refactor the existing CUDA implementation into its own `feature flag` to compile a dedicated `telora-daemon-cuda` binary.
+        - [ ] **Intel Backend (OpenVINO)**:
+            - [ ] Investigate requirements for compiling `whisper-rs` with the OpenVINO backend.
+            - [ ] Create an `openvino` `feature flag` and the necessary configuration to compile the `telora-daemon-openvino` binary.
+        - [ ] **AMD Backend (ROCm)**:
+            - [ ] Investigate requirements for compiling `whisper-rs` with the `hipblas` `feature flag` (ROCm).
+            - [ ] Create a `rocm` `feature flag` to compile the `telora-daemon-rocm` binary.
+    - [ ] **Phase 3: Integration & CI/CD**:
+        - [ ] Update the launcher to recognize and manage all new backends.
+        - [ ] Configure the CI/CD pipeline to build all binaries (launcher, cpu, cuda, openvino, rocm) and publish them as release assets with a checksum manifest.
 
 ## Security & Performance (SecOps & Enthusiast)
 - [ ] **Process Sandboxing**: Use `Landlock` or `seccomp` to restrict the daemon's access to only necessary files/directories.
