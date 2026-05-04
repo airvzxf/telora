@@ -8,7 +8,7 @@
 ## Features
 - [ ] **Continuous Dictation Mode**: A mode where the daemon transcribes in real-time without manual toggling.
 - [ ] **Multi-language Auto-detection**: Leverage Whisper's language detection capabilities.
-- [ ] **Architecture Refactor**: Move core logic from `telora-daemon/src/main.rs` to a `lib.rs` and implement a `Transcriber` trait for future engine support.
+- [x] **Architecture Refactor**: Move core logic from `telora-daemon/src/main.rs` to a `lib.rs` and implement a `Transcriber` trait for future engine support.
 
 ## UI/UX
 - [ ] **Tray Icon**: Add a system tray icon for status monitoring and quick settings.

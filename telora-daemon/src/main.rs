@@ -15,7 +15,7 @@ mod vad;
 
 use audio::AudioEngine;
 use socket::{Command, SocketServer, StatusResponse, SttConfig};
-use transcriber::Transcriber;
+use transcriber::{Transcriber, WhisperTranscriber};
 
 // Config references
 const SOCKET_PATH: &str = "/tmp/telora-sock";
@@ -293,8 +293,9 @@ async fn main() -> Result<()> {
     info!("Language: {}", stt_config.language);
 
     // 1. Initialize Components
-    let mut transcriber =
-        Transcriber::new(&stt_config.model_path).context("Failed to load Whisper model")?;
+    let mut transcriber: Box<dyn Transcriber> = Box::new(
+        WhisperTranscriber::new(&stt_config.model_path).context("Failed to load Whisper model")?,
+    );
 
     // Audio Engine initialization
     let rb = HeapRb::<f32>::new(16000 * 30); // 30 seconds buffer
@@ -388,9 +389,9 @@ async fn main() -> Result<()> {
 
                     if reload_transcriber {
                         info!("Model path changed, reloading transcriber...");
-                        match Transcriber::new(&stt_config.model_path) {
+                        match WhisperTranscriber::new(&stt_config.model_path) {
                             Ok(new_transcriber) => {
-                                transcriber = new_transcriber;
+                                transcriber = Box::new(new_transcriber);
                                 info!("Transcriber reloaded successfully.");
                                 let _ = response_tx.send(Ok(()));
                             }

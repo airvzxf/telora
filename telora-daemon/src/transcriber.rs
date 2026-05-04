@@ -3,11 +3,15 @@ use log::info;
 use std::path::Path;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-pub struct Transcriber {
+pub trait Transcriber: Send {
+    fn transcribe(&mut self, audio_data: &[f32], language: Option<&str>) -> Result<String>;
+}
+
+pub struct WhisperTranscriber {
     ctx: WhisperContext,
 }
 
-impl Transcriber {
+impl WhisperTranscriber {
     pub fn new(model_path: &str) -> Result<Self> {
         if !Path::new(model_path).exists() {
             return Err(anyhow!("Model file not found: {}", model_path));
@@ -22,8 +26,10 @@ impl Transcriber {
         info!("Whisper model loaded successfully.");
         Ok(Self { ctx })
     }
+}
 
-    pub fn transcribe(&mut self, audio_data: &[f32], language: Option<&str>) -> Result<String> {
+impl Transcriber for WhisperTranscriber {
+    fn transcribe(&mut self, audio_data: &[f32], language: Option<&str>) -> Result<String> {
         let mut state = self
             .ctx
             .create_state()
