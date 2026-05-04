@@ -26,17 +26,6 @@ impl SocketClient {
             .context("Failed to read response from daemon")?;
         Ok(String::from_utf8_lossy(&buf).to_string())
     }
-
-    pub async fn send_control_command(cmd: &str) -> Result<()> {
-        let mut stream = UnixStream::connect(CONTROL_SOCKET)
-            .await
-            .context("Failed to connect to control socket (is the GUI running?)")?;
-        stream
-            .write_all(cmd.as_bytes())
-            .await
-            .context("Failed to send control command")?;
-        Ok(())
-    }
 }
 
 pub struct ControlServer {
@@ -48,6 +37,7 @@ impl ControlServer {
         if Path::new(CONTROL_SOCKET).exists() {
             let _ = std::fs::remove_file(CONTROL_SOCKET);
         }
+
         let listener =
             UnixListener::bind(CONTROL_SOCKET).context("Failed to bind control socket")?;
         Ok(Self { listener })

@@ -1,6 +1,7 @@
 [Unit]
 Description=Telora Audio Daemon (Whisper)
-After=network.target
+After=network.target pipewire.service
+Requires=pipewire.service
 
 [Service]
 Type=simple
@@ -9,4 +10,4 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

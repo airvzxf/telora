@@ -14,7 +14,7 @@
 - [ ] **Tray Icon**: Add a system tray icon for status monitoring and quick settings.
 - [ ] **Configuration GUI**: A simple GTK window to edit `telora.toml`.
 - [ ] **Integrated Model Manager**: A GUI for `telora-models` with download progress bars.
-- [ ] **Model Detection UX**: Enhance the client (`telora`) to detect when the daemon fails due to a missing model and provide an interactive dialog to download it via `telora-models`.
+- [ ] **Model Detection UX**: Enhance the GUI client (`telora-gui`) to detect when the daemon fails due to a missing model and provide an interactive dialog to download it via `telora-models`.
 *Focus: Making the tool accessible to everyone, not just power users.*
 - [ ] **Visual Feedback**: Add a VU Meter (audio level indicator) to the OSD while recording.
 

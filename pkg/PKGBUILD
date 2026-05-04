@@ -4,7 +4,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Telora: Professional Speech-to-Text Assistant (Pre-built binaries)"
 arch=('x86_64')
-url="https://github.com/yourusername/telora"
+url="https://github.com/airvzxf/telora"
 license=('MIT')
 depends=('gtk4' 'gtk4-layer-shell' 'alsa-lib' 'gcc-libs')
 makedepends=('make')
@@ -18,7 +18,7 @@ prepare() {
 
 build() {
     cd "$startdir/.."
-    if [ ! -f "bin/telora-daemon" ] || [ ! -f "bin/telora" ] || [ ! -f "bin/telora-models" ]; then
+    if [ ! -f "bin/telora-daemon" ] || [ ! -f "bin/telora-gui" ] || [ ! -f "bin/telora" ] || [ ! -f "bin/telora-models" ]; then
         echo "Binaries not found in bin/. Please run ./scripts/build first."
         return 1
     fi

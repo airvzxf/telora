@@ -5,7 +5,8 @@ Thank you for your interest in improving Telora!
 ## Project Structure
 
 - `telora-daemon`: Rust daemon handling audio input and Whisper transcription (CUDA).
-- `telora`: GTK4 client for UI feedback and control.
+- `telora-gui`: GTK4 client for Wayland OSD overlay, visual feedback and control.
+- `telora-ctl`: CLI control client (binary name: `telora`) for sending commands to the GUI via Unix socket.
 - `telora-models`: Tool for managing Whisper models.
 - `pkg/`: Arch Linux packaging files.
 - `scripts/`: Build and verification scripts.
@@ -30,8 +31,11 @@ You can run the binaries directly from the `bin/` directory after building:
 # Start the daemon
 ./bin/telora-daemon --model ./models/ggml-base.bin
 
-# In another terminal, run the client
-./bin/telora
+# In another terminal, run the GUI client (Wayland OSD overlay)
+./bin/telora-gui
+
+# Use the CLI client to control recording (e.g., from a hotkey)
+./bin/telora toggle-type
 ```
 
 ## Finding Your First Task

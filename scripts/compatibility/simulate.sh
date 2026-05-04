@@ -12,7 +12,7 @@ cleanup() {
     
     # Global cleanup as fallback
     pkill -9 -f "./bin/telora-daemon" 2>/dev/null || true
-    pkill -9 -f "./bin/telora" 2>/dev/null || true
+    pkill -9 -f "./bin/telora-gui" 2>/dev/null || true
     echo "--> Cleanup done."
 }
 
@@ -27,7 +27,7 @@ fi
 echo "--> Starting Full Stack Simulation..."
 
 # Check if binaries exist
-for bin in telora-daemon telora; do
+for bin in telora-daemon telora-gui telora; do
     if [ ! -f "bin/$bin" ]; then
         echo "Error: bin/$bin not found! Build them first with ./scripts/build"
         exit 1
@@ -42,10 +42,10 @@ echo "--> Daemon PID: $DAEMON_PID"
 echo "Wait for daemon (3s)..."
 sleep 3
 
-echo "--> Launching telora..."
-./bin/telora > /dev/null 2>&1 &
+echo "--> Launching telora-gui..."
+./bin/telora-gui > /dev/null 2>&1 &
 CLIENT_PID=$!
-echo "--> Client PID: $CLIENT_PID"
+echo "--> GUI PID: $CLIENT_PID"
 
 echo "Wait for client (1s)..."
 sleep 1

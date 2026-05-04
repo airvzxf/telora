@@ -1,12 +1,13 @@
 # Telora
 
-A professional Speech-to-Text Assistant for Linux, featuring a high-performance Rust daemon using Whisper (CUDA-accelerated) and a lightweight GTK4 client.
+A professional Speech-to-Text Assistant for Linux, featuring a high-performance Rust daemon using Whisper (CUDA-accelerated), a GTK4 Wayland overlay GUI (`telora-gui`), and a CLI control client (`telora`).
 
 ## Features
 
 - **Daemon**: Rust-based, using `whisper-rs` for local, privacy-focused transcription. Now configurable via CLI or TOML.
 - **Model Manager**: Integrated CLI tool to download and manage Whisper models (Tiny, Base, Small, etc.).
-- **Client**: GTK4 Layer Shell interface for seamless desktop integration.
+- **GUI Client (`telora-gui`)**: GTK4 Layer Shell OSD overlay for Wayland, providing visual feedback during recording.
+- **CLI Client (`telora`)**: Lightweight CLI to toggle recording and control the assistant from scripts or hotkeys.
 - **Packaging**: Ready for Arch Linux (PKGBUILD provided).
 - **Multi-Distribution Support**: Verified on Arch, Fedora, and Debian using an automated test matrix.
 
@@ -83,7 +84,7 @@ This method preserves your changes even if the main package updates the service 
 
 ## Client CLI & Controls
 
-The `telora` now supports CLI commands for integration with shortcuts or scripts:
+The `telora` CLI communicates with the `telora-gui` process via a Unix socket. Use it for integration with shortcuts or scripts:
 
 ```bash
 # Toggle recording and TYPE the result
@@ -166,7 +167,7 @@ Start the assistant (this will automatically start the background daemon):
 systemctl --user enable --now telora.service
 ```
 
-The `telora` service manages the UI and requires `telora-daemon` (the audio engine), which systemd will handle for you.
+The `telora` systemd service launches `telora-gui` (the Wayland OSD overlay), which in turn communicates with `telora-daemon` (the audio engine). Systemd handles both for you.
 
 ## Development
 

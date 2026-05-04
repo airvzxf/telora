@@ -21,10 +21,11 @@ mkdir -p bin
 # Extract the binaries
 echo "--> Extracting binaries to ./bin/"
 $CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-daemon" > bin/telora-daemon
+$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-gui" > bin/telora-gui
 $CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora" > bin/telora
 $CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-models" > bin/telora-models
 
-chmod +x bin/telora-daemon bin/telora bin/telora-models
+chmod +x bin/telora-daemon bin/telora-gui bin/telora bin/telora-models
 
 echo "--> Build complete!"
 echo "--> Binaries are in ./bin/"

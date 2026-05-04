@@ -10,9 +10,9 @@ Type=simple
 #   vkQueuePresentKHR(): A swapchain no longer matches the surface properties exactly,
 #   but can still be used to present to the surface successfully. (VK_SUBOPTIMAL_KHR) (1000001003)
 Environment=GSK_RENDERER=gl
-ExecStart=/usr/bin/telora
+ExecStart=/usr/bin/telora-gui
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=graphical-session.target

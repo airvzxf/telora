@@ -2540,14 +2540,9 @@ name = "telora"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-channel",
  "clap",
  "env_logger",
- "gtk4",
- "gtk4-layer-shell",
  "log",
- "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -2570,6 +2565,21 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "whisper-rs",
+]
+
+[[package]]
+name = "telora-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "env_logger",
+ "gtk4",
+ "gtk4-layer-shell",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,8 +1,10 @@
 use async_channel::Sender;
-use clap::{Parser, Subcommand};
 use gtk4::prelude::*;
 use gtk4::{Application, glib};
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -15,21 +17,45 @@ mod ui;
 use connection::{ControlServer, SocketClient};
 use ui::Osd;
 
-#[derive(Parser)]
-#[command(author, version, about = "Telora Client - GUI and Control CLI", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
+fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
+    let xdg_runtime_dir =
+        std::env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR is not set".to_string())?;
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Toggle recording and type the result
-    ToggleType,
-    /// Toggle recording and copy the result to clipboard
-    ToggleCopy,
-    /// Cancel current recording
-    Cancel,
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
+
+    let socket_path = Path::new(&xdg_runtime_dir).join(&display);
+
+    let start = Instant::now();
+    let mut attempt: u32 = 0;
+
+    loop {
+        if let Ok(meta) = std::fs::metadata(&socket_path)
+            && meta.file_type().is_socket()
+        {
+            info!("Wayland display ready at {}", socket_path.display());
+            return Ok(());
+        }
+
+        let elapsed = start.elapsed().as_secs();
+        if elapsed >= max_wait_secs {
+            return Err(format!(
+                "Wayland display {} not available after {}s",
+                socket_path.display(),
+                elapsed
+            ));
+        }
+
+        attempt += 1;
+        let delay = (1u64 << attempt).min(10); // 1, 2, 4, 8, 10, 10, ...
+        let remaining = max_wait_secs.saturating_sub(elapsed);
+        let wait = delay.min(remaining);
+
+        info!(
+            "Waiting for Wayland compositor (attempt {})... retrying in {}s",
+            attempt, wait
+        );
+        thread::sleep(Duration::from_secs(wait));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,25 +77,43 @@ enum DaemonCommand {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "\
+telora-gui — Telora Assistant UI (Wayland overlay)
+
+USAGE:
+    telora-gui
+
+DESCRIPTION:
+    Displays an OSD overlay on Wayland using the Layer Shell protocol.
+    It listens for control commands via Unix socket and relays them to
+    the telora-daemon for audio transcription.
+
+    This binary is normally launched by systemd as a user service and
+    controlled via the `telora` CLI client.
+
+SOCKETS:
+    Control (listen):  /tmp/telora-control.sock
+    Daemon (connect):  /tmp/telora-sock
+
+ENVIRONMENT:
+    WAYLAND_DISPLAY     Wayland socket name (default: wayland-0)
+    XDG_RUNTIME_DIR     Runtime directory for Wayland socket
+    GSK_RENDERER        GTK render backend (set to \"gl\" by systemd service)
+    RUST_LOG            Log filter (default: info)
+
+SEE ALSO:
+    telora(1), telora-daemon(1), telora.service(5)"
+        );
+        std::process::exit(0);
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
-
-    if let Some(command) = cli.command {
-        let cmd_str = match command {
-            Commands::ToggleType => "TOGGLE_TYPE",
-            Commands::ToggleCopy => "TOGGLE_COPY",
-            Commands::Cancel => "CANCEL",
-        };
-
-        let rt = Runtime::new().expect("Failed to create Tokio runtime");
-        rt.block_on(async {
-            match SocketClient::send_control_command(cmd_str).await {
-                Ok(_) => info!("Command '{}' sent successfully.", cmd_str),
-                Err(e) => log::error!("Failed to send command: {}", e),
-            }
-        });
-        return;
+    if let Err(e) = wait_for_wayland_display(60) {
+        log::error!("{}", e);
+        std::process::exit(1);
     }
 
     // Initialize GTK Application

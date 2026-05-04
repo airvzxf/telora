@@ -40,22 +40,24 @@ WORKDIR /app
 # 2. DEPENDENCIES: Manifests
 COPY Cargo.toml Cargo.lock ./
 COPY telora-daemon/Cargo.toml ./telora-daemon/
-COPY telora/Cargo.toml ./telora/
+COPY telora-gui/Cargo.toml ./telora-gui/
+COPY telora-ctl/Cargo.toml ./telora-ctl/
 COPY telora-models/Cargo.toml ./telora-models/
 
 # 3. CACHE: Compile dependencies with dummy sources
-RUN mkdir -p telora-daemon/src telora/src telora-models/src && \
+RUN mkdir -p telora-daemon/src telora-gui/src telora-ctl/src telora-models/src && \
     echo "fn main() {}" > telora-daemon/src/main.rs && \
-    echo "fn main() {}" > telora/src/main.rs && \
+    echo "fn main() {}" > telora-gui/src/main.rs && \
+    echo "fn main() {}" > telora-ctl/src/main.rs && \
     echo "fn main() {}" > telora-models/src/main.rs && \
     cargo build --release --workspace && \
-    rm -rf telora-daemon/src telora/src telora-models/src
+    rm -rf telora-daemon/src telora-gui/src telora-ctl/src telora-models/src
 
 # 4. SOURCE: Copy entire project context
 COPY . .
 
 # 5. BUILD: Final compilation
-RUN touch telora-daemon/src/main.rs telora/src/main.rs telora-models/src/main.rs && \
+RUN touch telora-daemon/src/main.rs telora-gui/src/main.rs telora-ctl/src/main.rs telora-models/src/main.rs && \
     cargo clippy --release --workspace -- -D warnings && \
     cargo build --release --workspace
 
@@ -78,6 +80,7 @@ COPY --from=builder \
     /usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so* \
     /usr/lib/x86_64-linux-gnu/girepository-1.0/Gtk4LayerShell-1.0.typelib \
     /app/target/release/telora-daemon \
+    /app/target/release/telora-gui \
     /app/target/release/telora \
     /app/target/release/telora-models \
     /tmp/artifacts/
