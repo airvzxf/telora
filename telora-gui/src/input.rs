@@ -1,18 +1,43 @@
-use log::{error, info};
+use log::{error, info, warn};
 use std::process::Command;
 
-pub fn type_text(text: &str) {
+use super::config::GuiConfig;
+
+pub fn type_text(text: &str, config: &GuiConfig) {
     if text.trim().is_empty() {
         return;
     }
 
-    // wtype
-    let res = Command::new("wtype").arg(text).output();
+    info!(
+        "Typing text via clipboard paste flow ({} chars)",
+        text.chars().count()
+    );
 
-    match res {
+    // Primary path: put the text in the clipboard, simulate the configured
+    // paste shortcut (per-app override or default), then restore whatever
+    // was there before. This is more reliable than wtype's
+    // character-by-character synthesis (which mangles non-ASCII, dead keys,
+    // IMEs, etc.) and preserves the user's prior clipboard contents.
+    super::clipboard::paste_text_via_clipboard(text, config);
+
+    // If wtype is missing entirely (e.g. minimal Wayland setups), the new
+    // function logs a warning and the text stays in the clipboard, so the
+    // user can paste it manually. Nothing more to do.
+}
+
+/// Backwards-compatible direct fallback for callers that specifically want
+/// character-by-character synthesis instead of the clipboard round-trip.
+/// Kept private to the module so it doesn't grow stale.
+#[allow(dead_code)]
+fn type_text_direct(text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+
+    match Command::new("wtype").arg(text).output() {
         Ok(_) => {}
         Err(e) => {
-            error!("wtype failed: {}. Trying clipboard fallback.", e);
+            warn!("wtype failed: {}. Falling back to clipboard copy.", e);
             copy_text(text);
         }
     }

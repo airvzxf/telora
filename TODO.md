@@ -3,7 +3,8 @@
 ## Priority
 - [ ] **Configurable Hotkeys**: Allow users to define their own shortcuts for toggle-type/toggle-copy.
 - [ ] **Visual Feedback Improvements**: Add a volume meter or waveform to the OSD while recording.
-- [ ] **Wayland Protocol Support**: Explore `wlr-virtual-keyboard-unstable-v1` for more robust typing on all Wayland compositors (currently uses a generic approach).
+- [x] **Wayland Clipboard Paste Flow**: `toggle-type` now puts the transcription in the Wayland clipboard, simulates a paste shortcut, and restores whatever was in the clipboard beforehand (text, images, etc.). Sensitive clipboard data (passwords) is not backed up.
+- [x] **Per-App Paste Shortcut**: Configurable per-app paste shortcut in `~/.config/telora/gui.toml` to support terminals (Ctrl+Shift+V / Shift+Insert) on wlroots compositors.
 
 ## Features
 - [ ] **Continuous Dictation Mode**: A mode where the daemon transcribes in real-time without manual toggling.

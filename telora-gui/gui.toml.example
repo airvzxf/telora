@@ -1,0 +1,31 @@
+# Telora GUI configuration example.
+#
+# Copy to ~/.config/telora/gui.toml and edit to your needs.
+# All fields are optional: any missing key falls back to a built-in default.
+
+# Default paste shortcut used when the focused app has no per-app override
+# below, or when the focused app cannot be detected (e.g. GNOME / KDE without
+# wlrctl, or no wlr-foreign-toplevel support).
+#
+# Format: comma-free, `+`-separated tokens. Modifiers: ctrl, shift, alt, super.
+# Final token is the key (v, insert, return, etc.).
+paste_shortcut = "ctrl+v"
+
+# Per-app overrides. The key is the focused window's `app_id` (you can see all
+# the app_ids your compositor exposes with `wlrctl toplevel list` on wlroots
+# compositors such as Sway, Hyprland, labwc, river, Wayfire). The value is a
+# wtype-compatible shortcut.
+#
+# When the focused app is not in this table, `paste_shortcut` above is used.
+[paste_shortcut_by_app]
+
+# Terminal emulators typically need shift+insert or ctrl+shift+v.
+# Key names are case-insensitive on the user side ("insert" and "Insert" both
+# work) and are normalized to libxkbcommon's canonical spelling internally.
+Alacritty = "shift+insert"
+kitty = "ctrl+shift+v"
+foot = "ctrl+shift+v"
+wezterm = "ctrl+shift+v"
+"org.gnome.Terminal" = "ctrl+shift+v"
+xfce4-terminal = "ctrl+shift+v"
+konsole = "ctrl+shift+v"

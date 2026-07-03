@@ -37,6 +37,9 @@ if [ -f /etc/debian_version ]; then
         wl-clipboard \
         wtype \
         libgl1
+    # wlrctl is optional; only needed for per-app paste shortcut overrides
+    # on wlroots-based compositors (Sway, Hyprland, labwc, river, Wayfire).
+    $SUDO apt-get install -y wlrctl || true
 
 elif [ -f /etc/fedora-release ]; then
     echo "--> Distribution: Fedora family"
@@ -49,6 +52,9 @@ elif [ -f /etc/fedora-release ]; then
         mesa-libGL \
         wl-clipboard \
         wtype
+    # wlrctl is optional; only needed for per-app paste shortcut overrides
+    # on wlroots-based compositors (Sway, Hyprland, labwc, river, Wayfire).
+    $SUDO dnf install -y wlrctl || true
 
 elif [ -f /etc/arch-release ]; then
     echo "--> Distribution: Arch Linux"
@@ -60,10 +66,14 @@ elif [ -f /etc/arch-release ]; then
         pipewire-alsa \
         wl-clipboard \
         wtype
+    # wlrctl is optional; only needed for per-app paste shortcut overrides
+    # on wlroots-based compositors (Sway, Hyprland, labwc, river, Wayfire).
+    $SUDO pacman -S --noconfirm wlrctl || true
 
 else
     echo "!! Error: Distribution not supported by setup-env.sh"
     echo "Please install dependencies manually: GTK4, libadwaita, ALSA, wl-clipboard, wtype."
+    echo "Optional: wlrctl (for per-app paste shortcut overrides on wlroots compositors)."
     exit 1
 fi
 
