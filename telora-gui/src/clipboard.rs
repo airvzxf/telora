@@ -163,9 +163,27 @@ pub fn restore(snap: &ClipboardSnapshot) {
 ///    pastes it (`ctrl+v` by default; per-app overrides in `gui.toml`
 ///    cover terminals that use `ctrl+shift+v` or `shift+insert`).
 /// 4. Wait briefly so the receiving app has time to read the clipboard.
-/// 5. Restore the original clipboard contents.
+/// 5. Restore the original clipboard contents — but only if we actually
+///    had something to restore. If the snapshot is empty (no prior
+///    clipboard content, or backup was skipped), the user's text is left
+///    in the clipboard so they can paste it manually if the simulated
+///    shortcut didn't reach the app.
+///
+/// Refuses to run when the clipboard currently contains sensitive
+/// content (the KDE password-manager hint MIME type), so we never
+/// overwrite a password/key with the transcription.
 pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) {
     if text.is_empty() {
+        return;
+    }
+
+    if has_sensitive_content() {
+        warn!(
+            "Clipboard contains sensitive data ({}); refusing to overwrite \
+             it with the transcription. Paste manually after clearing the \
+             clipboard.",
+            SENSITIVE_MIME
+        );
         return;
     }
 
@@ -194,9 +212,29 @@ pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) {
 
     // Give the focused app a moment to read the clipboard data via the
     // data-control protocol before we overwrite it with the original.
-    thread::sleep(Duration::from_millis(150));
+    // Only restore when we actually had prior content to put back; if
+    // the snapshot is empty the user's transcribed text is left in
+    // the clipboard for manual paste.
+    if snap.had_content {
+        thread::sleep(Duration::from_millis(150));
+        restore(&snap);
+    }
+}
 
-    restore(&snap);
+/// Check whether the current clipboard contents include the
+/// password-manager hint MIME type. Used as a safety check before
+/// overwriting the clipboard with a transcription, so a
+/// password-manager secret is never silently clobbered.
+fn has_sensitive_content() -> bool {
+    let Ok(out) = Command::new("wl-paste").arg("--list-types").output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.trim() == SENSITIVE_MIME)
 }
 
 /// Convert a human shortcut like `"ctrl+shift+v"` into `wtype` arguments.
@@ -331,12 +369,16 @@ fn write_to_clipboard(mime: &str, data: &[u8]) -> std::io::Result<()> {
 /// Map a stored MIME type to a canonical equivalent for restoration.
 ///
 /// `wl-copy` cannot publish multiple types simultaneously, so when the
-/// original offered several `text/*` variants we collapse them to
-/// `text/plain;charset=utf-8`, which is the only one any modern app needs.
-/// For `image/*` and other types we keep the original since there is no
-/// canonical fallback.
+/// original offered several `text/plain*` variants (e.g. `text/plain`,
+/// `text/plain;charset=utf-8`, `UTF8_STRING`, `STRING`, `TEXT`) we
+/// collapse them to `text/plain;charset=utf-8`, which is the only one
+/// any modern app needs. Rich-text types like `text/html` or
+/// `text/markdown` are *not* collapsed: their semantics are different
+/// from plain text and we should preserve them so the receiving app can
+/// decide. `image/*` and other non-text types are also left untouched
+/// since there is no canonical fallback.
 fn canonicalize_mime(original: &str) -> String {
-    if original.starts_with("text/") {
+    if original == "text/plain" || original.starts_with("text/plain;") {
         "text/plain;charset=utf-8".to_string()
     } else {
         original.to_string()
