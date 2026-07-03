@@ -10,10 +10,14 @@ use tokio::sync::mpsc;
 
 use log::info;
 
+mod clipboard;
+mod config;
 mod connection;
+mod focus;
 mod input;
 mod ui;
 
+use config::GuiConfig;
 use connection::{ControlServer, SocketClient};
 use ui::Osd;
 
@@ -125,6 +129,10 @@ SEE ALSO:
         // Keep the app running even without visible windows
         let _hold_guard = app.hold();
 
+        // Load GUI configuration once. Cheap to clone (two strings + a small
+        // map), so we hand copies to whichever thread needs it.
+        let gui_config = GuiConfig::load();
+
         // Create async channel for communication between Tokio and GTK
         let (tx, rx) = async_channel::unbounded::<AppAction>();
 
@@ -134,6 +142,7 @@ SEE ALSO:
         // Start Tokio Runtime in a separate thread
         // This happens AFTER GTK confirms we're the primary instance
         let tx_clone = tx.clone();
+        let cfg_for_tokio = gui_config.clone();
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async {
@@ -143,7 +152,7 @@ SEE ALSO:
                             log::error!("Control server failed: {}", e);
                         }
                     }
-                    _ = handle_daemon_commands(daemon_rx, tx_clone) => {}
+                    _ = handle_daemon_commands(daemon_rx, tx_clone, cfg_for_tokio) => {}
                 }
             });
         });
@@ -214,6 +223,7 @@ SEE ALSO:
 async fn handle_daemon_commands(
     mut rx: mpsc::UnboundedReceiver<DaemonCommand>,
     _tx: Sender<AppAction>,
+    gui_config: GuiConfig,
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -226,7 +236,7 @@ async fn handle_daemon_commands(
                     Ok(text) if !text.trim().is_empty() && !text.starts_with("ERROR:") => {
                         let is_auto = mode == "AUTO";
                         if mode == "TYPE" || is_auto {
-                            input::type_text(&text);
+                            input::type_text(&text, &gui_config);
                         } else {
                             input::copy_text(&text);
                         }

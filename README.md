@@ -59,6 +59,56 @@ language = "es"
 max_recording_seconds = 300
 ```
 
+### GUI Client Configuration (`gui.toml`)
+
+The GUI client has its own optional configuration file at `~/.config/telora/gui.toml`
+(XDG-compliant). It controls the paste-shortcut behaviour for the `toggle-type`
+command. If the file is missing, sensible defaults are used.
+
+```toml
+# Default paste shortcut to simulate after putting the transcribed text in
+# the clipboard. Most graphical apps accept this.
+paste_shortcut = "ctrl+v"
+
+# Per-app overrides. The key is the focused window's `app_id` (visible via
+# `wlrctl toplevel list` on wlroots-based compositors such as Sway, Hyprland,
+# labwc, river, Wayfire). The value is a `wtype`-compatible shortcut.
+#
+# On compositors without `wlrctl` (GNOME, KDE), or when no app_id matches,
+# the default above is used.
+[paste_shortcut_by_app]
+Alacritty = "shift+insert"
+kitty = "ctrl+shift+v"
+foot = "ctrl+shift+v"
+wezterm = "ctrl+shift+v"
+"org.gnome.Terminal" = "ctrl+shift+v"
+```
+
+**Supported shortcut tokens** (combined with `+`): `ctrl`, `shift`, `alt`,
+`super`, plus a final key. Key names are case-insensitive on the user side
+and normalized to libxkbcommon's canonical spelling (e.g. `insert` →
+`Insert`); without that normalization, `wtype` would type the literal text
+"insert" instead of pressing the Insert key.
+
+Recognized keys: `v`, any single letter or digit, `insert`, `delete`/`del`,
+`home`, `end`, `up`, `down`, `left`, `right`, `pageup`/`pgup`/`prior`,
+`pagedown`/`pgdn`/`next`, `return`/`enter`, `tab`, `escape`/`esc`,
+`backspace`/`bs`, `space`, `F1`–`F24`.
+
+**How it works (toggle-type):**
+
+1. Whatever is currently in the Wayland clipboard is backed up in memory
+   (text, images, or other MIME types are preserved). Sensitive content
+   (`x-kde-passwordManagerHint`, used by KDE password managers) is *not*
+   backed up to avoid holding secrets in process memory.
+2. The transcribed text is written to the clipboard.
+3. The configured paste shortcut is simulated via `wtype`.
+4. After a short delay (so the focused app can read the data), the original
+   clipboard contents are restored.
+
+The clipboard's data is never written to disk; it lives only in the GUI
+process memory for the few hundred milliseconds of a typical paste cycle.
+
 ## Customizing Systemd Services
 
 If you need to change how the services start (e.g., adding environment variables like `RUST_LOG`), the best practice is to use a **drop-in override** rather than copying the entire file.
