@@ -70,6 +70,7 @@ ion, latency).
     - [ ] **Noise Gate**: Implement a volume threshold to ignore quiet background noise.
 - [ ] **Audible Feedback**: Option to play sounds for events (e.g., record start, record stop, cancel).
 - [ ] **Text Post-Processing**:
-    - [x] **Automatic Capitalization**: Smartly capitalize the beginning of sentences.
+    - [x] **First-Word Normalization**: Trim, collapse internal whitespace to a single space, and title-case the first word of every transcription so that "  hola   MUNDO  " becomes "Hola MUNDO" before reaching the clipboard.
+    - [ ] **Sentence-Start Capitalization**: Capitalize the first letter after every sentence boundary (`.`, `?`, `!`) so capitalization is correct throughout, not only at the very start of the transcription.
     - [ ] **Custom Word Replacements**: A user-defined dictionary for correcting common mis-transcriptions (e.g., "telora" -> "Telora").
 - [ ] **Output Delay**: Add an optional delay before typing to allow for cancellation.
