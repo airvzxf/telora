@@ -15,6 +15,7 @@ mod config;
 mod connection;
 mod focus;
 mod input;
+mod text;
 mod ui;
 
 use config::GuiConfig;
@@ -234,11 +235,12 @@ async fn handle_daemon_commands(
                 // The STOP command now returns the transcription result directly
                 match SocketClient::send_command("STOP").await {
                     Ok(text) if !text.trim().is_empty() && !text.starts_with("ERROR:") => {
+                        let cleaned = text::clean_transcription(&text);
                         let is_auto = mode == "AUTO";
                         if mode == "TYPE" || is_auto {
-                            input::type_text(&text, &gui_config);
+                            input::type_text(&cleaned, &gui_config);
                         } else {
-                            input::copy_text(&text);
+                            input::copy_text(&cleaned);
                         }
 
                         if is_auto {

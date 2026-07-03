@@ -70,6 +70,6 @@ ion, latency).
     - [ ] **Noise Gate**: Implement a volume threshold to ignore quiet background noise.
 - [ ] **Audible Feedback**: Option to play sounds for events (e.g., record start, record stop, cancel).
 - [ ] **Text Post-Processing**:
-    - [ ] **Automatic Capitalization**: Smartly capitalize the beginning of sentences.
+    - [x] **Automatic Capitalization**: Smartly capitalize the beginning of sentences.
     - [ ] **Custom Word Replacements**: A user-defined dictionary for correcting common mis-transcriptions (e.g., "telora" -> "Telora").
 - [ ] **Output Delay**: Add an optional delay before typing to allow for cancellation.
