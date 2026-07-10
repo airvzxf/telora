@@ -7,6 +7,19 @@
 //! `wl-copy` / `wl-paste` shell tools (single-MIME only) and surfaces a
 //! user-visible hint via [`PasteOutcome::FallbackSingleMime`].
 //!
+//! When `backup()` cannot read a particular MIME within
+//! [`PER_MIME_READ_DEADLINE`], the failure is recorded in two flavours:
+//!
+//! - **Silent** for known-benign MIME types in [`SILENT_SKIP_MIME_TYPES`],
+//!   which never trigger `PasteOutcome::Partial`. The canonical example
+//!   is Firefox's `SAVE_TARGETS`, which is unfixable from our side.
+//! - **Surfaced** for everything else: WARN log + `PasteOutcome::Partial`,
+//!   surfacing the lost fidelity to the user via the OSD.
+//!
+//! The boundary between the two is a hardcoded constant — extend it only
+//! after confirming the MIME is genuinely unrecoverable across the
+//! compositors the user runs on.
+//!
 //! Sensitive data marked with the KDE password-manager hint MIME type
 //! (`x-kde-passwordManagerHint`) is never copied into our process memory.
 
@@ -56,6 +69,49 @@ const RESTORE_DELAY_MS: u64 = 150;
 /// native Wayland state, and the leaked thread does not block any other
 /// operation. At worst we keep one such thread per hung MIME per cycle.
 const PER_MIME_READ_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// MIME types whose per-MIME read failure is informational and
+/// compositor-specific. The canonical example is Firefox's
+/// `SAVE_TARGETS`, which Firefox advertises in its clipboard offer but
+/// the compositor (labwc, likely others) cannot deliver through
+/// `wlr-data-control` because the data is internal to Firefox's drag-
+/// and-drop pipeline. The user cannot fix this from any setting — it is
+/// a compositor/library limitation. We skip these silently so the toggle-
+/// type workflow completes cleanly without alarming the user about a
+/// problem they have no lever to act on. Real, unexpected failures
+/// (MIMEs not in this list) still surface via `PasteOutcome::Partial`
+/// and a WARN log, preserving the fail-loud property.
+const SILENT_SKIP_MIME_TYPES: &[&str] = &["SAVE_TARGETS"];
+
+/// Returns true when a failed per-MIME read should be skipped silently
+/// without surfacing the loss to the user or adding to `skipped_mimes`.
+fn is_silent_skip(mime: &str) -> bool {
+    SILENT_SKIP_MIME_TYPES.contains(&mime)
+}
+
+/// Record a per-MIME read failure either silently (if the MIME is in
+/// [`SILENT_SKIP_MIME_TYPES`]) or with a WARN log + entry in `skipped`
+/// (which will later trigger `PasteOutcome::Partial`). `detail` should
+/// be a short, user-readable description of the underlying cause.
+fn record_skip(skipped: &mut Vec<String>, mime: &str, kind: &str, detail: &str) {
+    if is_silent_skip(mime) {
+        log::debug!(
+            "Skipping known-benign MIME {} ({}); silent ({})",
+            mime,
+            kind,
+            detail
+        );
+        return;
+    }
+    log::warn!(
+        "wl-clipboard-rs paste for mime={} {} ({}); \
+         compositor likely failed to deliver data",
+        mime,
+        kind,
+        detail
+    );
+    skipped.push(mime.to_string());
+}
 
 /// Threshold above which we log the previous backup size at INFO instead of
 /// DEBUG. Helps spot large image pastes without spamming routine text pastes.
@@ -182,21 +238,15 @@ pub fn backup() -> (ClipboardSnapshot, bool) {
                 data,
             }),
             ReadOutcome::Failed(e) => {
-                log::warn!(
-                    "wl-clipboard-rs paste failed for mime={} ({}); skipping that type",
-                    mime,
-                    e
-                );
-                skipped.push(mime.clone());
+                record_skip(&mut skipped, mime, "failed", &e.to_string());
             }
             ReadOutcome::TimedOut => {
-                log::warn!(
-                    "wl-clipboard-rs paste for mime={} did not complete within {:?}; \
-                     skipping that type (compositor likely failed to deliver data)",
+                record_skip(
+                    &mut skipped,
                     mime,
-                    PER_MIME_READ_DEADLINE
+                    "timed out",
+                    &format!("no data within {:?}", PER_MIME_READ_DEADLINE),
                 );
-                skipped.push(mime.clone());
             }
         }
     }
@@ -934,6 +984,55 @@ mod tests {
     fn outcome_for_skipped_returns_ok_for_empty_snapshot() {
         let snap = ClipboardSnapshot::empty();
         assert_eq!(outcome_for_skipped(&snap), PasteOutcome::Ok);
+    }
+
+    #[test]
+    fn is_silent_skip_recognises_save_targets() {
+        assert!(is_silent_skip("SAVE_TARGETS"));
+    }
+
+    #[test]
+    fn is_silent_skip_rejects_canonicals_and_others() {
+        // Canonical text types must always surface (or be readable) — not
+        // silently dropped.
+        assert!(!is_silent_skip("text/plain"));
+        assert!(!is_silent_skip("text/_moz_htmlcontext"));
+        assert!(!is_silent_skip("image/png"));
+        assert!(!is_silent_skip(""));
+        // A typo of SAVE_TARGETS is not the same MIME — surface it.
+        assert!(!is_silent_skip("save_targets"));
+        assert!(!is_silent_skip("SAVE_TARGET"));
+        assert!(!is_silent_skip("SAVE_TARGETS ")); // trailing space differs
+    }
+
+    #[test]
+    fn record_skip_silences_save_targets_but_surfaces_others() {
+        let mut skipped = Vec::new();
+        record_skip(
+            &mut skipped,
+            "SAVE_TARGETS",
+            "timed out",
+            "no data within 1.5s",
+        );
+        // SAVE_TARGETS is silenced: no entry added.
+        assert!(
+            skipped.is_empty(),
+            "SAVE_TARGETS should be silent; got {:?}",
+            skipped
+        );
+
+        record_skip(
+            &mut skipped,
+            "text/x-mystery",
+            "timed out",
+            "no data within 1.5s",
+        );
+        // Unknown MIME surfaces.
+        assert_eq!(skipped, vec!["text/x-mystery".to_string()]);
+
+        // A second silent skip after a surfaced one is still silent.
+        record_skip(&mut skipped, "SAVE_TARGETS", "failed", "PipeCreation");
+        assert_eq!(skipped, vec!["text/x-mystery".to_string()]);
     }
 
     #[test]
