@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -37,8 +38,24 @@ const TRANSCRIPTION_MIME: &str = "text/plain;charset=utf-8";
 
 /// Grace period between the simulated paste and the restore, giving the
 /// focused application time to read the clipboard data via the data-control
-/// protocol before we overwrite it.
+/// protocol before we overwrite it with the original.
 const RESTORE_DELAY_MS: u64 = 150;
+
+/// Per-MIME hard deadline for `paste::get_contents`.
+///
+/// `wl-clipboard-rs` 0.9.3 calls `queue.roundtrip` synchronously inside
+/// `paste::get_contents`, and on some wlroots-based compositors (labwc,
+/// possibly Hyprland in certain configurations) the compositor never fills
+/// the pipe it created, leaving the calling thread blocked at
+/// `wchan=anon_pipe_read` indefinitely. We do NOT silently fall back to
+/// another path; instead we abandon each stuck MIME after this deadline,
+/// log the MIME that was skipped, and continue with the rest of the
+/// snapshot. This keeps the paste cycle from freezing the GUI when one
+/// specific MIME type hangs. The thread that was blocked in the roundtrip
+/// is intentionally leaked: Rust cannot safely kill a thread holding
+/// native Wayland state, and the leaked thread does not block any other
+/// operation. At worst we keep one such thread per hung MIME per cycle.
+const PER_MIME_READ_DEADLINE: Duration = Duration::from_millis(1500);
 
 /// Threshold above which we log the previous backup size at INFO instead of
 /// DEBUG. Helps spot large image pastes without spamming routine text pastes.
@@ -58,10 +75,17 @@ pub struct MimeSourceEntry {
 /// the clipboard (or leaves it cleared). When `true`, `restore` re-offers
 /// every entry in `sources` in a single Wayland offer, so the receiving
 /// application picks whichever MIME type it wants.
+///
+/// `skipped_mimes` records the MIME types that [`backup`] tried to read
+/// but could not because `paste::get_contents` either errored or hit the
+/// per-MIME read deadline. These MIMEs are NOT in `sources`, so they will
+/// not appear in the restored offer; the caller surfaces this so the user
+/// knows which types were dropped.
 #[derive(Debug, Default)]
 pub struct ClipboardSnapshot {
     pub had_content: bool,
     pub sources: Vec<MimeSourceEntry>,
+    pub skipped_mimes: Vec<String>,
 }
 
 /// Outcome of [`paste_text_via_clipboard`]. Lets the caller pick the right
@@ -71,6 +95,13 @@ pub struct ClipboardSnapshot {
 pub enum PasteOutcome {
     /// Full multi-MIME backup + paste + restore succeeded.
     Ok,
+    /// The paste cycle completed and the receiving app got the text, but
+    /// some MIME types were dropped from the backup because their
+    /// `paste::get_contents` call errored or hit the per-MIME deadline.
+    /// The clipboard was restored with the surviving types; `skipped`
+    /// lists the MIME types that were lost so the user can decide whether
+    /// to retry with a different compositor setting.
+    Partial { skipped: Vec<String> },
     /// The compositor does not expose `wlr-data-control` /
     /// `ext-data-control`, so wl-clipboard-rs could not run. We fell back
     /// to the `wl-copy` / `wl-paste` shell tools, which can only handle a
@@ -85,7 +116,10 @@ pub enum PasteOutcome {
 
 impl PasteOutcome {
     pub fn is_failure(&self) -> bool {
-        !matches!(self, PasteOutcome::Ok)
+        matches!(
+            self,
+            PasteOutcome::FallbackSingleMime { .. } | PasteOutcome::Refused { .. }
+        )
     }
 }
 
@@ -140,54 +174,136 @@ pub fn backup() -> (ClipboardSnapshot, bool) {
     }
 
     let mut sources: Vec<MimeSourceEntry> = Vec::with_capacity(types.len());
+    let mut skipped: Vec<String> = Vec::new();
     for mime in &types {
-        match paste::get_contents(
-            PasteClipboardType::Regular,
-            Seat::Unspecified,
-            PasteMimeType::Specific(mime),
-        ) {
-            Ok((mut pipe, _)) => {
-                let mut data = Vec::new();
-                if let Err(e) = pipe.read_to_end(&mut data) {
-                    log::warn!(
-                        "Failed to read clipboard contents for mime={} ({}); \
-                         skipping that type",
-                        mime,
-                        e
-                    );
-                    continue;
-                }
-                sources.push(MimeSourceEntry {
-                    mime_type: mime.clone(),
-                    data,
-                });
-            }
-            Err(PasteError::NoMimeType) => {
-                log::debug!("MIME type {} no longer offered; skipping", mime);
-            }
-            Err(e) => {
+        match read_mime_with_deadline(mime, PER_MIME_READ_DEADLINE) {
+            ReadOutcome::Read(data) => sources.push(MimeSourceEntry {
+                mime_type: mime.clone(),
+                data,
+            }),
+            ReadOutcome::Failed(e) => {
                 log::warn!(
                     "wl-clipboard-rs paste failed for mime={} ({}); skipping that type",
                     mime,
                     e
                 );
+                skipped.push(mime.clone());
+            }
+            ReadOutcome::TimedOut => {
+                log::warn!(
+                    "wl-clipboard-rs paste for mime={} did not complete within {:?}; \
+                     skipping that type (compositor likely failed to deliver data)",
+                    mime,
+                    PER_MIME_READ_DEADLINE
+                );
+                skipped.push(mime.clone());
             }
         }
     }
 
     if sources.is_empty() {
-        log::debug!("No MIME types yielded contents; treating as empty snapshot");
-        return (ClipboardSnapshot::empty(), false);
+        if skipped.is_empty() {
+            log::debug!("No MIME types yielded contents; treating as empty snapshot");
+        } else {
+            log::warn!(
+                "All {} MIME type(s) failed to read or timed out: {:?}; treating as empty snapshot",
+                skipped.len(),
+                skipped
+            );
+        }
+        return (
+            ClipboardSnapshot {
+                had_content: false,
+                sources: Vec::new(),
+                skipped_mimes: skipped,
+            },
+            false,
+        );
     }
 
     log_total_backup_size(&sources);
+    if !skipped.is_empty() {
+        log::warn!(
+            "Backup preserved {} of {} MIME type(s); dropped: {:?}",
+            sources.len(),
+            sources.len() + skipped.len(),
+            skipped
+        );
+    }
     (
         ClipboardSnapshot {
             had_content: true,
             sources,
+            skipped_mimes: skipped,
         },
         false,
     )
+}
+
+/// Result of a single `paste::get_contents` attempt bounded by a deadline.
+enum ReadOutcome {
+    /// The clipboard delivered the bytes before the deadline.
+    Read(Vec<u8>),
+    /// `paste::get_contents` returned an error before the deadline.
+    Failed(paste::Error),
+    /// The deadline elapsed before `paste::get_contents` returned. The
+    /// spawned worker thread continues running; we abandon its result.
+    TimedOut,
+}
+
+/// Run `paste::get_contents` for `mime` on a worker thread, abandoning the
+/// result if the call does not return within `deadline`.
+///
+/// See [`PER_MIME_READ_DEADLINE`] for why this exists. The spawned thread
+/// is intentionally NOT joined on timeout; killing a thread that holds
+/// Wayland state is unsafe in Rust and the leaked thread is bounded (one
+/// per hung MIME per cycle).
+fn read_mime_with_deadline(mime: &str, deadline: Duration) -> ReadOutcome {
+    let (tx, rx) = mpsc::channel();
+    let mime_owned = mime.to_string();
+    let join = thread::Builder::new()
+        .name(format!("telora-paste-{}", mime_owned))
+        .spawn(move || {
+            let result: Result<Vec<u8>, String> = (|| -> Result<Vec<u8>, String> {
+                let (mut pipe, _actual_mime) = paste::get_contents(
+                    PasteClipboardType::Regular,
+                    Seat::Unspecified,
+                    PasteMimeType::Specific(&mime_owned),
+                )
+                .map_err(|e| e.to_string())?;
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).map_err(|e| e.to_string())?;
+                Ok(data)
+            })();
+            let _ = tx.send(result);
+        });
+    let spawn_result = match join {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = spawn_result {
+        log::warn!("Failed to spawn reader thread for {}: {}", mime, e);
+        return ReadOutcome::Failed(paste::Error::PipeCreation(std::io::Error::other(e)));
+    }
+
+    match rx.recv_timeout(deadline) {
+        Ok(Ok(data)) => ReadOutcome::Read(data),
+        Ok(Err(e)) => {
+            // Try to map back into a paste::Error variant when possible so
+            // the failure log stays informative, otherwise synthesise a
+            // generic PipeCreation error.
+            ReadOutcome::Failed(classify_read_error(&e))
+        }
+        Err(_timeout) => ReadOutcome::TimedOut,
+    }
+}
+
+/// Best-effort conversion from a thread-channel error string into a
+/// `paste::Error`. Most error messages produced by `get_contents` /
+/// `read_to_end` are MIME-aware only in their formatting; we keep the
+/// `PipeCreation` variant to surface "we couldn't read from the pipe".
+fn classify_read_error(message: &str) -> paste::Error {
+    paste::Error::PipeCreation(std::io::Error::other(message))
 }
 
 /// Restore a previously captured snapshot to the clipboard via
@@ -311,7 +427,7 @@ pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) -> PasteOutcome 
     if snap.had_content {
         thread::sleep(Duration::from_millis(RESTORE_DELAY_MS));
         match restore(&snap) {
-            Ok(()) => PasteOutcome::Ok,
+            Ok(()) => outcome_for_skipped(&snap),
             Err(e) if is_protocol_error(&e) => {
                 let reason = copy_error_reason(&e);
                 log::warn!(
@@ -332,7 +448,21 @@ pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) -> PasteOutcome 
             }
         }
     } else {
+        outcome_for_skipped(&snap)
+    }
+}
+
+/// Return `PasteOutcome::Partial` when the snapshot has MIME types that
+/// `backup` could not read; otherwise `PasteOutcome::Ok`. The receiving
+/// app still received the transcription — only clipboard fidelity is
+/// degraded, and the OSD surfaces a degraded-mode warning.
+fn outcome_for_skipped(snap: &ClipboardSnapshot) -> PasteOutcome {
+    if snap.skipped_mimes.is_empty() {
         PasteOutcome::Ok
+    } else {
+        PasteOutcome::Partial {
+            skipped: snap.skipped_mimes.clone(),
+        }
     }
 }
 
@@ -570,6 +700,7 @@ fn backup_via_wl_paste() -> ClipboardSnapshot {
                     mime_type: primary,
                     data: bytes,
                 }],
+                skipped_mimes: Vec::new(),
             }
         }
         Ok(out) => {
@@ -714,6 +845,63 @@ mod tests {
             }
             .is_failure()
         );
+        // Partial is degraded success, not a hard failure: the user
+        // received the text but lost some MIME types from the snapshot.
+        assert!(
+            !PasteOutcome::Partial {
+                skipped: vec!["text/x-moz-url-priv".to_string()],
+            }
+            .is_failure()
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_has_no_content_and_no_skipped() {
+        let s = ClipboardSnapshot::empty();
+        assert!(!s.had_content);
+        assert!(s.sources.is_empty());
+        assert!(s.skipped_mimes.is_empty());
+    }
+
+    #[test]
+    fn outcome_for_skipped_returns_partial_when_dropped_mimes_present() {
+        let snap = ClipboardSnapshot {
+            had_content: true,
+            sources: vec![MimeSourceEntry {
+                mime_type: "text/plain".to_string(),
+                data: b"hello".to_vec(),
+            }],
+            skipped_mimes: vec![
+                "text/_moz_htmlcontext".to_string(),
+                "SAVE_TARGETS".to_string(),
+            ],
+        };
+        match outcome_for_skipped(&snap) {
+            PasteOutcome::Partial { skipped } => {
+                assert_eq!(skipped.len(), 2);
+                assert!(skipped.contains(&"SAVE_TARGETS".to_string()));
+            }
+            other => panic!("expected Partial, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn outcome_for_skipped_returns_ok_when_no_drops() {
+        let snap = ClipboardSnapshot {
+            had_content: true,
+            sources: vec![MimeSourceEntry {
+                mime_type: "text/plain".to_string(),
+                data: b"hello".to_vec(),
+            }],
+            skipped_mimes: Vec::new(),
+        };
+        assert_eq!(outcome_for_skipped(&snap), PasteOutcome::Ok);
+    }
+
+    #[test]
+    fn outcome_for_skipped_returns_ok_for_empty_snapshot() {
+        let snap = ClipboardSnapshot::empty();
+        assert_eq!(outcome_for_skipped(&snap), PasteOutcome::Ok);
     }
 
     #[test]
@@ -734,6 +922,7 @@ mod tests {
                     data: vec![0x89, 0x50, 0x4e, 0x47],
                 },
             ],
+            skipped_mimes: Vec::new(),
         };
         assert_eq!(snap.sources.len(), 3);
         assert!(snap.had_content);

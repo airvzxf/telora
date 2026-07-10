@@ -293,6 +293,18 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
                 ("Copiado".to_string(), "green".to_string())
             }
         }
+        clipboard::PasteOutcome::Partial { skipped } => {
+            let count = skipped.len();
+            let label = if is_type_mode { "Escrito" } else { "Copiado" };
+            (
+                format!(
+                    "{label} ⚠ {count} tipo{plural} perdido{plural2}",
+                    plural = if count == 1 { "" } else { "s" },
+                    plural2 = if count == 1 { "" } else { "s" }
+                ),
+                "yellow".to_string(),
+            )
+        }
         clipboard::PasteOutcome::FallbackSingleMime { .. } => (
             "⚠ Respaldo simple (formato único)".to_string(),
             "orange".to_string(),
