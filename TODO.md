@@ -5,6 +5,7 @@
 - [ ] **Visual Feedback Improvements**: Add a volume meter or waveform to the OSD while recording.
 - [x] **Wayland Clipboard Paste Flow**: `toggle-type` now puts the transcription in the Wayland clipboard, simulates a paste shortcut, and restores whatever was in the clipboard beforehand (text, images, etc.). Sensitive clipboard data (passwords) is not backed up.
 - [x] **Per-App Paste Shortcut**: Configurable per-app paste shortcut in `~/.config/telora/gui.toml` to support terminals (Ctrl+Shift+V / Shift+Insert) on wlroots compositors.
+- [x] **Multi-MIME Clipboard Restore**: `toggle-type` uses `wl-clipboard-rs` (a Rust wrapper over `wlr-data-control` / `ext-data-control`) to back up and restore every MIME type the source advertised (HTML + plain text + markdown + images, etc.) in a single Wayland offer. Compositors without `wlr-data-control` fall back to `wl-copy` single-MIME with an OSD hint. Resolves the follow-up documented in PR #4.
 
 ## Features
 - [ ] **Continuous Dictation Mode**: A mode where the daemon transcribes in real-time without manual toggling.
@@ -74,3 +75,4 @@ ion, latency).
     - [ ] **Sentence-Start Capitalization**: Capitalize the first letter after every sentence boundary (`.`, `?`, `!`) so capitalization is correct throughout, not only at the very start of the transcription.
     - [ ] **Custom Word Replacements**: A user-defined dictionary for correcting common mis-transcriptions (e.g., "telora" -> "Telora").
 - [ ] **Output Delay**: Add an optional delay before typing to allow for cancellation.
+- [ ] **OSD i18n**: Translate on-screen overlay messages (currently Spanish-only, e.g. `● GRABANDO`, `Procesando...`, `⚠ Respaldo simple`) to English and the user's locale.
