@@ -29,3 +29,22 @@ wezterm = "ctrl+shift+v"
 "org.gnome.Terminal" = "ctrl+shift+v"
 xfce4-terminal = "ctrl+shift+v"
 konsole = "ctrl+shift+v"
+
+# Backend used to back up and restore the Wayland clipboard around a
+# `toggle-type` paste. Valid values:
+#
+#   wl-copy        Single-MIME backup/restore via the wl-copy / wl-paste CLI
+#                  tools. Robust on every Wayland compositor; preserves only
+#                  one MIME type per cycle. This is the default.
+#
+#   wl-clipboard-rs
+#                  Multi-MIME backup/restore via the wl-clipboard-rs Rust
+#                  crate. Preserves every MIME type the source advertised
+#                  (text/html + text/plain + image/png + ...) across the
+#                  toggle-type cycle. Requires the compositor to expose
+#                  wlr-data-control / ext-data-control. Currently
+#                  experimental: if the GUI stays at "Procesando..." after
+#                  a toggle-type with rich content in the clipboard, switch
+#                  back to wl-copy.
+#
+# paste_backend = "wl-copy"

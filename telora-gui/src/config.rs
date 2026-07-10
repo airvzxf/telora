@@ -3,6 +3,30 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Backend used to back up and restore the Wayland clipboard around a
+/// `toggle-type` paste.
+///
+/// `wl-copy` is the default — robust on every Wayland compositor because the
+/// CLI tool's own backing protocol is decoupled from the application's IPC
+/// model; only one MIME type is preserved per cycle.
+///
+/// `wl-clipboard-rs` preserves every MIME type the source advertised
+/// (`text/html`, `text/plain`, `image/png`, …) by talking to
+/// `wlr-data-control` / `ext-data-control` directly. It is currently
+/// experimental: some compositor / Wayland-backend combinations cause a
+/// pipe read inside `paste::get_contents` to block indefinitely. If you see
+/// the OSD stuck at "Procesando..." during a paste cycle, switch back to
+/// `wl-copy` until the upstream is fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PasteBackend {
+    /// Single-MIME backup/restore via the `wl-copy` / `wl-paste` CLI tools.
+    #[default]
+    WlCopy,
+    /// Multi-MIME backup/restore via the `wl-clipboard-rs` Rust crate.
+    WlClipboardRs,
+}
+
 /// Runtime configuration for the GUI client (`telora-gui`).
 ///
 /// Resolved once at startup from `~/.config/telora/gui.toml`. If the file is
@@ -12,6 +36,7 @@ use std::path::PathBuf;
 pub struct GuiConfig {
     pub paste_shortcut: String,
     pub paste_shortcut_by_app: HashMap<String, String>,
+    pub paste_backend: PasteBackend,
 }
 
 impl Default for GuiConfig {
@@ -27,6 +52,7 @@ impl Default for GuiConfig {
         Self {
             paste_shortcut: "ctrl+v".to_string(),
             paste_shortcut_by_app: map,
+            paste_backend: PasteBackend::default(),
         }
     }
 }
@@ -37,6 +63,7 @@ impl Default for GuiConfig {
 struct RawGuiConfig {
     paste_shortcut: Option<String>,
     paste_shortcut_by_app: Option<HashMap<String, String>>,
+    paste_backend: Option<PasteBackend>,
 }
 
 impl GuiConfig {
@@ -96,11 +123,16 @@ impl GuiConfig {
             }
         }
 
+        if let Some(backend) = raw.paste_backend {
+            cfg.paste_backend = backend;
+        }
+
         info!(
-            "Loaded config from {} (default shortcut: {}, {} per-app overrides)",
+            "Loaded config from {} (default shortcut: {}, {} per-app overrides, clipboard backend: {:?})",
             path.display(),
             cfg.paste_shortcut,
-            cfg.paste_shortcut_by_app.len()
+            cfg.paste_shortcut_by_app.len(),
+            cfg.paste_backend
         );
 
         cfg
@@ -114,6 +146,34 @@ impl GuiConfig {
             return s.clone();
         }
         self.paste_shortcut.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_backend_defaults_to_wl_copy() {
+        assert_eq!(PasteBackend::default(), PasteBackend::WlCopy);
+    }
+
+    #[test]
+    fn paste_backend_parses_via_raw_config() {
+        // Round-trip through the same path the loader uses. The RawGuiConfig
+        // representation in this module accepts the key `paste_backend` with
+        // `wl-copy` and `wl-clipboard-rs` strings.
+        let parsed: RawGuiConfig = toml::from_str("paste_backend = \"wl-copy\"").unwrap();
+        assert_eq!(parsed.paste_backend, Some(PasteBackend::WlCopy));
+
+        let parsed: RawGuiConfig = toml::from_str("paste_backend = \"wl-clipboard-rs\"").unwrap();
+        assert_eq!(parsed.paste_backend, Some(PasteBackend::WlClipboardRs));
+    }
+
+    #[test]
+    fn gui_config_default_backend_is_wl_copy() {
+        let cfg = GuiConfig::default();
+        assert_eq!(cfg.paste_backend, PasteBackend::WlCopy);
     }
 }
 
