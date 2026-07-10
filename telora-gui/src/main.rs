@@ -302,7 +302,10 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
                     plural = if count == 1 { "" } else { "s" },
                     plural2 = if count == 1 { "" } else { "s" }
                 ),
-                "yellow".to_string(),
+                // `darkgoldenrod` is CSS #B8860B (readable with white at
+                // 5:1 contrast) — `yellow` (#FFFF00) is unreadable with
+                // white text (1.07:1) and hurts the eyes.
+                "darkgoldenrod".to_string(),
             )
         }
         clipboard::PasteOutcome::FallbackSingleMime { .. } => (

@@ -310,6 +310,16 @@ fn classify_read_error(message: &str) -> paste::Error {
 /// `wl-clipboard-rs`'s multi-MIME path. Returns an error if the protocol
 /// is unavailable; the caller decides whether to fall back to the
 /// single-MIME `wl-copy` shell tool.
+///
+/// **Order preservation caveat**: `wl-clipboard-rs` 0.9.3 builds an
+/// internal `HashMap<String, _>` inside `copy::prepare_copy_internal`
+/// (`copy.rs:811` in the crate source), so the order of `data_source.offer`
+/// calls is not deterministic even when we hand it an ordered `Vec`. The
+/// receiving compositor may then re-emit the offer in its own order. We
+/// preserve content fidelity (every MIME in `snap.sources` ends up on the
+/// clipboard) but the visual order in `wl-paste --list-types` after a
+/// restore may differ from the source. Fixing order would require either
+/// forking the upstream crate or upstreaming a HashMap → IndexMap patch.
 pub fn restore(snap: &ClipboardSnapshot) -> Result<(), copy::Error> {
     if !snap.had_content {
         log::debug!("Restoring: clearing clipboard (no prior content)");
@@ -328,9 +338,16 @@ pub fn restore(snap: &ClipboardSnapshot) -> Result<(), copy::Error> {
         })
         .collect();
 
-    let opts = Options::new();
+    let mut opts = Options::new();
+    // Tell wl-clipboard-rs to NOT auto-add the canonical text MIME types
+    // (text/plain;charset=utf-8, text/plain, STRING, UTF8_STRING, TEXT)
+    // when at least one text type is offered. The snapshot already contains
+    // exactly what was on the clipboard, so adding extras would publish
+    // MIME types that the source never advertised and that the user
+    // never asked us to restore.
+    opts.omit_additional_text_mime_types(true);
     log::info!(
-        "Restoring clipboard ({} MIME type{} via wl-clipboard-rs)",
+        "Restoring clipboard ({} MIME type{} via wl-clipboard-rs, no extra text mimes added)",
         mime_sources.len(),
         if mime_sources.len() == 1 { "" } else { "s" }
     );
