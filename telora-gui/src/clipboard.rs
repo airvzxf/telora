@@ -483,6 +483,21 @@ fn outcome_for_skipped(snap: &ClipboardSnapshot) -> PasteOutcome {
     }
 }
 
+/// Publish `text` to the clipboard as a single MIME type
+/// (`TRANSCRIPTION_MIME` = `text/plain;charset=utf-8`) and let
+/// `wl-clipboard-rs` add the canonical text aliases (`text/plain`,
+/// `STRING`, `UTF8_STRING`, `TEXT`) because we use the default
+/// `Options::new()` (i.e. `omit_additional_text_mime_types = false`).
+///
+/// **Asymmetric with `restore` on purpose.** `restore` uses
+/// `omit = true` because it must be faithful to whatever the source
+/// advertised — adding types that the source never had would publish
+/// fabricated data. `write_to_clipboard_multi` uses `omit = false` because
+/// it publishes brand-new content (our transcription) for the receiving
+/// app, and matching `wl-copy`'s default behaviour maximises app
+/// compatibility (most apps can read plain text under any of those five
+/// canonicals). Don't "unify" the two calls without re-reading this
+/// comment.
 fn write_to_clipboard_multi(text: &str) -> Result<(), copy::Error> {
     let opts = Options::new();
     opts.copy_multi(vec![MimeSource {
