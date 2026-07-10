@@ -97,46 +97,34 @@ Recognized keys: `v`, any single letter or digit, `insert`, `delete`/`del`,
 
 **How it works (toggle-type):**
 
-1. The current clipboard contents are read into memory and the transcribed
-   text is written to the clipboard as `text/plain;charset=utf-8`. The
-   mechanism depends on `paste_backend` in `gui.toml`:
-
-   - **`paste_backend = "wl-copy"` (default)** — single-MIME backup/restore
-     via the `wl-copy` / `wl-paste` CLI tools. Only the first MIME type
-     the source advertised (typically `text/html` for browsers /
-     VSCode / Geany) is preserved across the cycle. Stable on every
-     Wayland compositor.
-   - **`paste_backend = "wl-clipboard-rs"` (experimental)** — multi-MIME
-     backup/restore via the `wl-clipboard-rs` Rust crate. Every MIME
-     type the source advertised (`text/html` + `text/plain` +
-     `image/png` + ...) is republished in a single Wayland offer. Plain
-     text editors keep getting plain text, rich text editors keep
-     getting rich text, image tools keep getting the image. Requires
-     `wlr-data-control` / `ext-data-control`. **Currently
-     experimental**: some compositor / Wayland-backend combinations
-     cause a pipe read inside `paste::get_contents` to block
-     indefinitely. If the GUI hangs at "Procesando..." during a paste
-     cycle on rich content, switch back to `wl-copy`.
-
+1. Every MIME type the source application advertised is read into memory
+   via `wl-clipboard-rs` (a Rust wrapper around the `wlr-data-control` /
+   `ext-data-control` Wayland protocols). The snapshot keeps each MIME
+   type and its raw bytes verbatim, so `text/html` + `text/plain` +
+   `image/png` + ... are all preserved across the paste cycle.
    Sensitive content (`x-kde-passwordManagerHint`, used by KDE password
    managers) is *not* backed up to avoid holding secrets in process
-   memory regardless of the backend.
-
-2. The transcribed text is written to the clipboard.
+   memory.
+2. The transcribed text is written to the clipboard as
+   `text/plain;charset=utf-8`.
 3. The configured paste shortcut is simulated via `wtype`.
 4. After a short delay (so the focused app can read the data), the
-   original clipboard contents are restored.
+   original clipboard contents are restored by republishing every MIME
+   type the snapshot holds in a single Wayland offer. Plain-text editors
+   keep getting plain text, rich-text editors keep getting rich text,
+   and image tools keep getting the image.
+
+**Compositor fallback** — if the compositor does not expose
+`wlr-data-control` or `ext-data-control` (rare on modern Wayland; affects
+old Weston and very old GNOME), `wl-clipboard-rs` cannot operate.
+Telora falls back to the `wl-copy` / `wl-paste` shell tools for that
+cycle, which can only preserve a single MIME type per offer. The
+on-screen overlay shows `⚠ Respaldo simple (formato único)` so the user
+is aware that the multi-MIME fidelity is reduced. Updating the
+compositor restores the full behaviour.
 
 The clipboard's data is never written to disk; it lives only in the GUI
 process memory for the few hundred milliseconds of a typical paste cycle.
-
-**Hang protection.** The clipboard round-trip runs on a `tokio::task::spawn_blocking`
-thread with a hard timeout (`paste_timeout_ms` in `gui.toml`, default 8 s).
-If the chosen backend blocks past the timeout, the GUI falls back to the
-known-good `wl-copy` subprocess path while the hung worker thread continues
-in the background. This makes `toggle-type` resilient to future regressions
-in upstream Wayland libraries (notably `wl-clipboard-rs` on labwc with
-multi-MIME clipboard contents).
 
 ## Customizing Systemd Services
 

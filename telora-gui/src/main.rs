@@ -240,7 +240,7 @@ async fn handle_daemon_commands(
                         let cleaned = text::clean_transcription(&raw_text);
                         let is_auto = mode == "AUTO";
                         let paste_outcome = if mode == "TYPE" || is_auto {
-                            input::type_text(&cleaned, &gui_config).await
+                            input::type_text(&cleaned, &gui_config)
                         } else {
                             input::copy_text(&cleaned);
                             clipboard::PasteOutcome::Ok
@@ -292,6 +292,21 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
             } else {
                 ("Copiado".to_string(), "green".to_string())
             }
+        }
+        clipboard::PasteOutcome::Partial { skipped } => {
+            let count = skipped.len();
+            let label = if is_type_mode { "Escrito" } else { "Copiado" };
+            (
+                format!(
+                    "{label} ⚠ {count} tipo{plural} perdido{plural2}",
+                    plural = if count == 1 { "" } else { "s" },
+                    plural2 = if count == 1 { "" } else { "s" }
+                ),
+                // `darkgoldenrod` is CSS #B8860B (readable with white at
+                // 5:1 contrast) — `yellow` (#FFFF00) is unreadable with
+                // white text (1.07:1) and hurts the eyes.
+                "darkgoldenrod".to_string(),
+            )
         }
         clipboard::PasteOutcome::FallbackSingleMime { .. } => (
             "⚠ Respaldo simple (formato único)".to_string(),

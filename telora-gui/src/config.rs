@@ -2,31 +2,6 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
-
-/// Backend used to back up and restore the Wayland clipboard around a
-/// `toggle-type` paste.
-///
-/// `wl-copy` is the default — robust on every Wayland compositor because the
-/// CLI tool's own backing protocol is decoupled from the application's IPC
-/// model; only one MIME type is preserved per cycle.
-///
-/// `wl-clipboard-rs` preserves every MIME type the source advertised
-/// (`text/html`, `text/plain`, `image/png`, …) by talking to
-/// `wlr-data-control` / `ext-data-control` directly. It is currently
-/// experimental: some compositor / Wayland-backend combinations cause a
-/// pipe read inside `paste::get_contents` to block indefinitely. If you see
-/// the OSD stuck at "Procesando..." during a paste cycle, switch back to
-/// `wl-copy` until the upstream is fixed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PasteBackend {
-    /// Single-MIME backup/restore via the `wl-copy` / `wl-paste` CLI tools.
-    #[default]
-    WlCopy,
-    /// Multi-MIME backup/restore via the `wl-clipboard-rs` Rust crate.
-    WlClipboardRs,
-}
 
 /// Runtime configuration for the GUI client (`telora-gui`).
 ///
@@ -37,14 +12,6 @@ pub enum PasteBackend {
 pub struct GuiConfig {
     pub paste_shortcut: String,
     pub paste_shortcut_by_app: HashMap<String, String>,
-    pub paste_backend: PasteBackend,
-    /// Maximum time the GUI waits for a `paste_text_via_clipboard` cycle to
-    /// complete before falling back to the `wl-copy` subprocess path. The
-    /// timeout exists so that a hung `wl-clipboard-rs` call (observed on
-    /// labwc with multi-MIME clipboard contents) cannot freeze the tokio
-    /// worker that drives the OSD and the control server. Configurable via
-    /// `paste_timeout_ms` in `gui.toml` (in milliseconds).
-    pub paste_timeout: Duration,
 }
 
 impl Default for GuiConfig {
@@ -60,12 +27,6 @@ impl Default for GuiConfig {
         Self {
             paste_shortcut: "ctrl+v".to_string(),
             paste_shortcut_by_app: map,
-            paste_backend: PasteBackend::default(),
-            // Generous default: large models + heavy wayland roundtrips +
-            // a busy compositor can each consume a few hundred ms; 8 s is
-            // the upper bound before we suspect a hang. Lower it on a fast
-            // setup if you prefer snappier fallback to wl-copy.
-            paste_timeout: Duration::from_secs(8),
         }
     }
 }
@@ -76,8 +37,6 @@ impl Default for GuiConfig {
 struct RawGuiConfig {
     paste_shortcut: Option<String>,
     paste_shortcut_by_app: Option<HashMap<String, String>>,
-    paste_backend: Option<PasteBackend>,
-    paste_timeout_ms: Option<u64>,
 }
 
 impl GuiConfig {
@@ -137,25 +96,11 @@ impl GuiConfig {
             }
         }
 
-        if let Some(backend) = raw.paste_backend {
-            cfg.paste_backend = backend;
-        }
-
-        if let Some(ms) = raw.paste_timeout_ms {
-            if ms == 0 {
-                warn!("paste_timeout_ms is zero; keeping default");
-            } else {
-                cfg.paste_timeout = Duration::from_millis(ms);
-            }
-        }
-
         info!(
-            "Loaded config from {} (default shortcut: {}, {} per-app overrides, clipboard backend: {:?}, paste timeout: {:?})",
+            "Loaded config from {} (default shortcut: {}, {} per-app overrides)",
             path.display(),
             cfg.paste_shortcut,
-            cfg.paste_shortcut_by_app.len(),
-            cfg.paste_backend,
-            cfg.paste_timeout
+            cfg.paste_shortcut_by_app.len()
         );
 
         cfg
@@ -189,48 +134,4 @@ fn config_path() -> Option<PathBuf> {
         );
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paste_backend_defaults_to_wl_copy() {
-        assert_eq!(PasteBackend::default(), PasteBackend::WlCopy);
-    }
-
-    #[test]
-    fn paste_backend_parses_via_raw_config() {
-        // Round-trip through the same path the loader uses. The RawGuiConfig
-        // representation in this module accepts the key `paste_backend` with
-        // `wl-copy` and `wl-clipboard-rs` strings.
-        let parsed: RawGuiConfig = toml::from_str("paste_backend = \"wl-copy\"").unwrap();
-        assert_eq!(parsed.paste_backend, Some(PasteBackend::WlCopy));
-
-        let parsed: RawGuiConfig = toml::from_str("paste_backend = \"wl-clipboard-rs\"").unwrap();
-        assert_eq!(parsed.paste_backend, Some(PasteBackend::WlClipboardRs));
-    }
-
-    #[test]
-    fn paste_timeout_parses_milliseconds() {
-        let parsed: RawGuiConfig = toml::from_str("paste_timeout_ms = 2000").unwrap();
-        assert_eq!(parsed.paste_timeout_ms, Some(2000));
-    }
-
-    #[test]
-    fn gui_config_default_paste_timeout_is_generous() {
-        // Default is sane: > 0 and < 30s. Anything outside that should be a
-        // deliberate choice.
-        let cfg = GuiConfig::default();
-        let ms = cfg.paste_timeout.as_millis();
-        assert!(ms >= 1000, "default too short: {} ms", ms);
-        assert!(ms <= 30_000, "default too long: {} ms", ms);
-    }
-
-    #[test]
-    fn gui_config_default_backend_is_wl_copy() {
-        let cfg = GuiConfig::default();
-        assert_eq!(cfg.paste_backend, PasteBackend::WlCopy);
-    }
 }
