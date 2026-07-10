@@ -4,7 +4,18 @@ use std::process::Command;
 use super::clipboard::{self, PasteOutcome};
 use super::config::GuiConfig;
 
-pub fn type_text(text: &str, config: &GuiConfig) -> PasteOutcome {
+/// Run the synchronous paste cycle on a blocking thread with a hard timeout.
+///
+/// `paste_text_via_clipboard` is currently synchronous and may block indefinitely
+/// when the chosen backend (notably `wl-clipboard-rs` against some wlroots
+/// compositors) gets stuck inside a Wayland roundtrip. That call runs inside
+/// the tokio worker that also services the OSD and the control server, so a
+/// hang there freezes the whole GUI. Running the call on a `spawn_blocking`
+/// task and wrapping it with `tokio::time::timeout` lets the worker recover:
+/// when the timeout fires we fall back to the robust `wl-copy` subprocess
+/// path while the hung worker thread continues in the background (it never
+/// finishes on its own, but it does not interfere with future operations).
+pub async fn type_text(text: &str, config: &GuiConfig) -> PasteOutcome {
     if text.trim().is_empty() {
         return PasteOutcome::Refused {
             reason: "transcription is empty".to_string(),
@@ -16,16 +27,45 @@ pub fn type_text(text: &str, config: &GuiConfig) -> PasteOutcome {
         text.chars().count()
     );
 
-    // Primary path: put the text in the clipboard, simulate the configured
-    // paste shortcut (per-app override or default), then restore whatever
-    // was there before. This is more reliable than wtype's
-    // character-by-character synthesis (which mangles non-ASCII, dead keys,
-    // IMEs, etc.) and preserves the user's prior clipboard contents.
-    //
-    // If wtype is missing entirely (e.g. minimal Wayland setups), the
-    // routine logs a warning and the text stays in the clipboard, so the
-    // user can paste it manually.
-    clipboard::paste_text_via_clipboard(text, config)
+    // Clone the inputs so the spawning closure captures owned data. Spawning
+    // itself requires `'static + Send + 'static`; `Config` is `Clone`, and
+    // `text` is converted to a `String`.
+    let text_owned = text.to_string();
+    let config_owned = config.clone();
+    let timeout = config.paste_timeout;
+
+    // Run the synchronous paste on a blocking thread so the tokio worker
+    // is free to keep processing OSD updates and control commands while the
+    // call makes its wayland roundtrips.
+    let paste_handle = tokio::task::spawn_blocking(move || {
+        clipboard::paste_text_via_clipboard(&text_owned, &config_owned)
+    });
+
+    // Wait for the paste cycle with a hard timeout. If the timeout fires we
+    // fall back to a known-good paste path; the spawned thread continues
+    // running in the background but does not block any other GUI operation.
+    match tokio::time::timeout(timeout, paste_handle).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(join_err)) => {
+            warn!("Paste thread panicked ({}); aborting paste", join_err);
+            PasteOutcome::Refused {
+                reason: format!("paste thread panicked: {}", join_err),
+            }
+        }
+        Err(_elapsed) => {
+            warn!(
+                "Paste via {:?} did not complete within {:?}; \
+                 falling back to wl-copy subprocess and continuing anyway",
+                config.paste_backend, timeout
+            );
+            // The hung `paste_text_via_clipboard` thread is leaked on
+            // purpose: killing it from Rust is not safe (the thread holds
+            // internal wayland state) and its actions are bounded. Future
+            // toggles will keep working because this call site does not
+            // depend on it.
+            clipboard::paste_text_via_wl_copy_subprocess(text, config)
+        }
+    }
 }
 
 /// Backwards-compatible direct fallback for callers that specifically want

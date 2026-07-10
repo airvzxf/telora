@@ -240,7 +240,7 @@ async fn handle_daemon_commands(
                         let cleaned = text::clean_transcription(&raw_text);
                         let is_auto = mode == "AUTO";
                         let paste_outcome = if mode == "TYPE" || is_auto {
-                            input::type_text(&cleaned, &gui_config)
+                            input::type_text(&cleaned, &gui_config).await
                         } else {
                             input::copy_text(&cleaned);
                             clipboard::PasteOutcome::Ok
