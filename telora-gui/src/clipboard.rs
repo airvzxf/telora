@@ -23,7 +23,7 @@ use wl_clipboard_rs::paste::{
     self, ClipboardType as PasteClipboardType, Error as PasteError, MimeType as PasteMimeType, Seat,
 };
 
-use crate::config::{GuiConfig, PasteBackend};
+use crate::config::GuiConfig;
 use crate::focus;
 
 /// MIME type used by KDE / KPasswordManagerHint to flag sensitive content
@@ -37,7 +37,7 @@ const TRANSCRIPTION_MIME: &str = "text/plain;charset=utf-8";
 
 /// Grace period between the simulated paste and the restore, giving the
 /// focused application time to read the clipboard data via the data-control
-/// protocol before we overwrite it with the original.
+/// protocol before we overwrite it.
 const RESTORE_DELAY_MS: u64 = 150;
 
 /// Threshold above which we log the previous backup size at INFO instead of
@@ -221,115 +221,27 @@ pub fn restore(snap: &ClipboardSnapshot) -> Result<(), copy::Error> {
     opts.copy_multi(mime_sources)
 }
 
-/// Type `text` by routing it through the Wayland clipboard.
+/// Type `text` by routing it through the Wayland clipboard:
 ///
-/// Selects one of two backends based on [`GuiConfig::paste_backend`]:
+/// 1. Back up every MIME type the current clipboard advertises (multi-MIME).
+/// 2. Put `text` in the clipboard as `text/plain;charset=utf-8`.
+/// 3. Simulate the configured paste shortcut so the focused application
+///    pastes it (`ctrl+v` by default; per-app overrides in `gui.toml`
+///    cover terminals that use `ctrl+shift+v` or `shift+insert`).
+/// 4. Wait briefly so the receiving app has time to read the clipboard.
+/// 5. Restore the original clipboard contents, re-offering every MIME
+///    type it previously held.
 ///
-/// - [`PasteBackend::WlCopy`] (default): single-MIME backup/restore via the
-///   `wl-copy` / `wl-paste` CLI tools. Robust on every Wayland compositor;
-///   preserves only one MIME type per cycle. See
-///   [`paste_text_via_wl_copy_subprocess`].
-///
-/// - [`PasteBackend::WlClipboardRs`]: multi-MIME backup/restore via the
-///   `wl-clipboard-rs` Rust crate. Preserves every MIME type the source
-///   advertised (e.g. `text/html` + `text/plain` + `image/png`). See
-///   [`paste_text_via_wl_clipboard_rs`]. Experimental: some compositor /
-///   Wayland-backend combinations cause a pipe read inside
-///   `paste::get_contents` to block indefinitely. If the OSD stays at
-///   "Procesando..." during a paste cycle, switch back to `wl-copy`.
+/// If `wl-clipboard-rs` cannot talk to the compositor (no
+/// `wlr-data-control` / `ext-data-control`), the routine falls back to
+/// `wl-copy` / `wl-paste` and returns [`PasteOutcome::FallbackSingleMime`].
+/// The transcription is still pasted and left in the clipboard so the user
+/// can recover either by re-copying or by manual paste.
 ///
 /// Refuses to run when the clipboard currently contains the KDE password
 /// manager hint, so we never overwrite a password/key with the
 /// transcription.
 pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) -> PasteOutcome {
-    match config.paste_backend {
-        PasteBackend::WlCopy => paste_text_via_wl_copy_subprocess(text, config),
-        PasteBackend::WlClipboardRs => paste_text_via_wl_clipboard_rs(text, config),
-    }
-}
-
-/// Single-MIME backup/restore via the `wl-copy` / `wl-paste` CLI tools.
-///
-/// Type `text` through the Wayland clipboard:
-///
-/// 1. Snapshot the current primary MIME type with `wl-paste --list-types` /
-///    `wl-paste --type <primary>`.
-/// 2. Put `text` in the clipboard as `text/plain;charset=utf-8` via
-///    `wl-copy`.
-/// 3. Simulate the configured paste shortcut so the focused application
-///    pastes it (`ctrl+v` by default; per-app overrides in `gui.toml`
-///    cover terminals that use `ctrl+shift+v` or `shift+insert`).
-/// 4. Wait briefly so the receiving app has time to read the clipboard.
-/// 5. Restore the original primary MIME type via `wl-copy`.
-///
-/// Only the first MIME type is preserved (typically `text/html` for
-/// browsers / VSCode / Geany, etc.). To preserve every MIME type, set
-/// `paste_backend = "wl-clipboard-rs"` in `gui.toml`.
-///
-/// Refuses to run when the clipboard currently contains the KDE password
-/// manager hint, so we never overwrite a password/key with the
-/// transcription.
-///
-/// Returns [`PasteOutcome::Ok`] on success because the path matches the
-/// user's expressed preference; use [`paste_text_via_wl_clipboard_rs`] for
-/// the multi-MIME flow that may downgrade to this one as a fallback.
-pub fn paste_text_via_wl_copy_subprocess(text: &str, config: &GuiConfig) -> PasteOutcome {
-    if text.is_empty() {
-        return PasteOutcome::Refused {
-            reason: "transcription is empty".to_string(),
-        };
-    }
-
-    if has_sensitive_content() {
-        log::warn!(
-            "Clipboard contains sensitive data ({}); refusing to overwrite \
-             it with the transcription. Paste manually after clearing the \
-             clipboard.",
-            SENSITIVE_MIME
-        );
-        return PasteOutcome::Refused {
-            reason: format!("clipboard contains {}", SENSITIVE_MIME),
-        };
-    }
-
-    let snap = backup_via_wl_paste();
-
-    match write_to_clipboard_via_wl_copy(TRANSCRIPTION_MIME, text.as_bytes()) {
-        Ok(()) => {}
-        Err(e) => {
-            log::warn!("wl-copy write failed ({}); aborting paste", e);
-            return PasteOutcome::Refused {
-                reason: format!("wl-copy write failed: {}", e),
-            };
-        }
-    }
-
-    let app_id = focus::focused_app_id();
-    let shortcut = config.resolve_paste_shortcut(app_id.as_deref());
-    let args = parse_shortcut(&shortcut);
-
-    log::info!(
-        "Simulating paste shortcut '{}' (app_id={}, wl-copy single-MIME)",
-        shortcut,
-        app_id.as_deref().unwrap_or("<unknown>")
-    );
-
-    if let Err(e) = Command::new("wtype").args(&args).status() {
-        log::warn!("Failed to run wtype ({}); text remains in clipboard", e);
-    }
-
-    if snap.had_content {
-        thread::sleep(Duration::from_millis(RESTORE_DELAY_MS));
-        restore_via_wl_copy(&snap);
-    }
-
-    PasteOutcome::Ok
-}
-
-/// Same as [`paste_text_via_clipboard`] but always uses the `wl-clipboard-rs`
-/// path. Exposed for tests and for callers that want to force the multi-MIME
-/// flow regardless of the user's config.
-pub fn paste_text_via_wl_clipboard_rs(text: &str, config: &GuiConfig) -> PasteOutcome {
     if text.is_empty() {
         return PasteOutcome::Refused {
             reason: "transcription is empty".to_string(),
@@ -356,7 +268,7 @@ pub fn paste_text_via_wl_clipboard_rs(text: &str, config: &GuiConfig) -> PasteOu
              to wl-copy / wl-paste single-MIME for this round",
             reason
         );
-        return paste_text_via_wl_copy_subprocess_inner(text, config, reason);
+        return paste_text_via_wl_copy_fallback(text, config, reason);
     }
 
     if let Err(e) = write_to_clipboard_multi(text) {
@@ -367,7 +279,7 @@ pub fn paste_text_via_wl_clipboard_rs(text: &str, config: &GuiConfig) -> PasteOu
                  single-MIME for this round",
                 reason
             );
-            return paste_text_via_wl_copy_subprocess_inner(text, config, reason);
+            return paste_text_via_wl_copy_fallback(text, config, reason);
         }
         log::warn!(
             "Failed to put text in clipboard via wl-clipboard-rs ({}); aborting paste",
@@ -432,17 +344,13 @@ fn write_to_clipboard_multi(text: &str) -> Result<(), copy::Error> {
     }])
 }
 
-fn paste_text_via_wl_copy_subprocess_inner(
-    text: &str,
-    config: &GuiConfig,
-    reason: String,
-) -> PasteOutcome {
+fn paste_text_via_wl_copy_fallback(text: &str, config: &GuiConfig, reason: String) -> PasteOutcome {
     let snap = backup_via_wl_paste();
 
     if let Err(e) = write_to_clipboard_via_wl_copy(TRANSCRIPTION_MIME, text.as_bytes()) {
-        log::warn!("wl-copy write failed ({}); aborting paste", e);
+        log::warn!("wl-copy fallback write failed ({}); aborting paste", e);
         return PasteOutcome::Refused {
-            reason: format!("wl-copy write failed: {}", e),
+            reason: format!("wl-copy fallback write failed: {}", e),
         };
     }
 
@@ -451,7 +359,7 @@ fn paste_text_via_wl_copy_subprocess_inner(
     let args = parse_shortcut(&shortcut);
 
     log::info!(
-        "Simulating paste shortcut '{}' (app_id={}, wl-copy single-MIME)",
+        "Simulating paste shortcut '{}' (app_id={}, fallback)",
         shortcut,
         app_id.as_deref().unwrap_or("<unknown>")
     );
@@ -463,9 +371,8 @@ fn paste_text_via_wl_copy_subprocess_inner(
     if snap.had_content {
         thread::sleep(Duration::from_millis(RESTORE_DELAY_MS));
         restore_via_wl_copy(&snap);
-        // We deliberately do not return Ok: even when configured as the
-        // primary backend, the multi-MIME promise was not kept, so the
-        // caller surfaces an OSD hint to the user.
+        // We deliberately do not return Ok: the multi-MIME promise was
+        // not kept. The caller will surface an OSD hint to the user.
         PasteOutcome::FallbackSingleMime { reason }
     } else {
         // Nothing to restore, transcription is in the clipboard and ready
