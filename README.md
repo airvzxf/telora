@@ -130,6 +130,14 @@ Recognized keys: `v`, any single letter or digit, `insert`, `delete`/`del`,
 The clipboard's data is never written to disk; it lives only in the GUI
 process memory for the few hundred milliseconds of a typical paste cycle.
 
+**Hang protection.** The clipboard round-trip runs on a `tokio::task::spawn_blocking`
+thread with a hard timeout (`paste_timeout_ms` in `gui.toml`, default 8 s).
+If the chosen backend blocks past the timeout, the GUI falls back to the
+known-good `wl-copy` subprocess path while the hung worker thread continues
+in the background. This makes `toggle-type` resilient to future regressions
+in upstream Wayland libraries (notably `wl-clipboard-rs` on labwc with
+multi-MIME clipboard contents).
+
 ## Customizing Systemd Services
 
 If you need to change how the services start (e.g., adding environment variables like `RUST_LOG`), the best practice is to use a **drop-in override** rather than copying the entire file.
