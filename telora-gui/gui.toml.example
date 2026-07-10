@@ -45,17 +45,6 @@ konsole = "ctrl+shift+v"
 #                  wlr-data-control / ext-data-control. Currently
 #                  experimental: if the GUI stays at "Procesando..." after
 #                  a toggle-type with rich content in the clipboard, switch
-#                  back to wl-copy. Even if the wl-clipboard-rs thread
-#                  hangs, a hard timeout (paste_timeout_ms below) makes
-#                  the GUI recover gracefully by falling back to wl-copy.
+#                  back to wl-copy.
 #
 # paste_backend = "wl-copy"
-
-# Maximum time (in milliseconds) the GUI waits for a `paste_text_via_clipboard`
-# cycle to complete before giving up on the chosen backend and falling back to
-# the wl-copy subprocess path. The hung worker thread continues running in the
-# background but does not block the GUI. Default: 8000 (8 seconds). Lower this
-# on fast setups if you want a snappier fallback; raise it if whisper inference
-# and the wayland roundtrips together routinely exceed 8 s.
-#
-# paste_timeout_ms = 8000
