@@ -302,10 +302,13 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
                     plural = if count == 1 { "" } else { "s" },
                     plural2 = if count == 1 { "" } else { "s" }
                 ),
-                // `darkgoldenrod` is CSS #B8860B (readable with white at
-                // 5:1 contrast) — `yellow` (#FFFF00) is unreadable with
-                // white text (1.07:1) and hurts the eyes.
-                "darkgoldenrod".to_string(),
+                // A Partial means the receiving app already got the text
+                // but lost fidelity on a few MIME types. It is not an
+                // error, just a degraded success — surface it in the same
+                // green as `Ok` so the colour does not suggest something
+                // went wrong; only the trailing '⚠ N tipos perdidos'
+                // tells the user that some clipboard content was dropped.
+                "green".to_string(),
             )
         }
         clipboard::PasteOutcome::FallbackSingleMime { .. } => (
