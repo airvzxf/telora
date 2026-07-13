@@ -1,86 +1,63 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::File;
-use std::io::Write;
+//! `telora-models` — thin wrapper around `voxora-hf`.
+//!
+//! The legacy `telora-models list / download / path` CLI surface is
+//! preserved for backwards compatibility, but the implementation
+//! now delegates every Hugging Face operation to [`voxora_hf`].
+//! The previous hardcoded `MODELS` table and direct `reqwest`
+//! downloader are gone.
+//!
+//! All models live in voxora's cache:
+//! `$XDG_CACHE_HOME/voxora/models/huggingface`. `telora-models`
+//! exposes the same view as `voxora-cli list`.
+//!
+//! # Migration
+//!
+//! New flows should call `voxora-cli` directly. `telora-models` is
+//! kept here so old documentation and packaging recipes keep
+//! working. Going forward the plan is to retire it; see
+//! `TODO.md`.
+
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use voxora_core::{ModelSource, ResolveOptions};
+
 #[derive(Parser)]
-#[command(author, version, about = "Telora Model Manager - Download and manage Whisper models", long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Telora Model Manager - delegates to voxora-hf",
+    long_about = "telora-models is a thin wrapper around `voxora-hf`. \
+                  Same UX as before, but all downloads go through \
+                  voxora's cache at $XDG_CACHE_HOME/voxora/models/huggingface. \
+                  New flows should call `voxora-cli` directly."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Override the voxora cache directory (otherwise
+    /// `$XDG_CACHE_HOME/voxora/models/huggingface`).
+    #[arg(long, global = true, value_name = "DIR")]
+    voxora_cache: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List available models
+    /// List models currently cached by voxora.
     List,
-    /// Download a model
+    /// Download (or re-resolve) a Hugging Face model id through
+    /// voxora-hf. Accepts any HF id (e.g.
+    /// `Qwen/Qwen3-ASR-0.6B` or
+    /// `ggerganov/whisper.cpp/ggml-base.bin`).
     Download {
-        /// Name of the model to download (e.g., "base", "small", "medium")
-        name: Option<String>,
-        /// Force re-download
-        #[arg(short, long)]
-        force: bool,
-        /// Download to global system directory (/usr/share/telora/models)
-        #[arg(short, long)]
-        global: bool,
-        /// Custom URL to download from
-        #[arg(short, long)]
-        url: Option<String>,
-        /// Custom output filename
-        #[arg(short, long)]
-        out: Option<String>,
+        /// Hugging Face model identifier.
+        #[arg(value_name = "HF_MODEL_ID")]
+        model_id: String,
     },
-    /// Show the storage paths
+    /// Show the voxora cache directory used by telora.
     Path,
-}
-
-struct ModelInfo {
-    name: &'static str,
-    url: &'static str,
-    description: &'static str,
-}
-
-const MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        name: "tiny",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-        description: "Tiny model (lowest accuracy)",
-    },
-    ModelInfo {
-        name: "base",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
-        description: "Base model (standard balance)",
-    },
-    ModelInfo {
-        name: "small",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-        description: "Small model",
-    },
-    ModelInfo {
-        name: "medium",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-        description: "Medium model",
-    },
-    ModelInfo {
-        name: "large-v3",
-        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-        description: "Large v3 model (highest accuracy)",
-    },
-];
-
-fn get_local_models_dir() -> Result<PathBuf> {
-    let mut path = dirs::data_local_dir().context("Could not find local data directory")?;
-    path.push("telora");
-    path.push("models");
-    Ok(path)
-}
-
-fn get_global_models_dir() -> PathBuf {
-    PathBuf::from("/usr/share/telora/models")
 }
 
 #[tokio::main]
@@ -88,139 +65,109 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
+    let cache_root = cli.voxora_cache.clone().unwrap_or_else(default_cache_dir);
+    let source = build_source(cli.voxora_cache.as_deref())?;
+
     match cli.command {
-        Commands::List => {
-            let local_dir = get_local_models_dir()?;
-            let global_dir = get_global_models_dir();
-
-            println!("Available models in https://huggingface.co/ggerganov/whisper.cpp:");
-            println!(
-                "{:<12} {:<40} {:<10} {:<10}",
-                "NAME", "DESCRIPTION", "LOCAL", "GLOBAL"
-            );
-            println!("{:-<12} {:-<40} {:-<10} {:-<10}", "", "", "", "");
-            for model in MODELS {
-                let local_path = local_dir.join(format!("ggml-{}.bin", model.name));
-                let global_path = global_dir.join(format!("ggml-{}.bin", model.name));
-
-                let local_status = if local_path.exists() { "YES" } else { "-" };
-                let global_status = if global_path.exists() { "YES" } else { "-" };
-
-                println!(
-                    "{:<12} {:<40} {:<10} {:<10}",
-                    model.name, model.description, local_status, global_status
-                );
-            }
-
-            println!("\nNote: telora-daemon prioritizes LOCAL models over GLOBAL ones.");
-        }
-        Commands::Path => {
-            println!("Local:  {}", get_local_models_dir()?.display());
-            println!("Global: {}", get_global_models_dir().display());
-        }
-        Commands::Download {
-            name,
-            force,
-            global,
-            url,
-            out,
-        } => {
-            let (download_url, model_identifier) = if let Some(custom_url) = url.clone() {
-                (custom_url, name.clone())
-            } else {
-                let name = name
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Model name or --url is required."))?;
-                if let Some(model) = MODELS.iter().find(|m| m.name == name) {
-                    println!("Download from https://huggingface.co/ggerganov/whisper.cpp");
-                    (model.url.to_string(), Some(model.name.to_string()))
-                } else {
-                    println!("Download from https://huggingface.co/ggerganov/whisper.cpp");
-                    let constructed_url = format!(
-                        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin",
-                        name
-                    );
-                    (constructed_url, Some(name))
-                }
-            };
-
-            let file_name = if let Some(output_name) = out {
-                output_name
-            } else if url.is_some() {
-                // If URL is provided, default to the filename in the URL
-                Path::new(&download_url)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Could not determine filename from URL. Use --out to specify one."
-                        )
-                    })?
-            } else {
-                // Default HuggingFace pattern
-                format!(
-                    "ggml-{}.bin",
-                    model_identifier.expect("Model identifier should be present if URL is not")
-                )
-            };
-
-            let target_dir = if global {
-                get_global_models_dir()
-            } else {
-                get_local_models_dir()?
-            };
-
-            if !target_dir.exists() {
-                std::fs::create_dir_all(&target_dir).with_context(|| {
-                    format!(
-                        "Failed to create directory {}. Check permissions (use sudo for --global).",
-                        target_dir.display()
-                    )
-                })?;
-            }
-
-            let dest_path = target_dir.join(&file_name);
-
-            if dest_path.exists() && !force {
-                println!(
-                    "File '{}' already exists at {}. Use --force to overwrite.",
-                    file_name,
-                    dest_path.display()
-                );
-                return Ok(());
-            }
-
-            println!("Downloading to {}...", dest_path.display());
-            download_file(&download_url, &dest_path).await?;
-            println!("Download complete.");
-        }
+        Commands::List => list_cmd(&cache_root),
+        Commands::Download { model_id } => download_cmd(&source, &model_id).await,
+        Commands::Path => path_cmd(&cache_root),
     }
+}
+
+fn build_source(cache: Option<&Path>) -> Result<voxora_hf::HuggingFaceSource> {
+    let mut builder = voxora_hf::HuggingFaceSource::builder();
+    if let Some(dir) = cache {
+        builder = builder.cache_dir(dir.to_path_buf());
+    }
+    // Token is auto-resolved by voxora-hf from HF_TOKEN /
+    // HUGGING_FACE_HUB_TOKEN when builder.token() is not called.
+    builder.build().context("failed to build HuggingFaceSource")
+}
+
+fn list_cmd(cache_root: &Path) -> Result<()> {
+    let entries = voxora_hf::cache::list_cached(cache_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if entries.is_empty() {
+        println!("No models cached yet.");
+        println!("Run `telora-models download <hf-model-id>` to fetch one.");
+        println!("Run `voxora list` for the same view (recommended).");
+        return Ok(());
+    }
+
+    println!("Models cached by voxora (source-of-truth cache):");
+    println!("{:<70} {:<10} COMPLETE", "PATH", "BYTES");
+    println!("{:-<70} {:-<10} {:-<8}", "", "", "");
+    for entry in entries {
+        println!(
+            "{:<70} {:<10} {}",
+            truncate(&entry.path.display().to_string(), 70),
+            human_bytes(entry.bytes_total),
+            if entry.complete_marker_present {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+
+    println!("\nNote: telora-models now uses voxora's cache. Run `voxora list` for the same view.");
+    Ok(())
+}
+
+async fn download_cmd(source: &voxora_hf::HuggingFaceSource, model_id: &str) -> Result<()> {
+    let opts = ResolveOptions::default();
+    let dir = source
+        .resolve(model_id, &opts)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to resolve {model_id:?}"))?;
+
+    println!("Model {model_id:?} is ready at {}.", dir.path.display());
+    println!(
+        "Quantization: {:?}\nSource:       {}\n\nNext: set `model_id = {model_id:?}` in telora.toml and start the daemon.",
+        dir.quantization,
+        dir.kind.tag()
+    );
 
     Ok(())
 }
 
-async fn download_file(url: &str, path: &Path) -> Result<()> {
-    let res = reqwest::get(url)
-        .await
-        .context("Failed to initiate request")?;
-    let total_size = res.content_length().unwrap_or(0);
-
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
-        .progress_chars("#>-"));
-
-    let mut file = File::create(path).context("Failed to create file")?;
-    let mut stream = res.bytes_stream();
-
-    while let Some(item) = stream.next().await {
-        let chunk = item.context("Error while downloading chunk")?;
-        file.write_all(&chunk)
-            .context("Error while writing to file")?;
-        pb.inc(chunk.len() as u64);
-    }
-
-    pb.finish_with_message("Downloaded");
+fn path_cmd(cache_root: &Path) -> Result<()> {
+    println!("Telora (voxora) model cache: {}", cache_root.display());
     Ok(())
+}
+
+/// Mirror of `voxora_hf::cache::default_cache_root`. Kept private
+/// there to keep the voxora-hf API surface minimal; duplicated here
+/// because we only need it for the `path` subcommand.
+fn default_cache_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR") {
+        return PathBuf::from(custom);
+    }
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+    base.join("voxora").join("models").join("huggingface")
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("...{}", &s[s.len().saturating_sub(max - 3)..])
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
 }
