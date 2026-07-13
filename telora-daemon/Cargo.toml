@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-whisper-rs = { version = "0.13.2", features = ["cuda"] }
+# voxora-bridge replaces the direct whisper-rs dependency. voxora-bridge
+# defaults to `["whisper", "qwen3asr"]`, which is exactly what the
+# daemon needs so users can switch model_kind without a rebuild.
+voxora-bridge = { workspace = true }
+
 cpal = "0.15"
 anyhow = "1.0"
 tokio = { version = "1.36", features = ["full"] }

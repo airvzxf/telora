@@ -6,18 +6,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
+/// Status payload returned to clients over the unix socket.
+///
+/// `model_kind` is the voxora engine family (`whisper` or
+/// `qwen3-asr`). `model_id` is the Hugging Face identifier the
+/// daemon loaded (e.g. `ggerganov/whisper.cpp/ggml-base.bin`).
+/// `model_path` is the resolved local file/directory the engine
+/// actually loaded from — kept for the GUI's status display.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub active: bool,
     pub pid: u32,
+    pub model_id: String,
+    pub model_kind: String,
     pub model_path: String,
     pub language: String,
     pub max_recording_seconds: u32,
     pub state: String,
 }
 
+/// Configuration the daemon reads from `telora.toml` (or
+/// `TELORA_*` env vars).
+///
+/// `model_kind` is a free-form string at the JSON layer so we can
+/// pass it verbatim over the socket; the daemon validates it via
+/// [`voxora_bridge::ModelKind::from_config`].
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SttConfig {
+    pub model_id: String,
+    pub model_kind: String,
     pub model_path: String,
     pub language: String,
     pub max_recording_seconds: u32,
