@@ -10,6 +10,7 @@
 - [ ] **Continuous Dictation Mode**: A mode where the daemon transcribes in real-time without manual toggling.
 - [ ] **Multi-language Auto-detection**: Leverage Whisper's language detection capabilities.
 - [x] **Architecture Refactor**: Move core logic from `telora-daemon/src/main.rs` to a `lib.rs` and implement a `Transcriber` trait for future engine support.
+- [x] **Model-agnostic backend via voxora**: `telora-daemon` now depends on `voxora-bridge` and loads Whisper (whisper.cpp) or Qwen3-ASR (candle) via the same `Arc<dyn AsrEngine>` boundary. `model_kind` + `model_id` in `telora.toml` selects which one. Legacy `WhisperTranscriber` is replaced by `BridgeTranscriber`. `telora-models` is now a thin wrapper around `voxora-hf`.
 
 ## UI/UX
 - [ ] **Tray Icon**: Add a system tray icon for status monitoring and quick settings.
@@ -21,8 +22,9 @@
 
 ## Maintenance
 - [ ] **Unit Tests**: Increase coverage for audio processing and socket communication.
-- [ ] **Integrity Checks**: Add SHA256 checksum verification for model downloads in `telora-models`.
+- [ ] **Integrity Checks**: Add SHA256 checksum verification for model downloads in `telora-models`. (Voxora-hf already does this; `telora-models` does not need its own.)
 - [ ] **CI/CD**: Automate binary releases for different distributions.
+- [ ] **Deprecate `telora-models` in favour of `voxora-cli`**: `telora-models` is now a thin wrapper around `voxora-hf`. Once the package ecosystem catches up, retire `telora-models` and tell users to call `voxora-cli list/download` directly.
 
 ## Core & Stability (Developer & DevOps).
 - [ ] **Modernize IPC**: Replace custom text-based protocol with a structured format (JSON-RPC or Varlink) to support metadata (confidence, durat

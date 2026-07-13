@@ -1,13 +1,48 @@
-# Path to the model file.
-# Can be an absolute path, or relative to:
-# - $HOME/.local/share/telora/models/
-# - /usr/share/telora/models/
-# - ./models/
-model_path = "ggml-base.bin"
+# Telora configuration.
+#
+# The daemon loads this file at startup. Fields can be overridden
+# with environment variables prefixed with `TELORA_` (e.g.
+# `TELORA_LANGUAGE=fr`) or with CLI flags
+# (`telora-daemon --language fr`).
 
-# Language code (e.g., "es", "en", "fr")
-# This is passed to the Whisper model.
+# Engine family. One of:
+#   "whisper"    — whisper.cpp via voxora-whisper (ggml-*.bin files)
+#   "qwen3-asr"  — Qwen3-ASR via voxora-qwen3asr (candle, multi-lingual)
+model_kind = "whisper"
+
+# Hugging Face model identifier (or local path, see below).
+#
+# The daemon calls voxora-bridge which calls voxora-hf to resolve
+# this id, downloading (if needed) and caching the weights into
+# `$XDG_CACHE_HOME/voxora/models/huggingface`. Switch engines by
+# editing this field and `model_kind`; no code changes required.
+#
+# A few examples:
+#   ggerganov/whisper.cpp/ggml-base.bin   — Whisper base (English-ish)
+#   ggerganov/whisper.cpp/ggml-large-v3.bin
+#   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR (20 languages)
+#   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR (larger, 20 languages)
+#
+# To use a model that lives outside Hugging Face, point
+# `voxora_cache` (or the `--voxora-cache` CLI flag) at the
+# directory that already contains the weights — voxora-hf will pick
+# them up.
+model_id = "ggerganov/whisper.cpp/ggml-base.bin"
+
+# Legacy field: kept so old telora.toml files keep working.
+# The daemon reads `model_id` (above) and falls back to this if
+# `model_id` is empty. New configs should set `model_id` directly.
+model_path = ""
+
+# Language code (ISO 639-1, e.g. "es", "en", "fr"). The daemon
+# translates this to the engine-specific vocabulary internally:
+#   - whisper: passed through as-is.
+#   - qwen3-asr: mapped to the full English name
+#     (`english`, `chinese`, `cantonese`, …).
 language = "es"
 
 # Maximum recording time in seconds.
+# The daemon will automatically stop and process the audio if this
+# limit is reached. Default is 600 seconds (10 minutes). Set to a
+# higher value for long dictations, or lower to prevent memory abuse.
 max_recording_seconds = 300
