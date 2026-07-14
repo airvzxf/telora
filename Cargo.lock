@@ -3908,7 +3908,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxora-bridge"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61975a0f7d96c2180c5e57d25f3fbbdf81ab0065e45669aac44ef6e75ccea570"
 dependencies = [
  "thiserror 2.0.18",
  "voxora-core",
@@ -3919,7 +3921,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-core"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff54d1f1c2917abcb7493f17f13f8597e186ffa2f8bd68a94681716d46c0a221"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -3927,7 +3931,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-hf"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396c110601e5a42f76db54890da750546b8dc51492cee57aef53d9aecc84bcbb"
 dependencies = [
  "async-trait",
  "dirs",
@@ -3943,7 +3949,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-qwen3asr"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97e3c23174c1d997abb93b4aac8de736b2b00b3720f107a7f7f29810689715b1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3956,7 +3964,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-whisper"
-version = "0.0.0"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd333abd924448374a7e8b0a7a3b757670c2fc1006d1b840934f76803a25917e"
 dependencies = [
  "thiserror 2.0.18",
  "voxora-core",

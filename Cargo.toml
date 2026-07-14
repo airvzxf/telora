@@ -6,18 +6,13 @@ members = ["telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 version = "0.1.0"
 edition = "2024"
 
-# voxora lives as a sibling repository (`../voxora`) when developing
-# locally. All three voxora crates the telora workspace depends on
-# are declared here so each member crate only has to opt into the
-# features it wants.
-#
-# CI / production deployments should switch these to git or registry
-# deps; for the phase-6 PR we keep path deps because voxora is not
-# published yet.
+# voxora 0.1.0 is on crates.io (published as part of phase 6). The
+# three voxora crates telora depends on are resolved from the
+# registry; local-dev sibling layout is no longer required.
 [workspace.dependencies]
-voxora-core    = { path = "../voxora/voxora-core" }
-voxora-hf      = { path = "../voxora/voxora-hf" }
-voxora-bridge  = { path = "../voxora/voxora-bridge" }
+voxora-core    = "0.1"
+voxora-hf      = "0.1"
+voxora-bridge  = "0.1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
