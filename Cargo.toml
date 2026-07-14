@@ -6,6 +6,14 @@ members = ["telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 version = "0.1.0"
 edition = "2024"
 
+# voxora 0.1.0 is on crates.io (published as part of phase 6). The
+# three voxora crates telora depends on are resolved from the
+# registry; local-dev sibling layout is no longer required.
+[workspace.dependencies]
+voxora-core    = "0.1"
+voxora-hf      = "0.1"
+voxora-bridge  = "0.1"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"

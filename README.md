@@ -41,15 +41,28 @@ You can configure the daemon using a TOML file. The daemon looks for configurati
 ### Example Configuration (`config.toml`)
 
 ```toml
-# Path to the model file.
-# Can be an absolute path, or relative to:
-# - $HOME/.local/share/telora/models/
-# - /usr/share/telora/models/
-# - ./models/
-model_path = "ggml-base.bin"
+# Engine family: "whisper" (whisper.cpp via voxora-whisper) or
+# "qwen3-asr" (Qwen3-ASR via voxora-qwen3asr). Pick one and stick
+# with it for a given install; switching is just an edit.
+model_kind = "whisper"
 
-# Language code (e.g., "es", "en", "fr")
-# This is passed to the Whisper model.
+# Hugging Face identifier (or local path; voxora-hf resolves both).
+# A few common examples:
+#   ggerganov/whisper.cpp/ggml-base.bin   — Whisper base (~142 MB)
+#   ggerganov/whisper.cpp/ggml-large-v3.bin
+#   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR 0.6B (~1.7 GB)
+#   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR 1.7B
+model_id = "ggerganov/whisper.cpp/ggml-base.bin"
+
+# Legacy field; kept so older configs keep working. New configs
+# should set `model_id` directly. If `model_id` is empty and
+# `model_path` is set, the daemon treats `model_path` as the model id.
+model_path = ""
+
+# Language code (ISO 639-1, e.g. "es", "en", "fr"). The daemon
+# translates this to the engine-specific vocabulary internally:
+# whisper gets the ISO code as-is; qwen3-asr gets the full English
+# name ("english", "chinese", …).
 language = "es"
 
 # Maximum recording time in seconds.
@@ -178,11 +191,13 @@ telora-daemon status
 
 ```text
 Telora Daemon Status
-ACTIVE     PID        MODEL                          LANG       MAX_SEC    STATE
----------- ---------- ------------------------------ ---------- ---------- ---------------
-YES        1234       ggml-base.bin                  es         300        Idle
+ACTIVE     PID        KIND       MODEL                          LANG       MAX_SEC    STATE
+---------- ---------- ---------- ------------------------------ ---------- ---------- ---------------
+YES        1234       whisper    ggerganov/whisper.cpp/ggml-b… es         300        Idle
 
-Full Model Path: /usr/share/telora/models/ggml-base.bin
+Full Model Id:   ggerganov/whisper.cpp/ggml-base.bin
+Resolved Path:   /home/user/.cache/voxora/models/huggingface/ggerganov/whisper.cpp/ggml-base.bin/main/ggml-base.bin
+Engine Kind:     whisper
 ```
 
 ## Security & Privacy
@@ -193,38 +208,56 @@ Full Model Path: /usr/share/telora/models/ggml-base.bin
 
 ## Model Management
 
-Use `telora-models` to download and manage Whisper models:
+Telora is model-agnostic. The `telora.toml` file picks the engine family
+(`model_kind`) and the Hugging Face identifier (`model_id`); the daemon
+resolves, downloads, caches and loads the model via
+[`voxora-bridge`](https://github.com/airvzxf/voxora).
+
+```toml
+# Whisper base (English-ish, ~142 MB).
+model_kind = "whisper"
+model_id   = "ggerganov/whisper.cpp/ggml-base.bin"
+
+# Qwen3-ASR 0.6B (20 languages incl. Spanish/Chinese, ~1.7 GB).
+# model_kind = "qwen3-asr"
+# model_id   = "Qwen/Qwen3-ASR-0.6B"
+```
+
+Switch engines by editing `telora.toml` and reloading the daemon
+(`telora-daemon refresh`). No code change required.
+
+### Downloading a model
+
+Models land in voxora's canonical cache:
+`$XDG_CACHE_HOME/voxora/models/huggingface`. You can either let the
+daemon download on first use (it logs progress) or pre-fetch with
+either tool:
 
 ```bash
-# List available and installed models
+# Pre-fetch with voxora-cli (recommended for new flows):
+voxora-cli download Qwen/Qwen3-ASR-0.6B
+voxora-cli download ggerganov/whisper.cpp/ggml-base.bin
+
+# Or use the legacy telora-models wrapper:
+telora-models download Qwen/Qwen3-ASR-0.6B
+telora-models download ggerganov/whisper.cpp/ggml-base.bin
+
+# See what's already cached:
+voxora-cli list
 telora-models list
-
-# Download a predefined model
-telora-models download base
-
-# Download ANY model from whisper.cpp HuggingFace repo (e.g. large-v3-turbo-q8_0)
-telora-models download large-v3-turbo-q8_0
-
-# Download from a custom URL
-telora-models download --url https://example.com/models/custom-whisper.bin
-
-# Specify a custom output name
-telora-models download base --out my-model.bin
-
-# Download a model for all users (requires sudo)
-sudo telora-models download base --global
 ```
+
+Both tools print the same view; `telora-models` exists only for
+backwards compatibility with the pre-voxora packaging recipes and
+will be retired (see `TODO.md`).
 
 ### Model Resolution (Precedence)
 
-When you specify a model (via CLI `--model` or TOML `model_path`), the daemon resolves the path using the following priority:
-
-1.  **Explicit Path**: If you provide a full or relative path (e.g., `./my-models/tiny.bin`), it is used directly.
-2.  **User Models**: `~/.local/share/telora/models/`
-3.  **System Models**: `/usr/share/telora/models/`
-4.  **Local Development**: `./models/` (current working directory)
-
-**Note:** If two models have the same name, the **User** version shadows the **System** version.
+When the daemon resolves `model_id`, it goes through voxora-hf's
+cache. A previously downloaded model is loaded from
+`$XDG_CACHE_HOME/voxora/models/huggingface`; a new id is downloaded
+there on first use. There is no per-user / per-system split anymore
+— the cache is single-tenant per `$XDG_CACHE_HOME`.
 
 ## Usage
 

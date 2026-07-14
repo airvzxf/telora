@@ -15,7 +15,7 @@ mod vad;
 
 use audio::AudioEngine;
 use socket::{Command, SocketServer, StatusResponse, SttConfig};
-use transcriber::{Transcriber, WhisperTranscriber};
+use transcriber::{BridgeTranscriber, Transcriber};
 
 // Config references
 const SOCKET_PATH: &str = "/tmp/telora-sock";
@@ -37,21 +37,27 @@ struct Args {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Path or name of the model file (overrides config).
-    /// If a name is provided (e.g., 'ggml-base.bin'), it searches in order:
-    /// 1. ~/.local/share/telora/models/
-    /// 2. /usr/share/telora/models/
-    /// 3. ./models/
-    #[arg(short, long)]
-    model: Option<String>,
+    /// Hugging Face model id (overrides config).
+    /// Example: `Qwen/Qwen3-ASR-0.6B` or
+    /// `ggerganov/whisper.cpp/ggml-base.bin`.
+    #[arg(long)]
+    model_id: Option<String>,
 
-    /// Language (overrides config)
+    /// Engine family (`whisper` or `qwen3-asr`); overrides config.
+    #[arg(long)]
+    model_kind: Option<String>,
+
+    /// Language (ISO 639-1, e.g. "es", "en"); overrides config.
     #[arg(short, long)]
     language: Option<String>,
 
-    /// Maximum recording time in seconds (overrides config)
+    /// Maximum recording time in seconds (overrides config).
     #[arg(long)]
     max_recording_seconds: Option<u32>,
+
+    /// Hugging Face cache directory (overrides config).
+    #[arg(long)]
+    voxora_cache: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -69,10 +75,23 @@ enum State {
     Processing,
 }
 
+/// Default values for [`SttConfig`] when the user's `telora.toml`
+/// does not supply them. Matches the legacy defaults so an upgrade
+/// from a Whisper-only install still boots a working daemon.
+fn default_stt_config() -> SttConfig {
+    SttConfig {
+        model_id: "ggerganov/whisper.cpp/ggml-base.bin".to_string(),
+        model_kind: "whisper".to_string(),
+        model_path: String::new(),
+        language: "es".to_string(),
+        max_recording_seconds: 600,
+    }
+}
+
 fn load_config(args: &Args) -> SttConfig {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
 
-    // Load configuration from multiple sources in order of precedence (last one wins)
+    // Load configuration from multiple sources in order of precedence (last one wins).
     let mut builder = Config::builder();
 
     // 1. System config (/etc/telora.toml) - Lowest priority
@@ -93,24 +112,22 @@ fn load_config(args: &Args) -> SttConfig {
 
     let config_res = builder.build();
     let mut stt_config: SttConfig = match config_res {
-        Ok(c) => c.try_deserialize().unwrap_or(SttConfig {
-            model_path: "ggml-base.bin".to_string(),
-            language: "es".to_string(),
-            max_recording_seconds: 600,
+        Ok(c) => c.try_deserialize().unwrap_or_else(|e| {
+            warn!("Configuration warning: {}. Using defaults.", e);
+            default_stt_config()
         }),
         Err(e) => {
             warn!("Configuration warning: {}. Using defaults.", e);
-            SttConfig {
-                model_path: "ggml-base.bin".to_string(),
-                language: "es".to_string(),
-                max_recording_seconds: 600,
-            }
+            default_stt_config()
         }
     };
 
     // CLI args override
-    if let Some(m) = &args.model {
-        stt_config.model_path = m.clone();
+    if let Some(m) = &args.model_id {
+        stt_config.model_id = m.clone();
+    }
+    if let Some(k) = &args.model_kind {
+        stt_config.model_kind = k.clone();
     }
     if let Some(l) = &args.language {
         stt_config.language = l.clone();
@@ -119,31 +136,13 @@ fn load_config(args: &Args) -> SttConfig {
         stt_config.max_recording_seconds = s;
     }
 
-    // Attempt to resolve model path if it's just a filename
-    if !std::path::Path::new(&stt_config.model_path).exists() {
-        let filename = if stt_config.model_path.contains('/') {
-            // If it contains a slash but doesn't exist, we'll still try to see if it's just the end part
-            std::path::Path::new(&stt_config.model_path)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(&stt_config.model_path)
-        } else {
-            &stt_config.model_path
-        };
-
-        let candidates = vec![
-            format!("{}/.local/share/telora/models/{}", home, filename),
-            format!("/usr/share/telora/models/{}", filename),
-            format!("models/{}", filename),
-            filename.to_string(),
-        ];
-
-        for path in candidates {
-            if std::path::Path::new(&path).exists() {
-                stt_config.model_path = path;
-                break;
-            }
-        }
+    // Legacy compatibility: if the user's telora.toml only supplies
+    // `model_path`, treat it as a Whisper `model_id` so existing
+    // configs keep working. The `model_path` field was a local file
+    // path in the pre-voxora daemon; HF ids are forward-slash
+    // separated, so the two are unambiguous in practice.
+    if stt_config.model_id.is_empty() && !stt_config.model_path.is_empty() {
+        stt_config.model_id = stt_config.model_path.clone();
     }
 
     stt_config
@@ -184,16 +183,16 @@ async fn run_status_client() -> Result<()> {
         Err(_) => {
             println!("Telora Daemon Status");
             println!(
-                "{:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-                "ACTIVE", "PID", "MODEL", "LANG", "MAX_SEC", "STATE"
+                "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
+                "ACTIVE", "PID", "KIND", "MODEL", "LANG", "MAX_SEC", "STATE"
             );
             println!(
-                "{:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
-                "", "", "", "", "", ""
+                "{:-<10} {:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
+                "", "", "", "", "", "", ""
             );
             println!(
-                "{:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-                "NO", "-", "-", "-", "-", "STOPPED"
+                "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
+                "NO", "-", "-", "-", "-", "-", "STOPPED"
             );
             return Ok(());
         }
@@ -232,27 +231,28 @@ async fn run_status_client() -> Result<()> {
 
     println!("Telora Daemon Status");
     println!(
-        "{:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-        "ACTIVE", "PID", "MODEL", "LANG", "MAX_SEC", "STATE"
+        "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
+        "ACTIVE", "PID", "KIND", "MODEL", "LANG", "MAX_SEC", "STATE"
     );
     println!(
-        "{:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
-        "", "", "", "", "", ""
+        "{:-<10} {:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
+        "", "", "", "", "", "", ""
     );
 
-    let model_display = if status.model_path.len() > 28 {
+    let model_display = if status.model_id.len() > 28 {
         format!(
             "...{}",
-            &status.model_path[status.model_path.len().saturating_sub(25)..]
+            &status.model_id[status.model_id.len().saturating_sub(25)..]
         )
     } else {
-        status.model_path.clone()
+        status.model_id.clone()
     };
 
     println!(
-        "{:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
+        "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
         if status.active { "YES" } else { "NO" },
         status.pid,
+        status.model_kind,
         model_display,
         status.language,
         status.max_recording_seconds,
@@ -260,11 +260,37 @@ async fn run_status_client() -> Result<()> {
     );
 
     if status.active {
-        println!("\nFull Model Path: {}", status.model_path);
+        println!(
+            "\nFull Model Id:   {}\nResolved Path:   {}\nEngine Kind:     {}",
+            status.model_id, status.model_path, status.model_kind
+        );
     }
 
     Ok(())
 }
+
+/// Async constructor for a fresh [`BridgeTranscriber`] from an
+/// [`SttConfig`]. Centralised so the daemon's startup and
+/// `ReloadConfig` handler both go through the same path.
+async fn build_transcriber(
+    config: &SttConfig,
+    voxora_cache: Option<std::path::PathBuf>,
+) -> Result<(Box<dyn Transcriber>, String)> {
+    let kind = voxora_bridge::ModelKind::from_config(&config.model_kind).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown model_kind {:?}; expected one of `whisper` or `qwen3-asr`",
+            config.model_kind
+        )
+    })?;
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+
+    let bridge = BridgeTranscriber::from_id(&config.model_id, kind, voxora_cache, token).await?;
+    let resolved_path = bridge.resolved_path().to_string();
+    Ok((Box::new(bridge), resolved_path))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -288,14 +314,25 @@ async fn main() -> Result<()> {
 
     let mut stt_config = load_config(&args);
 
-    info!("Starting Telora Daemon...");
-    info!("Using model: {}", stt_config.model_path);
-    info!("Language: {}", stt_config.language);
+    // The voxora cache defaults to XDG_CACHE_HOME/voxora/models/huggingface;
+    // a CLI override (`--voxora-cache`) or env var (`VOXORA_CACHE_DIR`)
+    // can pin a different location.
+    let voxora_cache = args
+        .voxora_cache
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("VOXORA_CACHE_DIR").map(std::path::PathBuf::from));
 
-    // 1. Initialize Components
-    let mut transcriber: Box<dyn Transcriber> = Box::new(
-        WhisperTranscriber::new(&stt_config.model_path).context("Failed to load Whisper model")?,
-    );
+    info!("Starting Telora Daemon...");
+    info!("Model kind: {}", stt_config.model_kind);
+    info!("Model id:   {}", stt_config.model_id);
+    info!("Language:   {}", stt_config.language);
+
+    // 1. Initialize Components — voxora engine via BridgeTranscriber
+    let (mut transcriber, resolved_path) = build_transcriber(&stt_config, voxora_cache.clone())
+        .await
+        .context("Failed to load voxora engine")?;
+    stt_config.model_path = resolved_path;
 
     // Audio Engine initialization
     let rb = HeapRb::<f32>::new(16000 * 30); // 30 seconds buffer
@@ -364,6 +401,8 @@ async fn main() -> Result<()> {
                     let status_resp = StatusResponse {
                         active: true,
                         pid: std::process::id(),
+                        model_id: stt_config.model_id.clone(),
+                        model_kind: stt_config.model_kind.clone(),
                         model_path: stt_config.model_path.clone(),
                         language: stt_config.language.clone(),
                         max_recording_seconds: stt_config.max_recording_seconds,
@@ -379,19 +418,25 @@ async fn main() -> Result<()> {
                     new_config,
                     response_tx,
                 } => {
-                    info!("Command: REFRESH");
+                    info!(
+                        "Command: REFRESH (model_kind={} model_id={})",
+                        new_config.model_kind, new_config.model_id
+                    );
                     let mut reload_transcriber = false;
-                    if new_config.model_path != stt_config.model_path {
+                    if new_config.model_id != stt_config.model_id
+                        || new_config.model_kind != stt_config.model_kind
+                    {
                         reload_transcriber = true;
                     }
 
                     stt_config = new_config;
 
                     if reload_transcriber {
-                        info!("Model path changed, reloading transcriber...");
-                        match WhisperTranscriber::new(&stt_config.model_path) {
-                            Ok(new_transcriber) => {
-                                transcriber = Box::new(new_transcriber);
+                        info!("Model changed, reloading transcriber...");
+                        match build_transcriber(&stt_config, voxora_cache.clone()).await {
+                            Ok((new_transcriber, resolved_path)) => {
+                                transcriber = new_transcriber;
+                                stt_config.model_path = resolved_path;
                                 info!("Transcriber reloaded successfully.");
                                 let _ = response_tx.send(Ok(()));
                             }

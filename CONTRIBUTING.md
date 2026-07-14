@@ -4,12 +4,27 @@ Thank you for your interest in improving Telora!
 
 ## Project Structure
 
-- `telora-daemon`: Rust daemon handling audio input and Whisper transcription (CUDA).
+- `telora-daemon`: Rust daemon handling audio input and speech-to-text. Loads Whisper (whisper.cpp) or Qwen3-ASR (candle) through `voxora-bridge`.
 - `telora-gui`: GTK4 client for Wayland OSD overlay, visual feedback and control.
 - `telora-ctl`: CLI control client (binary name: `telora`) for sending commands to the GUI via Unix socket.
-- `telora-models`: Tool for managing Whisper models.
+- `telora-models`: Thin wrapper around `voxora-hf`. Use `voxora-cli` directly for new flows.
 - `pkg/`: Arch Linux packaging files.
 - `scripts/`: Build and verification scripts.
+
+## License compatibility
+
+Telora is AGPL-3. The `voxora-bridge` crate (and the wider `voxora` workspace) is Apache-2.0. AGPL-3 §5 explicitly permits an AGPL work to depend on a non-copyleft library without propagating copyleft to that library, so `telora-daemon` linking `voxora-bridge` is fine. The copyleft boundary is at the daemon's source code, not at its transitive dependencies.
+
+## Adding a new model
+
+You do **not** need to touch the daemon source to support a new model. Set `model_id` (and the matching `model_kind`) in `telora.toml`:
+
+```toml
+model_kind = "qwen3-asr"
+model_id   = "Qwen/Qwen3-ASR-0.6B"
+```
+
+The daemon resolves the id through `voxora-hf` (which downloads, caches and verifies) and loads the engine adapter that matches `model_kind`. To add a brand-new engine (e.g. Parakeet), implement `voxora_core::AsrEngine` in a new `voxora-*` adapter crate and re-export it from `voxora-bridge` behind a feature flag. No changes in `telora-daemon` are required for the engine itself; only a new `ModelKind` variant in `voxora-bridge::ModelKind`.
 
 ## Development Workflow
 
@@ -18,6 +33,7 @@ Thank you for your interest in improving Telora!
 - Podman (for containerized builds)
 - GTK4 and Layer Shell libraries (if building locally)
 - CUDA Toolkit (for GPU acceleration)
+- A checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) as a sibling directory (`../voxora`). The telora workspace uses path deps to pick up the bridge umbrella crate; this avoids a crates.io publish while voxora is pre-`0.1.0`.
 
 ### 2. Building
 The recommended way to build is using the provided script, which ensures a consistent environment:
@@ -28,8 +44,8 @@ The recommended way to build is using the provided script, which ensures a consi
 ### 3. Local Testing
 You can run the binaries directly from the `bin/` directory after building:
 ```bash
-# Start the daemon
-./bin/telora-daemon --model ./models/ggml-base.bin
+# Start the daemon (loads the model referenced by telora.toml)
+./bin/telora-daemon
 
 # In another terminal, run the GUI client (Wayland OSD overlay)
 ./bin/telora-gui
@@ -58,9 +74,9 @@ To enable debug logs, use the `RUST_LOG` environment variable:
 RUST_LOG=debug ./bin/telora-daemon
 ```
 
-You can also override the model path for testing:
+You can also override the model for testing:
 ```bash
-TELORA_MODEL_PATH=/path/to/model.bin ./bin/telora-daemon
+TELORA_MODEL_ID=Qwen/Qwen3-ASR-0.6B TELORA_MODEL_KIND=qwen3-asr ./bin/telora-daemon
 ```
 
 ## Questions?
