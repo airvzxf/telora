@@ -110,14 +110,31 @@ Recognized keys: `v`, any single letter or digit, `insert`, `delete`/`del`,
 
 **How it works (toggle-type):**
 
-1. Whatever is currently in the Wayland clipboard is backed up in memory
-   (text, images, or other MIME types are preserved). Sensitive content
-   (`x-kde-passwordManagerHint`, used by KDE password managers) is *not*
-   backed up to avoid holding secrets in process memory.
-2. The transcribed text is written to the clipboard.
+1. Every MIME type the source application advertised is read into memory
+   via `wl-clipboard-rs` (a Rust wrapper around the `wlr-data-control` /
+   `ext-data-control` Wayland protocols). The snapshot keeps each MIME
+   type and its raw bytes verbatim, so `text/html` + `text/plain` +
+   `image/png` + ... are all preserved across the paste cycle.
+   Sensitive content (`x-kde-passwordManagerHint`, used by KDE password
+   managers) is *not* backed up to avoid holding secrets in process
+   memory.
+2. The transcribed text is written to the clipboard as
+   `text/plain;charset=utf-8`.
 3. The configured paste shortcut is simulated via `wtype`.
-4. After a short delay (so the focused app can read the data), the original
-   clipboard contents are restored.
+4. After a short delay (so the focused app can read the data), the
+   original clipboard contents are restored by republishing every MIME
+   type the snapshot holds in a single Wayland offer. Plain-text editors
+   keep getting plain text, rich-text editors keep getting rich text,
+   and image tools keep getting the image.
+
+**Compositor fallback** — if the compositor does not expose
+`wlr-data-control` or `ext-data-control` (rare on modern Wayland; affects
+old Weston and very old GNOME), `wl-clipboard-rs` cannot operate.
+Telora falls back to the `wl-copy` / `wl-paste` shell tools for that
+cycle, which can only preserve a single MIME type per offer. The
+on-screen overlay shows `⚠ Respaldo simple (formato único)` so the user
+is aware that the multi-MIME fidelity is reduced. Updating the
+compositor restores the full behaviour.
 
 The clipboard's data is never written to disk; it lives only in the GUI
 process memory for the few hundred milliseconds of a typical paste cycle.

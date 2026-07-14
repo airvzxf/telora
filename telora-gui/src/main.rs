@@ -239,11 +239,12 @@ async fn handle_daemon_commands(
                     {
                         let cleaned = text::clean_transcription(&raw_text);
                         let is_auto = mode == "AUTO";
-                        if mode == "TYPE" || is_auto {
-                            input::type_text(&cleaned, &gui_config);
+                        let paste_outcome = if mode == "TYPE" || is_auto {
+                            input::type_text(&cleaned, &gui_config)
                         } else {
                             input::copy_text(&cleaned);
-                        }
+                            clipboard::PasteOutcome::Ok
+                        };
 
                         if is_auto {
                             let _ = response_tx
@@ -254,14 +255,10 @@ async fn handle_daemon_commands(
                                 .await;
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         } else {
-                            let (msg, color) = if mode == "TYPE" {
-                                ("Escrito".to_string(), "green".to_string())
-                            } else {
-                                ("Copiado".to_string(), "green".to_string())
-                            };
-
+                            let (msg, color) = outcome_osd(&paste_outcome, mode == "TYPE");
                             let _ = response_tx.send(AppAction::OsdUpdate(msg, color)).await;
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            let hold_secs = if paste_outcome.is_failure() { 3 } else { 1 };
+                            tokio::time::sleep(std::time::Duration::from_secs(hold_secs)).await;
                         }
 
                         let _ = response_tx.send(AppAction::OsdHide).await;
@@ -284,6 +281,44 @@ async fn handle_daemon_commands(
                 let _ = SocketClient::send_command("CANCEL").await;
             }
         }
+    }
+}
+
+fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String, String) {
+    match outcome {
+        clipboard::PasteOutcome::Ok => {
+            if is_type_mode {
+                ("Escrito".to_string(), "green".to_string())
+            } else {
+                ("Copiado".to_string(), "green".to_string())
+            }
+        }
+        clipboard::PasteOutcome::Partial { skipped } => {
+            let count = skipped.len();
+            let label = if is_type_mode { "Escrito" } else { "Copiado" };
+            (
+                format!(
+                    "{label} ⚠ {count} tipo{plural} perdido{plural2}",
+                    plural = if count == 1 { "" } else { "s" },
+                    plural2 = if count == 1 { "" } else { "s" }
+                ),
+                // A Partial means the receiving app already got the text
+                // but lost fidelity on a few MIME types. It is not an
+                // error, just a degraded success — surface it in the same
+                // green as `Ok` so the colour does not suggest something
+                // went wrong; only the trailing '⚠ N tipos perdidos'
+                // tells the user that some clipboard content was dropped.
+                "green".to_string(),
+            )
+        }
+        clipboard::PasteOutcome::FallbackSingleMime { .. } => (
+            "⚠ Respaldo simple (formato único)".to_string(),
+            "orange".to_string(),
+        ),
+        clipboard::PasteOutcome::Refused { .. } => (
+            "✘ Cancelado (portapapeles protegido)".to_string(),
+            "gray".to_string(),
+        ),
     }
 }
 
