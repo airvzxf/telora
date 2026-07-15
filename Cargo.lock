@@ -3908,9 +3908,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxora-bridge"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61975a0f7d96c2180c5e57d25f3fbbdf81ab0065e45669aac44ef6e75ccea570"
+checksum = "835ca03bdcb7c268573bf30aef0bcebdacfe7bc578498c86373b3f8be06bb3a5"
 dependencies = [
  "thiserror 2.0.18",
  "voxora-core",

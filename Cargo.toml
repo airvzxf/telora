@@ -6,13 +6,14 @@ members = ["telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 version = "0.1.0"
 edition = "2024"
 
-# voxora 0.1.0 is on crates.io (published as part of phase 6). The
-# three voxora crates telora depends on are resolved from the
-# registry; local-dev sibling layout is no longer required.
+# voxora 0.1.x is on crates.io. telora-daemon pulls voxora-bridge with
+# the `cuda-whisper` feature (see telora-daemon/Cargo.toml) to enable
+# GPU-accelerated whisper.cpp on Pascal sm_61+ hardware; qwen3-asr stays
+# on CPU because candle's WMMA kernels require sm_70+.
 [workspace.dependencies]
 voxora-core    = "0.1"
 voxora-hf      = "0.1"
-voxora-bridge  = "0.1"
+voxora-bridge  = "0.1.1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
