@@ -7,7 +7,12 @@ edition.workspace = true
 # voxora-bridge replaces the direct whisper-rs dependency. voxora-bridge
 # defaults to `["whisper", "qwen3asr"]`, which is exactly what the
 # daemon needs so users can switch model_kind without a rebuild.
-voxora-bridge = { workspace = true }
+#
+# `cuda-whisper` enables ggml-cuda for whisper.cpp (Pascal sm_61+ OK).
+# We deliberately leave `cuda-qwen3asr` off: candle's WMMA kernels
+# require sm_70+ (Volta), so the qwen3-asr backend stays on CPU on
+# Pascal and older. Bump to `cuda` (umbrella) on sm_70+ hardware.
+voxora-bridge = { workspace = true, features = ["cuda-whisper"] }
 
 cpal = "0.15"
 anyhow = "1.0"
