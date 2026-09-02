@@ -4,19 +4,13 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-/// Path constants used by the GUI client to reach the daemon.
-///
-/// These constants will be replaced by resolver helpers in
-/// sub-issue #34. They stay in place so the GUI still compiles
-/// while that wiring lands.
-pub const DAEMON_SOCKET: &str = "/tmp/telora-sock";
-pub const CONTROL_SOCKET: &str = "/tmp/telora-control.sock";
+use crate::paths;
 
 pub struct SocketClient;
 
 impl SocketClient {
     pub async fn send_command(cmd: &str) -> Result<String> {
-        let mut stream = UnixStream::connect(DAEMON_SOCKET)
+        let mut stream = UnixStream::connect(paths::daemon_socket_path())
             .await
             .context("Failed to connect to daemon")?;
         stream

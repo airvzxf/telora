@@ -18,14 +18,6 @@ use audio::AudioEngine;
 use socket::{Command, DaemonConfig, SocketServer, StatusResponse, SttConfig};
 use transcriber::{BridgeTranscriber, Transcriber};
 
-// Config references
-const SOCKET_PATH: &str = "/tmp/telora-sock";
-/// Legacy control socket path. Kept for #34 (constants-removal
-/// step); the daemon now uses the [paths] resolver for the actual
-/// bind target.
-#[allow(dead_code)]
-const CONTROL_SOCKET: &str = "/tmp/telora-control.sock";
-
 async fn notify_client_auto_stop(control_socket: &str) {
     if let Ok(mut stream) = UnixStream::connect(control_socket).await {
         let _ = stream.write_all(b"AUTO_STOP").await;
@@ -293,32 +285,33 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(Commands::Status) = args.command {
-        let cfg = match load_config(&args) {
-            Ok(c) => c,
+        // Status client best-effort: if config load fails we still
+        // try to reach the daemon through the resolver's default
+        // cascade (XDG_RUNTIME_DIR → /run/user/<uid>/ → /tmp/<uid>/).
+        // Both errors are surfaced on stderr.
+        let paths_cfg = match load_config(&args) {
+            Ok(c) => paths::PathsConfig {
+                runtime_dir: c.paths.runtime_dir.clone(),
+                socket_dir: c.paths.socket_dir.clone(),
+                daemon_socket: c.paths.daemon_socket.clone(),
+                control_socket: c.paths.control_socket.clone(),
+            },
             Err(e) => {
-                eprintln!("Error loading configuration: {}", e);
-                if let Err(e) = run_status_client(SOCKET_PATH).await {
-                    eprintln!("Error querying status: {}", e);
-                }
+                eprintln!(
+                    "Error loading configuration: {}. Falling back to default socket resolver.",
+                    e
+                );
+                paths::PathsConfig::default()
+            }
+        };
+        let resolved = match paths::resolve(&paths_cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error resolving socket path: {}", e);
                 return Ok(());
             }
         };
-        let paths_cfg = paths::PathsConfig {
-            runtime_dir: cfg.paths.runtime_dir.clone(),
-            socket_dir: cfg.paths.socket_dir.clone(),
-            daemon_socket: cfg.paths.daemon_socket.clone(),
-            control_socket: cfg.paths.control_socket.clone(),
-        };
-        let daemon_sock = match paths::resolve(&paths_cfg) {
-            Ok(r) => r.daemon_sock.to_string_lossy().into_owned(),
-            Err(e) => {
-                eprintln!(
-                    "Error resolving socket path: {}. Using legacy /tmp path.",
-                    e
-                );
-                SOCKET_PATH.to_string()
-            }
-        };
+        let daemon_sock = resolved.daemon_sock.to_string_lossy().into_owned();
         if let Err(e) = run_status_client(&daemon_sock).await {
             eprintln!("Error querying status: {}", e);
         }
@@ -339,16 +332,8 @@ async fn main() -> Result<()> {
             daemon_socket: cfg.paths.daemon_socket.clone(),
             control_socket: cfg.paths.control_socket.clone(),
         };
-        let daemon_sock = match paths::resolve(&paths_cfg) {
-            Ok(r) => r.daemon_sock.to_string_lossy().into_owned(),
-            Err(e) => {
-                eprintln!(
-                    "Error resolving socket path: {}. Using legacy /tmp path.",
-                    e
-                );
-                SOCKET_PATH.to_string()
-            }
-        };
+        let resolved = paths::resolve(&paths_cfg).context("resolving daemon socket path")?;
+        let daemon_sock = resolved.daemon_sock.to_string_lossy().into_owned();
         if let Err(e) = run_refresh_client(cfg.stt, &daemon_sock).await {
             eprintln!("Error refreshing daemon: {}", e);
         }
@@ -396,10 +381,9 @@ async fn main() -> Result<()> {
     // Socket
     let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
     // Resolve the socket location through the [paths] cascade
-    // introduced in #30-#33. The legacy SOCKET_PATH/CONTROL_SOCKET
-    // constants are kept around for the client-side subcommands
-    // (run_status_client / run_refresh_client) and will be removed
-    // by sub-issue #34 along with the rest of the /tmp wiring.
+    // introduced in #30-#33. Sub-issue #34 deleted the legacy
+    // /tmp/telora-sock constants; every call site now goes through
+    // this resolver.
     let paths_cfg = paths::PathsConfig {
         runtime_dir: paths_config.runtime_dir.clone(),
         socket_dir: paths_config.socket_dir.clone(),

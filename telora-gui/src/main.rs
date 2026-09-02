@@ -15,11 +15,12 @@ mod config;
 mod connection;
 mod focus;
 mod input;
+mod paths;
 mod text;
 mod ui;
 
 use config::GuiConfig;
-use connection::{CONTROL_SOCKET, ControlServer, SocketClient};
+use connection::{ControlServer, SocketClient};
 use ui::Osd;
 
 fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
@@ -83,33 +84,44 @@ enum DaemonCommand {
 
 fn main() {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
+        // Print the resolved socket paths so the help text reflects
+        // whatever the runtime would actually bind/connect to (XDG
+        // cascade → /run/user/<uid>/ → /tmp fallback). Built with
+        // `format!` because the literal `println!("...")` form
+        // could not interpolate the dynamic paths.
+        let daemon_sock = paths::daemon_socket_path();
+        let control_sock = paths::control_socket_path();
+        let bin_name = std::env::args()
+            .next()
+            .unwrap_or_else(|| "telora-gui".to_string());
         println!(
-            "\
-telora-gui — Telora Assistant UI (Wayland overlay)
-
-USAGE:
-    telora-gui
-
-DESCRIPTION:
-    Displays an OSD overlay on Wayland using the Layer Shell protocol.
-    It listens for control commands via Unix socket and relays them to
-    the telora-daemon for audio transcription.
-
-    This binary is normally launched by systemd as a user service and
-    controlled via the `telora` CLI client.
-
-SOCKETS:
-    Control (listen):  /tmp/telora-control.sock
-    Daemon (connect):  /tmp/telora-sock
-
-ENVIRONMENT:
-    WAYLAND_DISPLAY     Wayland socket name (default: wayland-0)
-    XDG_RUNTIME_DIR     Runtime directory for Wayland socket
-    GSK_RENDERER        GTK render backend (set to \"gl\" by systemd service)
-    RUST_LOG            Log filter (default: info)
-
-SEE ALSO:
-    telora(1), telora-daemon(1), telora.service(5)"
+            "telora-gui — Telora Assistant UI (Wayland overlay)\n\
+             \n\
+             USAGE:\n\
+             {bin_name}\n\
+             \n\
+             DESCRIPTION:\n\
+             Displays an OSD overlay on Wayland using the Layer Shell protocol.\n\
+             It listens for control commands via Unix socket and relays them to\n\
+             the telora-daemon for audio transcription.\n\
+             \n\
+             This binary is normally launched by systemd as a user service and\n\
+             controlled via the `telora` CLI client.\n\
+             \n\
+             SOCKETS:\n\
+             Control (listen):  {control_sock}\n\
+             Daemon (connect):  {daemon_sock}\n\
+             \n\
+             ENVIRONMENT:\n\
+             WAYLAND_DISPLAY     Wayland socket name (default: wayland-0)\n\
+             XDG_RUNTIME_DIR     Runtime directory for Wayland socket\n\
+             GSK_RENDERER        GTK render backend (set to \"gl\" by systemd service)\n\
+             RUST_LOG            Log filter (default: info)\n\
+             \n\
+             SEE ALSO:\n\
+             telora(1), telora-daemon(1), telora.service(5)",
+            control_sock = control_sock.display(),
+            daemon_sock = daemon_sock.display(),
         );
         std::process::exit(0);
     }
@@ -323,7 +335,7 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
 }
 
 async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
-    let server = ControlServer::bind(std::path::Path::new(CONTROL_SOCKET))?;
+    let server = ControlServer::bind(&paths::control_socket_path())?;
     info!("Control server listening...");
 
     loop {
