@@ -33,6 +33,15 @@ jobs:
     - name: Format
       run: cargo fmt --all -- --check
 
+    - name: Build (workspace)
+      run: cargo build --workspace --all-targets
+
+    - name: Test (workspace, no fail-fast)
+      run: cargo test --workspace --no-fail-fast
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
     # Skipping full build for now as CUDA setup in GH Actions is complex/slow
     # - name: Build
     #   run: cargo build --verbose
