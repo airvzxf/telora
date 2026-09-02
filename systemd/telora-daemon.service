@@ -1,11 +1,23 @@
 [Unit]
 Description=Telora Audio Daemon (Whisper)
 After=network.target pipewire.service
-Requires=pipewire.service
+Wants=pipewire.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/telora-daemon
+# systemd creates /run/user/<uid>/telora/ with mode 0700 before exec
+# and removes it on stop. This is the primary defense against the
+# original EPERM bug (stale socket in /tmp from another UID).
+RuntimeDirectory=telora
+RuntimeDirectoryMode=0700
+# Belt-and-braces cleanup: even if the process is killed -9, systemd
+# always runs ExecStopPost and removes the socket.
+ExecStopPost=-/usr/bin/rm -f %t/telora/daemon.sock %t/telora/control.sock
+# Hardening (light, optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
 Restart=on-failure
 RestartSec=5
 
