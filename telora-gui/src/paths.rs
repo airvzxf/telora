@@ -72,8 +72,7 @@ fn pick_socket_dir(cfg: &PathsConfig) -> Result<PathBuf> {
         return Ok(PathBuf::from(run_user).join("telora"));
     }
     log::warn!(
-        "Falling back to /tmp/telora-{}/ — XDG_RUNTIME_DIR unset and /run/user/<uid> not writable",
-        uid
+        "Falling back to a per-user /tmp/telora-<uid>/ dir — XDG_RUNTIME_DIR unset and /run/user/<uid> not writable; numeric UID is not logged"
     );
     Ok(PathBuf::from(format!("/tmp/telora-{uid}")))
 }

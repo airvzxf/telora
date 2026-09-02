@@ -92,7 +92,9 @@ fn ensure_parent_dir_0700(path: &Path) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "control socket path {} has no parent directory",
-                path.display()
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
             )
         })?;
     std::fs::DirBuilder::new()
@@ -116,7 +118,9 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
         Err(e) => {
             return Err(anyhow::Error::from(e).context(format!(
                 "stat'ing existing control socket {}",
-                path.display()
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
             )));
         }
     };
@@ -124,19 +128,23 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     let current_uid = current_uid();
     if meta.uid() != current_uid {
         return Err(anyhow::anyhow!(
-            "stale control socket at {} owned by UID {} (current UID {}); run: sudo rm {}",
-            path.display(),
-            meta.uid(),
-            current_uid,
-            path.display()
+            "stale control socket '{}' in the user-runtime telora directory is not owned by the current user; \
+             use `ls -la <full-path>` to find the owner and `sudo rm <full-path>` to clean it up",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
         ));
     }
 
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::from(e)
-            .context(format!("removing stale control socket {}", path.display()))),
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "removing stale control socket {}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
+        ))),
     }
 }
 
@@ -163,20 +171,22 @@ fn current_uid() -> u32 {
 /// Translate a `bind(2)` failure into a user-actionable error.
 fn map_bind_error(err: std::io::Error, path: &Path) -> anyhow::Error {
     use std::io::ErrorKind;
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
     match err.kind() {
         ErrorKind::AddrInUse => anyhow::anyhow!(
-            "another telora-gui instance already holds {} (owner UID {:?}); check if a previous GUI session is still running",
-            path.display(),
-            std::fs::metadata(path).ok().map(|m| m.uid())
+            "another telora-gui instance already holds '{}' in the user-runtime telora directory; \
+             check if a previous GUI session is still running",
+            basename
         ),
         ErrorKind::PermissionDenied => anyhow::anyhow!(
-            "permission denied binding control socket at {} — parent directory not writable or sticky bit blocked removal of stale socket",
-            path.display()
+            "permission denied binding control socket at '{}' — parent directory not writable or sticky bit blocked removal of stale socket",
+            basename
         ),
-        _ => anyhow::Error::from(err).context(format!(
-            "Failed to bind control socket at {}",
-            path.display()
-        )),
+        _ => anyhow::Error::from(err)
+            .context(format!("Failed to bind control socket at {}", basename)),
     }
 }
 

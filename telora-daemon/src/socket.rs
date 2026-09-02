@@ -157,7 +157,9 @@ impl SocketServer {
 
         info!(
             "Listening on unix socket: {} (restricted to 0600)",
-            path.display()
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
         );
 
         Ok(Self { listener, cmd_tx })
@@ -321,9 +323,22 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("socket path {} has no parent directory", path.display()))?;
-    crate::paths::ensure_dir_0700(parent)
-        .with_context(|| format!("ensuring socket parent directory {}", parent.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "socket path {} has no parent directory",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
+            )
+        })?;
+    crate::paths::ensure_dir_0700(parent).with_context(|| {
+        format!(
+            "ensuring socket parent directory {}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
+        )
+    })
 }
 
 /// Remove a stale socket file at `path` if it is owned by the
@@ -334,19 +349,23 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(anyhow::Error::from(e)
-                .context(format!("stat'ing existing socket file {}", path.display())));
+            return Err(anyhow::Error::from(e).context(format!(
+                "stat'ing existing socket file {}",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
+            )));
         }
     };
 
     let current_uid = nix::unistd::getuid().as_raw();
     if meta.uid() != current_uid {
         return Err(anyhow::anyhow!(
-            "stale socket at {} owned by UID {} (current UID {}); run: sudo rm {}",
-            path.display(),
-            meta.uid(),
-            current_uid,
-            path.display()
+            "stale socket '{}' in the user-runtime telora directory is not owned by the current user; \
+             use `ls -la <full-path>` to find the owner and `sudo rm <full-path>` to clean it up",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
         ));
     }
 
@@ -354,13 +373,21 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
     // of a race with another process that just unlinked it.
     match std::fs::remove_file(path) {
         Ok(()) => {
-            info!("Removed stale socket file: {}", path.display());
+            info!(
+                "Removed stale socket file: {}",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
+            );
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => {
-            Err(anyhow::Error::from(e).context(format!("removing stale socket {}", path.display())))
-        }
+        Err(e) => Err(anyhow::Error::from(e).context(format!(
+            "removing stale socket {}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
+        ))),
     }
 }
 
@@ -382,21 +409,23 @@ fn bind_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
 /// Translate a `bind(2)` failure into a user-actionable error.
 fn map_bind_error(err: std::io::Error, path: &Path) -> anyhow::Error {
     use std::io::ErrorKind;
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
     match err.kind() {
-        ErrorKind::AddrInUse => {
-            let owner_uid = std::fs::metadata(path).ok().map(|m| m.uid());
-            anyhow::anyhow!(
-                "another telora-daemon instance already holds {} (owner UID {:?}); try systemctl --user status telora-daemon",
-                path.display(),
-                owner_uid
-            )
-        }
-        ErrorKind::PermissionDenied => anyhow::anyhow!(
-            "permission denied binding socket at {} — parent directory not writable or sticky bit blocked removal of stale socket",
-            path.display()
+        ErrorKind::AddrInUse => anyhow::anyhow!(
+            "another telora-daemon instance already holds '{}' in the user-runtime telora directory; \
+             try systemctl --user status telora-daemon",
+            basename
         ),
-        _ => anyhow::Error::from(err)
-            .context(format!("Failed to bind unix socket at {}", path.display())),
+        ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "permission denied binding socket at '{}' — parent directory not writable or sticky bit blocked removal of stale socket",
+            basename
+        ),
+        _ => {
+            anyhow::Error::from(err).context(format!("Failed to bind unix socket at {}", basename))
+        }
     }
 }
 
