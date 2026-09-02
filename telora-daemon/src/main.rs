@@ -9,20 +9,25 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
 mod audio;
+mod paths;
 mod socket;
 mod transcriber;
 mod vad;
 
 use audio::AudioEngine;
-use socket::{Command, SocketServer, StatusResponse, SttConfig};
+use socket::{Command, DaemonConfig, SocketServer, StatusResponse, SttConfig};
 use transcriber::{BridgeTranscriber, Transcriber};
 
 // Config references
 const SOCKET_PATH: &str = "/tmp/telora-sock";
+/// Legacy control socket path. Kept for #34 (constants-removal
+/// step); the daemon now uses the [paths] resolver for the actual
+/// bind target.
+#[allow(dead_code)]
 const CONTROL_SOCKET: &str = "/tmp/telora-control.sock";
 
-async fn notify_client_auto_stop() {
-    if let Ok(mut stream) = UnixStream::connect(CONTROL_SOCKET).await {
+async fn notify_client_auto_stop(control_socket: &str) {
+    if let Ok(mut stream) = UnixStream::connect(control_socket).await {
         let _ = stream.write_all(b"AUTO_STOP").await;
     }
 }
@@ -75,20 +80,12 @@ enum State {
     Processing,
 }
 
-/// Default values for [`SttConfig`] when the user's `telora.toml`
-/// does not supply them. Matches the legacy defaults so an upgrade
-/// from a Whisper-only install still boots a working daemon.
-fn default_stt_config() -> SttConfig {
-    SttConfig {
-        model_id: "ggerganov/whisper.cpp/ggml-base.bin".to_string(),
-        model_kind: "whisper".to_string(),
-        model_path: String::new(),
-        language: "es".to_string(),
-        max_recording_seconds: 600,
-    }
-}
-
-fn load_config(args: &Args) -> SttConfig {
+/// Load and merge configuration from the four-tier cascade
+/// (`/etc/telora.toml`, `~/.config/telora/config.toml`, the
+/// `--config` CLI override, and `TELORA_*` env vars). Returns a
+/// [`DaemonConfig`] which wraps both the STT settings and the
+/// `[paths]` overrides added in sub-issue #33.
+fn load_config(args: &Args) -> Result<DaemonConfig> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
 
     // Load configuration from multiple sources in order of precedence (last one wins).
@@ -110,30 +107,28 @@ fn load_config(args: &Args) -> SttConfig {
     // 4. Environment variables - Highest priority
     builder = builder.add_source(config::Environment::with_prefix("TELORA"));
 
-    let config_res = builder.build();
-    let mut stt_config: SttConfig = match config_res {
-        Ok(c) => c.try_deserialize().unwrap_or_else(|e| {
-            warn!("Configuration warning: {}. Using defaults.", e);
-            default_stt_config()
-        }),
+    let mut cfg: DaemonConfig = match builder.build() {
+        Ok(c) => c
+            .try_deserialize()
+            .context("loading telora config (telora.toml / --config / TELORA_*)")?,
         Err(e) => {
             warn!("Configuration warning: {}. Using defaults.", e);
-            default_stt_config()
+            DaemonConfig::default()
         }
     };
 
     // CLI args override
     if let Some(m) = &args.model_id {
-        stt_config.model_id = m.clone();
+        cfg.stt.model_id = m.clone();
     }
     if let Some(k) = &args.model_kind {
-        stt_config.model_kind = k.clone();
+        cfg.stt.model_kind = k.clone();
     }
     if let Some(l) = &args.language {
-        stt_config.language = l.clone();
+        cfg.stt.language = l.clone();
     }
     if let Some(s) = args.max_recording_seconds {
-        stt_config.max_recording_seconds = s;
+        cfg.stt.max_recording_seconds = s;
     }
 
     // Legacy compatibility: if the user's telora.toml only supplies
@@ -141,15 +136,15 @@ fn load_config(args: &Args) -> SttConfig {
     // configs keep working. The `model_path` field was a local file
     // path in the pre-voxora daemon; HF ids are forward-slash
     // separated, so the two are unambiguous in practice.
-    if stt_config.model_id.is_empty() && !stt_config.model_path.is_empty() {
-        stt_config.model_id = stt_config.model_path.clone();
+    if cfg.stt.model_id.is_empty() && !cfg.stt.model_path.is_empty() {
+        cfg.stt.model_id = cfg.stt.model_path.clone();
     }
 
-    stt_config
+    Ok(cfg)
 }
 
-async fn run_refresh_client(config: SttConfig) -> Result<()> {
-    let mut stream = match UnixStream::connect(SOCKET_PATH).await {
+async fn run_refresh_client(config: SttConfig, socket_path: &str) -> Result<()> {
+    let mut stream = match UnixStream::connect(socket_path).await {
         Ok(s) => s,
         Err(_) => {
             eprintln!("Error: Daemon is not running.");
@@ -177,8 +172,8 @@ async fn run_refresh_client(config: SttConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run_status_client() -> Result<()> {
-    let mut stream = match UnixStream::connect(SOCKET_PATH).await {
+async fn run_status_client(socket_path: &str) -> Result<()> {
+    let mut stream = match UnixStream::connect(socket_path).await {
         Ok(s) => s,
         Err(_) => {
             println!("Telora Daemon Status");
@@ -298,21 +293,76 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(Commands::Status) = args.command {
-        if let Err(e) = run_status_client().await {
+        let cfg = match load_config(&args) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error loading configuration: {}", e);
+                if let Err(e) = run_status_client(SOCKET_PATH).await {
+                    eprintln!("Error querying status: {}", e);
+                }
+                return Ok(());
+            }
+        };
+        let paths_cfg = paths::PathsConfig {
+            runtime_dir: cfg.paths.runtime_dir.clone(),
+            socket_dir: cfg.paths.socket_dir.clone(),
+            daemon_socket: cfg.paths.daemon_socket.clone(),
+            control_socket: cfg.paths.control_socket.clone(),
+        };
+        let daemon_sock = match paths::resolve(&paths_cfg) {
+            Ok(r) => r.daemon_sock.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!(
+                    "Error resolving socket path: {}. Using legacy /tmp path.",
+                    e
+                );
+                SOCKET_PATH.to_string()
+            }
+        };
+        if let Err(e) = run_status_client(&daemon_sock).await {
             eprintln!("Error querying status: {}", e);
         }
         return Ok(());
     }
 
     if let Some(Commands::Refresh) = args.command {
-        let stt_config = load_config(&args);
-        if let Err(e) = run_refresh_client(stt_config).await {
+        let cfg = match load_config(&args) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error loading configuration: {}", e);
+                return Ok(());
+            }
+        };
+        let paths_cfg = paths::PathsConfig {
+            runtime_dir: cfg.paths.runtime_dir.clone(),
+            socket_dir: cfg.paths.socket_dir.clone(),
+            daemon_socket: cfg.paths.daemon_socket.clone(),
+            control_socket: cfg.paths.control_socket.clone(),
+        };
+        let daemon_sock = match paths::resolve(&paths_cfg) {
+            Ok(r) => r.daemon_sock.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!(
+                    "Error resolving socket path: {}. Using legacy /tmp path.",
+                    e
+                );
+                SOCKET_PATH.to_string()
+            }
+        };
+        if let Err(e) = run_refresh_client(cfg.stt, &daemon_sock).await {
             eprintln!("Error refreshing daemon: {}", e);
         }
         return Ok(());
     }
 
-    let mut stt_config = load_config(&args);
+    let daemon_cfg = match load_config(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(e.context("loading telora-daemon configuration"));
+        }
+    };
+    let paths_config = daemon_cfg.paths.clone();
+    let mut stt_config = daemon_cfg.stt;
 
     // The voxora cache defaults to XDG_CACHE_HOME/voxora/models/huggingface;
     // a CLI override (`--voxora-cache`) or env var (`VOXORA_CACHE_DIR`)
@@ -345,7 +395,20 @@ async fn main() -> Result<()> {
 
     // Socket
     let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
-    let socket_server = SocketServer::bind(SOCKET_PATH, cmd_tx).context("Failed to bind socket")?;
+    // Resolve the socket location through the [paths] cascade
+    // introduced in #30-#33. The legacy SOCKET_PATH/CONTROL_SOCKET
+    // constants are kept around for the client-side subcommands
+    // (run_status_client / run_refresh_client) and will be removed
+    // by sub-issue #34 along with the rest of the /tmp wiring.
+    let paths_cfg = paths::PathsConfig {
+        runtime_dir: paths_config.runtime_dir.clone(),
+        socket_dir: paths_config.socket_dir.clone(),
+        daemon_socket: paths_config.daemon_socket.clone(),
+        control_socket: paths_config.control_socket.clone(),
+    };
+    let resolved_paths = paths::resolve(&paths_cfg)?;
+    let socket_server =
+        SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx).context("Failed to bind socket")?;
 
     tokio::spawn(async move {
         socket_server.run().await;
@@ -359,7 +422,10 @@ async fn main() -> Result<()> {
     let mut response_tx_opt: Option<oneshot::Sender<String>> = None;
     let mut pending_result: Option<String> = None;
 
-    info!("System Ready. Waiting for commands on {}", SOCKET_PATH);
+    info!(
+        "System Ready. Waiting for commands on {}",
+        resolved_paths.daemon_sock.display()
+    );
 
     loop {
         // Non-blocking check for commands
@@ -475,8 +541,9 @@ async fn main() -> Result<()> {
                     );
                     state = State::Processing;
                     // Notify client to stop UI and request result
+                    let control_sock = resolved_paths.control_sock.to_string_lossy().into_owned();
                     tokio::spawn(async move {
-                        notify_client_auto_stop().await;
+                        notify_client_auto_stop(&control_sock).await;
                     });
                 }
             }

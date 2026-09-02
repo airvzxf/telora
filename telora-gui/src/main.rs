@@ -19,7 +19,7 @@ mod text;
 mod ui;
 
 use config::GuiConfig;
-use connection::{ControlServer, SocketClient};
+use connection::{CONTROL_SOCKET, ControlServer, SocketClient};
 use ui::Osd;
 
 fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
@@ -323,7 +323,7 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
 }
 
 async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
-    let server = ControlServer::bind()?;
+    let server = ControlServer::bind(std::path::Path::new(CONTROL_SOCKET))?;
     info!("Control server listening...");
 
     loop {
