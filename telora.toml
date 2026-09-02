@@ -46,3 +46,24 @@ language = "es"
 # limit is reached. Default is 600 seconds (10 minutes). Set to a
 # higher value for long dictations, or lower to prevent memory abuse.
 max_recording_seconds = 300
+
+# Socket and runtime paths.
+#
+# If all fields are left empty (the default), the daemon resolves:
+#   socket_dir      = $XDG_RUNTIME_DIR/telora
+#   daemon_socket   = socket_dir / "daemon.sock"
+#   control_socket  = socket_dir / "control.sock"
+# If $XDG_RUNTIME_DIR is unset or not writable, falls back to
+#   /run/user/<uid>/telora  →  /tmp/telora-<uid>/  (last resort)
+#
+# Any non-empty field wins over the default.
+#
+# Env-var overrides (any source, precedence: env > file > built-in default):
+#   TELORA_PATHS__SOCKET_DIR
+#   TELORA_PATHS__DAEMON_SOCKET
+#   TELORA_PATHS__CONTROL_SOCKET
+[paths]
+runtime_dir     = ""
+socket_dir      = ""
+daemon_socket   = ""
+control_socket  = ""

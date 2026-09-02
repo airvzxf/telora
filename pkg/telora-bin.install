@@ -1,0 +1,40 @@
+post_install() {
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    # Encourage linger so /run/user/<uid>/telora/ persists across logouts
+    if ! loginctl show-user "$(id -un)" 2>/dev/null | grep -q 'Linger=yes'; then
+        echo ":: Tip: enable linger so telora-daemon survives logout:"
+        echo "      loginctl enable-linger $(id -un)"
+    fi
+    echo ":: Telora has been installed."
+    echo ":: IMPORTANT: You need to download a speech model before using Telora."
+    echo ":: Please run the following command to download the base model:"
+    echo ":: "
+    echo "::     telora-models download base"
+    echo ":: "
+    echo ":: You can also list available models with 'telora-models list'."
+}
+
+pre_upgrade() {
+    # Stop the daemon so the running binary is not replaced under its feet.
+    if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
+        systemctl --user stop telora-daemon.service || true
+    fi
+}
+
+post_upgrade() {
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if systemctl --user is-enabled --quiet telora-daemon.service 2>/dev/null; then
+        systemctl --user try-reload-or-restart telora-daemon.service || true
+    fi
+    echo ":: Telora has been upgraded."
+    echo ":: If you changed the model, run 'telora-models download <id>' to refresh weights."
+}
+
+pre_remove() {
+    # Remove sockets still living in /tmp (legacy locations from before the XDG migration).
+    rm -f /tmp/telora-sock /tmp/telora-control.sock
+    if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
+        systemctl --user stop telora-daemon.service || true
+        systemctl --user disable telora-daemon.service || true
+    fi
+}

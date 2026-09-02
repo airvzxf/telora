@@ -8,7 +8,7 @@ url="https://github.com/airvzxf/telora"
 license=('MIT')
 depends=('gtk4' 'gtk4-layer-shell' 'alsa-lib' 'gcc-libs')
 makedepends=('make')
-install='telora.install'
+install='telora-bin.install'
 source=()
 sha256sums=()
 
