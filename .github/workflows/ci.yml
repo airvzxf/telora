@@ -22,13 +22,13 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasound2-dev libgtk-4-dev libgtk-4-1 build-essential cmake pkg-config
-
-    # Note: whisper-rs with cuda requires CUDA toolkit, which is heavy for standard CI.
-    # For now, we might build without cuda features or assume we just test compilation
-    # generically. However, the crate forces "cuda".
-    # We might need a self-hosted runner or use a container with CUDA.
-    # For this template, we'll try to check format and clippy at least.
+        sudo apt-get install -y \
+          libasound2-dev libgtk-4-dev libgtk-4-1 \
+          build-essential cmake pkg-config \
+          nvidia-cuda-toolkit
+        # Verify nvcc is available so a missing CUDA toolkit fails the job loudly
+        # before we waste time compiling rust crates that need it.
+        nvcc --version
 
     - name: Format
       run: cargo fmt --all -- --check
