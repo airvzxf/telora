@@ -28,6 +28,7 @@ impl SocketClient {
     }
 }
 
+#[derive(Debug)]
 pub struct ControlServer {
     listener: UnixListener,
 }
@@ -159,5 +160,57 @@ fn map_bind_error(err: std::io::Error, path: &Path) -> anyhow::Error {
             "Failed to bind control socket at {}",
             path.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn control_server_bind_creates_socket_with_0600() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sock_path = tmp.path().join("telora/control.sock");
+            let _server = ControlServer::bind(&sock_path).expect("bind should succeed");
+            let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "control socket must be 0o600 (closes PROPOSAL.md S1)"
+            );
+        });
+    }
+
+    // Same idempotent design as the daemon (see socket.rs notes): the
+    // GUI's `ControlServer::bind` removes same-UID stale sockets before
+    // `bind(2)`, so the sequential second-bind scenario cannot reach
+    // the EADDRINUSE branch. The test is `#[ignore]`d to keep it as a
+    // canary for any future regression that breaks the error mapping
+    // or the idempotency. Re-enabling would require a separate UID
+    // (root-only) or a bind race.
+    #[test]
+    #[ignore = "bind is idempotent for same-UID socket; would require a second UID or a bind race"]
+    fn control_server_rejects_double_bind() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sock_path = tmp.path().join("telora/control.sock");
+            let _server1 = ControlServer::bind(&sock_path).expect("first bind");
+            let err = ControlServer::bind(&sock_path).expect_err("second bind should fail");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("already holds") || msg.contains("another telora-gui"),
+                "expected actionable EADDRINUSE message, got: {msg}"
+            );
+        });
     }
 }

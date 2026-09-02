@@ -3,20 +3,14 @@ use clap::{Parser, Subcommand};
 use config::{Config, File};
 use log::{error, info, warn};
 use ringbuf::HeapRb;
+use telora_daemon::{
+    AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
+    Transcriber, paths,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
-
-mod audio;
-mod paths;
-mod socket;
-mod transcriber;
-mod vad;
-
-use audio::AudioEngine;
-use socket::{Command, DaemonConfig, SocketServer, StatusResponse, SttConfig};
-use transcriber::{BridgeTranscriber, Transcriber};
 
 async fn notify_client_auto_stop(control_socket: &str) {
     if let Ok(mut stream) = UnixStream::connect(control_socket).await {
