@@ -3607,6 +3607,7 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "log",
+ "nix",
  "serde",
  "tempfile",
  "tokio",

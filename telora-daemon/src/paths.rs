@@ -13,6 +13,7 @@
 //! tries to bind.
 
 use anyhow::{Context, Result};
+use config::Environment;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -55,6 +56,38 @@ pub struct ResolvedPaths {
 #[allow(dead_code)]
 pub fn default_paths_config() -> PathsConfig {
     PathsConfig::default()
+}
+
+/// Build the `TELORA_*` environment-variable source for the config
+/// cascade.
+///
+/// `config` 0.13's `Environment::with_prefix("TELORA")` defaults its
+/// key separator to `""` (no splitting) and its prefix separator to
+/// `"_"`. With those defaults `TELORA_PATHS__SOCKET_DIR` is
+/// registered as a single flat key `paths__socket_dir` (with two
+/// underscores as part of the name) and is silently dropped during
+/// deserialisation — no field in [`crate::socket::DaemonConfig`]
+/// matches. The fix sets both separators explicitly:
+///
+///   * `.prefix_separator("_")` keeps the `TELORA_` prefix matching
+///     (without it, `config` auto-derives the prefix separator from
+///     the key separator and the `TELORA_` prefix no longer matches
+///     once `.separator("__")` is set).
+///   * `.separator("__")` makes the env parser treat any remaining
+///     double-underscore as a path separator, turning
+///     `paths__socket_dir` into the nested key `paths.socket_dir`
+///     that the struct expects.
+///
+/// `main.rs::load_config` uses this helper to keep the source
+/// construction in one place; integration tests call it directly to
+/// pin the behaviour. Returns the [`Environment`] so callers can add
+/// it to their own [`config::Config`] builder (the helper does not
+/// own the builder so the test can compose other sources around it).
+#[allow(dead_code)]
+pub fn telora_env_source() -> Environment {
+    Environment::with_prefix("TELORA")
+        .prefix_separator("_")
+        .separator("__")
 }
 
 /// Resolve socket directory according to the four-step cascade and

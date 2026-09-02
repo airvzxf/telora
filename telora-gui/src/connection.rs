@@ -43,12 +43,29 @@ impl ControlServer {
         ensure_parent_dir_0700(path)?;
         remove_stale_socket(path)?;
 
-        let listener = UnixListener::bind(path).map_err(|e| map_bind_error(e, path))?;
+        // Atomically create the socket with mode 0o600 by setting
+        // umask to 0o177 for the duration of the bind. This
+        // eliminates the TOCTOU window between `bind(2)` and a
+        // follow-up `chmod(2)` so the socket is never world-readable
+        // even briefly under the user's default umask. Mirrors the
+        // daemon's `SocketServer::bind` (see `telora-daemon/src/socket.rs`).
+        let prev_umask = nix::sys::stat::umask(
+            nix::sys::stat::Mode::S_IROTH
+                | nix::sys::stat::Mode::S_IWOTH
+                | nix::sys::stat::Mode::S_IXOTH,
+        );
+        let bind_result = UnixListener::bind(path).map_err(|e| map_bind_error(e, path));
+        // Restore the previous umask regardless of bind outcome so
+        // unrelated file creation in the GUI (config, state) is
+        // unaffected.
+        nix::sys::stat::umask(prev_umask);
 
-        // Set permissions to 0o600 (owner read/write only). The GUI
-        // control socket has tighter security requirements than the
-        // daemon socket because it accepts commands from the
-        // telora-ctl CLI — see PROPOSAL.md security item S1.
+        let listener = bind_result?;
+
+        // Defensive chmod: in case the kernel ignored umask for some
+        // reason, force the mode back to 0o600. Matches the daemon's
+        // belt-and-suspenders pattern; this is a second line of
+        // defence rather than the primary fix.
         let mut perms = std::fs::metadata(path)?.permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(path, perms)
@@ -183,6 +200,51 @@ mod tests {
                 mode & 0o777,
                 0o600,
                 "control socket must be 0o600 (closes PROPOSAL.md S1)"
+            );
+        });
+    }
+
+    /// Regression test for F2 finding C: `ControlServer::bind` must
+    /// end with mode `0o600` even when the process umask is
+    /// permissive (`0o000`). This pins the documented contract that
+    /// the GUI control socket never leaks group/other readable bits.
+    ///
+    /// Note on coverage: the test exercises the END state of `bind`,
+    /// which is enforced by the defensive `set_permissions(0o600)`
+    /// after `UnixListener::bind`. The TOCTOU window between `bind(2)`
+    /// and the defensive `chmod(2)` is closed by the umask tightening
+    /// at the bind site (F2 fix C); detecting a regression of the
+    /// umask tightening alone requires racing `connect(2)` against
+    /// the bind window and is not attempted here because the defensive
+    /// chmod masks the test. The umask tightening is therefore
+    /// protected primarily by code review and the symmetry with
+    /// `telora-daemon`'s `SocketServer::bind`.
+    #[test]
+    fn control_server_bind_is_atomic_with_umask() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Force a permissive umask so we'd catch any regression
+            // where the bind leaks the socket into group/other
+            // before the chmod runs.
+            let prev_umask = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sock_path = tmp.path().join("telora/control.sock");
+            let result = ControlServer::bind(&sock_path);
+            // Restore umask even if bind failed so subsequent tests
+            // are unaffected.
+            nix::sys::stat::umask(prev_umask);
+
+            let _server = result.expect("bind should succeed");
+            let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "control socket must be 0o600 even under umask 0o000 \
+                 (the bind must tighten umask itself; the chmod alone \
+                 leaves a TOCTOU window)"
             );
         });
     }

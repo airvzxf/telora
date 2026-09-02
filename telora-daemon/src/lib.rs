@@ -39,6 +39,11 @@ pub use socket::{
     default_stt_config,
 };
 
+// Re-export the env-var source helper for integration tests.
+// `main.rs::load_config` also calls this helper so the test pins the
+// production behaviour in one place.
+pub use paths::telora_env_source;
+
 // Re-export the items `main.rs` (the binary) needs from the
 // otherwise-private `audio` and `transcriber` modules. Tests do not
 // touch these; they are surfaced strictly for the binary wiring.

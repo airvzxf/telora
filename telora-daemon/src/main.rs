@@ -90,8 +90,14 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
         builder = builder.add_source(File::with_name(cfg_path));
     }
 
-    // 4. Environment variables - Highest priority
-    builder = builder.add_source(config::Environment::with_prefix("TELORA"));
+    // 4. Environment variables - Highest priority. The source
+    // construction is centralised in [`paths::telora_env_source`]
+    // because `config` 0.13's defaults silently drop
+    // `TELORA_PATHS__SOCKET_DIR`; see that helper's rustdoc for the
+    // why. The integration test
+    // `telora-daemon/tests/config_env_cascade.rs` calls the same
+    // helper to pin the behaviour.
+    builder = builder.add_source(paths::telora_env_source());
 
     let mut cfg: DaemonConfig = match builder.build() {
         Ok(c) => c

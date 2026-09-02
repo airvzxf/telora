@@ -203,7 +203,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177` plus `O_NOFOLLOW`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check that confirms it is owned by the current UID, so an attacker cannot redirect the bind to a foreign socket.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -310,6 +310,21 @@ migration it can no longer happen — the runtime dir is owned by
 the current user and torn down by systemd. If you still see it,
 your `[paths] socket_dir` is pointing at `/tmp` and a stale file
 is blocking the bind; remove it as above.
+
+### Known limitation: `bind(2)` does not set `O_NOFOLLOW`
+
+The daemon and GUI sockets are created with `umask 0o177` so the
+mode is `0o600` atomically inside `bind(2)`, but the bind itself
+does **not** pass `O_NOFOLLOW`. A symlink swap race between the
+`symlink_metadata` ownership pre-check and the `bind(2)` syscall
+is therefore theoretically open for the duration of one scheduling
+slice. The current defence is the `symlink_metadata` pre-check
+plus umask enforcement — adequate for the EPIC's stated threat
+model (stale socket owned by another UID on the same machine) but
+not a full TOCTOU fix. Adding `O_NOFOLLOW` to the bind path
+(open the parent directory with `O_PATH`, then
+`linkat(AT_FDCWD, name, parent_fd, name, AT_EMPTY_PATH)`) is
+tracked as a mid-term follow-up.
 
 ## Development
 
