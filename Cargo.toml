@@ -3,7 +3,7 @@ resolver = "2"
 members = ["telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 # voxora 0.1.x is on crates.io. telora-daemon pulls voxora-bridge with
