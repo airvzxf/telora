@@ -330,6 +330,61 @@ tracked as a mid-term follow-up.
 
 For detailed development instructions, local installation to `~/.local`, and coding standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Releases
+
+Telora is released through `.github/workflows/release.yml`, which runs on every push of a `vX.Y.Z` tag. The workflow has four jobs that gate a release on three independent invariants:
+
+1. **`validate-tag-input`** — the tag matches `^v[0-9]+\.[0-9]+\.[0-9]+$`. Fails fast on a malformed name.
+2. **`verify-tag-reachability`** — the tag's commit is an ancestor of `origin/main`. Catches the "tag the branch tip then squash-merge" bug class.
+3. **`verify-tag-signature`** — the tag was GPG/SSH-signed by a key listed in `.github/trusted-signers` (allow-list fetched from `origin/main`, not the tagged tree, so revoking a key on main takes effect on the next release).
+4. **`build-release`** — pinned to the verified SHA, builds the 4 binaries (`telora-daemon`, `telora-gui`, `telora`, `telora-models`) with the same install step as `ci.yml` (CUDA toolkit + `gtk4-layer-shell` built from source), strips them, computes `SHA256SUMS` / `SHA512SUMS`, and smoke-gates each binary with `--version` (or `--help` for the GUI).
+5. **`publish`** — uploads the binaries + checksums as a GitHub Release via `softprops/action-gh-release`, with auto-generated release notes.
+
+The build is **cold by design** (no `Swatinem/rust-cache`): GitHub Actions caches are scoped per-ref, and tag-to-tag restore is forbidden. ~5 min build per release is acceptable for 1–2 releases/week.
+
+### Cutting a release (the operator procedure)
+
+This is the load-bearing manual control while the repo remains single-maintainer. The workflow's structural checks (①–④ below) are defense in depth, not a substitute for the procedure.
+
+① **Fetch and align local `main` to remote.** Covers the local drift that the squash merge creates.
+
+```bash
+git fetch origin main
+git checkout main
+git reset --hard origin/main
+```
+
+② **Confirm the release bump is at HEAD and `Cargo.toml` matches the planned tag.**
+
+```bash
+git log --oneline -1   # expect: <sha> chore(release): vX.Y.Z — ...
+grep '^version' Cargo.toml   # expect: version = "X.Y.Z"
+```
+
+③ **Tag with `-s` (GPG-signed), pointing at the merge SHA.** Never tag a local-only commit before it reaches `main`, and never tag a branch tip that will be squashed.
+
+```bash
+git tag -s vX.Y.Z "$(git rev-parse HEAD)"
+git push origin vX.Y.Z
+```
+
+④ **Verify the tag's commit equals `origin/main`'s HEAD.** This is the invariant the workflow guard checks.
+
+```bash
+[ "$(git rev-parse vX.Y.Z^{commit})" = "$(git rev-parse origin/main)" ] \
+  || { echo "ORPHAN TAG — abort, re-tag after step ①"; exit 1; }
+```
+
+⑤ **Watch the `release.yml` run.** The `Verify · tag is reachable from main` and `Verify · tag is signed by a trusted signer` jobs run in parallel; `Build · release binaries` cold-builds only after both pass. The build is pinned to the immutable tag commit SHA so a tag force-push mid-run cannot redirect it. `Publish · GitHub Release` uploads the binary artefacts and creates the release page.
+
+### Adding a new trusted signer
+
+Append one entry to `.github/trusted-signers` (and, if the new signer uses PGP, append a `-----BEGIN PGP PUBLIC KEY BLOCK-----` to `.github/trusted-signers.asc`; if all signers are SSH-only the `.asc` file may be deleted). The format is documented in the file header. `git verify-tag` auto-detects which backend the tag used, so both formats work without conditional logic in the workflow.
+
+### Removing a signer
+
+Wait until the most recent tag signed by that key is at least one minor version old, so a compromise of the removed key cannot rewrite a release that's in production. The runner's `git verify-tag` step re-checks against the live allow-list on every release, so a removed signer surfaces immediately for the operator.
+
 ## Project Documents
 
 - **[TODO.md](TODO.md)**: A list of planned features, ongoing tasks, and ideas for future development.
