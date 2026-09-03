@@ -558,8 +558,17 @@ jobs:
         run: |
           set -euo pipefail
           useradd -m -s /bin/bash build
+          # Allow `build` to invoke `pacman` without a password so makepkg -s
+          # can satisfy the PKGBUILD's `depends` array. NOPASSWD is scoped
+          # to /usr/bin/pacman only; the build user still cannot read or
+          # modify anything outside its home and the workspace, and cannot
+          # invoke any other command via sudo.
+          echo 'build ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/build-pacman
+          chmod 0440 /etc/sudoers.d/build-pacman
           chown -R build:build "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE/pkg"
+          # Pass through any extra pacman flags makepkg uses; the env var
+          # PACMAN_OPTS is consumed by makepkg, not by the sudoers entry.
           su build -c 'makepkg -s --noconfirm --nocheck'
           # Restore ownership so the upload step can read the .pkg.tar.zst
           chown -R root:root "$GITHUB_WORKSPACE/pkg"
