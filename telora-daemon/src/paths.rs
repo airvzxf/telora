@@ -11,6 +11,13 @@
 //!
 //! The parent directory is created with mode 0o700 before any caller
 //! tries to bind.
+//!
+//! Also owns [`default_voxora_cache_dir`] — the voxora model-cache
+//! root. That helper lives here (not in a `voxora` module) because
+//! it is the same kind of cross-platform path-resolution cascade
+//! the socket resolver does, but its cascade is hardcoded to mirror
+//! the one in `telora-models/src/main.rs::default_cache_dir` so
+//! daemons and CLI tools see the same on-disk location.
 
 use anyhow::{Context, Result};
 use config::Environment;
@@ -56,6 +63,40 @@ pub struct ResolvedPaths {
 #[allow(dead_code)]
 pub fn default_paths_config() -> PathsConfig {
     PathsConfig::default()
+}
+
+/// Default on-disk location for the voxora Hugging Face model cache.
+///
+/// Honours the cascade (first match wins):
+///
+///   1. `$VOXORA_CACHE_DIR` — explicit override, no suffix appended.
+///   2. `$XDG_CACHE_HOME/voxora/models/huggingface` (with fallback
+///      to `dirs::cache_dir()`).
+///
+/// The `models/huggingface` suffix is **load-bearing** for
+/// backwards compatibility with every on-disk cache telora has
+/// shipped since 0.1.x. voxora-hf 0.2's default-features change
+/// enabled `voxora-config`, whose `cache_root()` returns just
+/// `$XDG_CACHE_HOME/voxora` — passing that to
+/// `HuggingFaceSource::cache_dir(...)` orphans every existing
+/// cached model and forces a 3 GB re-download. The fix lives in
+/// `main.rs`: it ALWAYS passes an explicit `cache_dir` here, with
+/// this function as the fallback when neither `--voxora-cache`
+/// nor `$VOXORA_CACHE_DIR` is set.
+///
+/// Mirrors [`telora_models::default_cache_dir`](../../telora_models/default_cache_dir.v.html)
+/// (private); the duplication is deliberate and noted in the plan
+/// (`adopt voxora 0.2` / `RATIONALE §1`). Do NOT switch to
+/// `voxora-config` here.
+#[must_use]
+pub fn default_voxora_cache_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR")
+        && !custom.is_empty()
+    {
+        return PathBuf::from(custom);
+    }
+    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+    base.join("voxora").join("models").join("huggingface")
 }
 
 /// Build the `TELORA_*` environment-variable source for the config

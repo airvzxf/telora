@@ -13,11 +13,25 @@ edition.workspace = true
 # require sm_70+ (Volta), so the qwen3-asr backend stays on CPU on
 # Pascal and older. Bump to `cuda` (umbrella) on sm_70+ hardware.
 voxora-bridge = { workspace = true, features = ["cuda-whisper"] }
+# voxora-registry owns the canonical resolution path
+# (`Registry::resolve(&ModelId::parse(id), &opts) -> ResolvedModel`)
+# the daemon goes through so it never has to lex-sort `*.bin`
+# files in a cache directory. Direct dep (not pulled transitively
+# through the bridge) because the bridge is a pure re-exporter
+# and won't expose the registry surface.
+voxora-registry = { workspace = true }
 
 cpal = "0.15"
 anyhow = "1.0"
 tokio = { version = "1.36", features = ["full"] }
 log = "0.4"
+# Used by `paths::default_voxora_cache_dir` to resolve
+# `$XDG_CACHE_HOME/voxora/models/huggingface` when neither
+# `--voxora-cache` nor `VOXORA_CACHE_DIR` is set. The
+# voxora-hf 0.2 default-features change removed the equivalent
+# `dirs::cache_dir()` cascade from `voxora-config`, which is
+# why we now resolve it ourselves on the telora side.
+dirs = "5"
 env_logger = "0.11"
 hound = "3.5"
 socket2 = "0.5"
@@ -33,3 +47,10 @@ serde_json = "1.0"
 tempfile = "3"
 assert_fs = "1"
 tokio = { version = "1.36", features = ["full", "test-util"] }
+# The voxora_020_resolution regression test exercises the registry
+# path (`ModelId::parse` + `Registry::resolve`) against a fabricated
+# cache layout. Production code already pulls `voxora-registry`
+# transitively via the bridge, but we list it here explicitly so the
+# test can import `RegistryHfExt` / `ModelId` without a private
+# re-export dance.
+voxora-registry = { workspace = true }

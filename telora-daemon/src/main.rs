@@ -261,9 +261,9 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
 /// `ReloadConfig` handler both go through the same path.
 async fn build_transcriber(
     config: &SttConfig,
-    voxora_cache: Option<std::path::PathBuf>,
+    voxora_cache: std::path::PathBuf,
 ) -> Result<(Box<dyn Transcriber>, String)> {
-    let kind = voxora_bridge::ModelKind::from_config(&config.model_kind).ok_or_else(|| {
+    let kind = voxora_bridge::EngineFamily::from_config(&config.model_kind).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown model_kind {:?}; expected one of `whisper` or `qwen3-asr`",
             config.model_kind
@@ -273,7 +273,8 @@ async fn build_transcriber(
         .ok()
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
 
-    let bridge = BridgeTranscriber::from_id(&config.model_id, kind, voxora_cache, token).await?;
+    let bridge =
+        BridgeTranscriber::from_id(&config.model_id, kind, Some(voxora_cache), token).await?;
     let resolved_path = bridge.resolved_path().to_string();
     Ok((Box::new(bridge), resolved_path))
 }
@@ -349,14 +350,27 @@ async fn main() -> Result<()> {
     let paths_config = daemon_cfg.paths.clone();
     let mut stt_config = daemon_cfg.stt;
 
-    // The voxora cache defaults to XDG_CACHE_HOME/voxora/models/huggingface;
-    // a CLI override (`--voxora-cache`) or env var (`VOXORA_CACHE_DIR`)
-    // can pin a different location.
+    // Resolve the voxora cache root. The explicit override and the
+    // `VOXORA_CACHE_DIR` env var both pin a custom location; in
+    // their absence the daemon falls back to
+    // `$XDG_CACHE_HOME/voxora/models/huggingface` (the legacy
+    // 0.1.x layout). The `models/huggingface` suffix is
+    // load-bearing: voxora-hf 0.2's default-features change enabled
+    // `voxora-config`, whose `cache_root()` returns just
+    // `$XDG_CACHE_HOME/voxora`. Letting `from_id` see `None` here
+    // would orphan the operator's 3 GB of cached models and trigger
+    // a re-download against the new (wrong) root — airvzxf/telora#79
+    // took that exact shape from a different cause.
     let voxora_cache = args
         .voxora_cache
-        .as_ref()
+        .as_deref()
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("VOXORA_CACHE_DIR").map(std::path::PathBuf::from));
+        .or_else(|| {
+            std::env::var_os("VOXORA_CACHE_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .unwrap_or_else(paths::default_voxora_cache_dir);
 
     info!("Starting Telora Daemon...");
     info!("Model kind: {}", stt_config.model_kind);
