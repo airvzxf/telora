@@ -332,13 +332,14 @@ For detailed development instructions, local installation to `~/.local`, and cod
 
 ## Releases
 
-Telora is released through `.github/workflows/release.yml`, which runs on every push of a `vX.Y.Z` tag. The workflow has four jobs that gate a release on three independent invariants:
+Telora is released through `.github/workflows/release.yml`, which runs on every push of a `vX.Y.Z` tag. The workflow has six jobs that gate a release on three independent invariants:
 
 1. **`validate-tag-input`** — the tag matches `^v[0-9]+\.[0-9]+\.[0-9]+$`. Fails fast on a malformed name.
 2. **`verify-tag-reachability`** — the tag's commit is an ancestor of `origin/main`. Catches the "tag the branch tip then squash-merge" bug class.
 3. **`verify-tag-signature`** — the tag was GPG/SSH-signed by a key listed in `.github/trusted-signers` (allow-list fetched from `origin/main`, not the tagged tree, so revoking a key on main takes effect on the next release).
-4. **`build-release`** — pinned to the verified SHA, builds the 4 binaries (`telora-daemon`, `telora-gui`, `telora`, `telora-models`) with the same install step as `ci.yml` (CUDA toolkit + `gtk4-layer-shell` built from source), strips them, computes `SHA256SUMS` / `SHA512SUMS`, and smoke-gates each binary with `--version` (or `--help` for the GUI).
-5. **`publish`** — uploads the binaries + checksums as a GitHub Release via `softprops/action-gh-release`, with auto-generated release notes.
+4. **`build-release`** — pinned to the verified SHA, builds the 4 binaries (`telora-daemon`, `telora-gui`, `telora`, `telora-models`) with the same install step as `ci.yml` (CUDA toolkit + `gtk4-layer-shell` built from source), strips them, computes `SHA256SUMS` / `SHA512SUMS`, smoke-gates each binary with `--version` (or `--help` for the GUI), and generates a CycloneDX SBOM via `anchore/sbom-action`.
+5. **`build-aur-package`** — runs in an `archlinux:latest` container, downloads the release artefacts, stages the binaries into `bin/` where the existing `PKGBUILD` expects them, updates `PKGBUILD`'s `pkgver` and the install hook's version line, runs `makepkg -s --noconfirm --nocheck`, and verifies the package contents (binaries + systemd units + `/etc/telora.toml`) with `tar -tf`.
+6. **`publish`** — uploads the binaries + checksums + SBOM + AUR `.pkg.tar.zst` as a GitHub Release via `softprops/action-gh-release`, with auto-generated release notes.
 
 The build is **cold by design** (no `Swatinem/rust-cache`): GitHub Actions caches are scoped per-ref, and tag-to-tag restore is forbidden. ~5 min build per release is acceptable for 1–2 releases/week.
 
@@ -384,6 +385,20 @@ Append one entry to `.github/trusted-signers` (and, if the new signer uses PGP, 
 ### Removing a signer
 
 Wait until the most recent tag signed by that key is at least one minor version old, so a compromise of the removed key cannot rewrite a release that's in production. The runner's `git verify-tag` step re-checks against the live allow-list on every release, so a removed signer surfaces immediately for the operator.
+
+### Release artefacts
+
+Each `vX.Y.Z` release attaches the following assets to the GitHub Release page:
+
+| File | What it is | Consumer |
+|---|---|---|
+| `telora-daemon` | Speech-to-text daemon (43 MB) | Runs as a systemd user service |
+| `telora-gui` | GTK4 Wayland OSD client (5.5 MB) | Runs as a systemd user service |
+| `telora` | CLI toggle/control client (4 MB) | One-shot commands from a terminal or hotkey |
+| `telora-models` | Model download/management CLI (10.7 MB) | One-shot, for first-time setup and model rotation |
+| `SHA256SUMS`, `SHA512SUMS` | Checksums for the 4 binaries | Verification |
+| `telora.sbom.cdx.json` | CycloneDX SBOM (auto-generated from Cargo.lock by `anchore/sbom-action`) | Audit, license compliance, vulnerability scanning |
+| `telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` | Arch Linux AUR binary package, built by the `build-aur-package` job running `makepkg` in an `archlinux:latest` container | `pacman -U telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` for Arch users who want the package instead of the four raw binaries |
 
 ## Project Documents
 
