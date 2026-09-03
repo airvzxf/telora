@@ -29,11 +29,11 @@ The daemon resolves the id through `voxora-hf` (which downloads, caches and veri
 ## Development Workflow
 
 ### 1. Prerequisites
-- Rust (Edition 2024, MSRV 1.85)
+- Rust (Edition 2024, MSRV 1.85) installed via [rustup](https://rustup.rs/) (any stable toolchain `>= 1.85` works; the project's CI pins `stable` via `dtolnay/rust-toolchain`).
 - Podman (for containerized builds)
 - GTK4 and Layer Shell libraries (if building locally)
 - CUDA Toolkit (for GPU acceleration)
-- A checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) as a sibling directory (`../voxora`). The telora workspace uses path deps to pick up the bridge umbrella crate; this avoids a crates.io publish while voxora is pre-`0.1.0`.
+- voxora 0.2.x, pinned via the workspace `[workspace.dependencies]` block in the top-level `Cargo.toml` (`voxora-bridge`, `voxora-registry`, `voxora-hf`, `voxora-core` — all `"0.2"`). No sibling checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) is required: the daemon resolves everything through registry crates since commit `b4a252b` (`fix: consume voxora 0.2.0`).
 
 ### 2. Building
 The recommended way to build is using the provided script, which ensures a consistent environment:

@@ -266,6 +266,15 @@ jobs:
           ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
+      # Pin a rustc toolchain that matches ci.yml's pin (same SHA)
+      # so the release artefact is built with the same compiler that
+      # validated the merge commit. See ci.yml for the rationale.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
       - name: Install dependencies
         # Mirror of ci.yml: Ubuntu 24.04 (Noble) does not ship
         # `libgtk4-layer-shell-dev` (only the GTK3 variant), so we
