@@ -375,6 +375,13 @@ jobs:
         # 'auto' which detects cargo and produces a Cargo-aware SBOM
         # (transitive deps from Cargo.lock, licenses from Cargo.toml,
         # project metadata from the workspace package).
+        #
+        # The action (v0.24.0) does NOT accept `source-name` /
+        # `source-version` as direct inputs; Syft's source metadata
+        # is configured via a `.syft.yaml` config file referenced
+        # through `with: config:`. Adding a Syft config file is out
+        # of scope for this release fix; the SBOM continues to
+        # report source as "directory@<sha>" until that lands.
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           format: cyclonedx-json
@@ -401,16 +408,40 @@ jobs:
           test -f "${{ github.workspace }}/telora.sbom.cdx.json" \
             || { echo "ERROR: SBOM file missing after download"; exit 1; }
 
+      - name: Stage SBOM with the binaries
+        # v4's actions/upload-artifact strips the longest common
+        # directory prefix of all matched paths from each zip entry.
+        # The SBOM lives at ${{ github.workspace }} (a sibling of
+        # release-artifacts/), so the LCA collapses to /home/runner/work
+        # and the zip ends up nested at _temp/release-artifacts/ and
+        # _telora/ — neither at the root the consumers expect.
+        # Stage the SBOM under release-artifacts/ so all 7 files
+        # share one parent and v4's stripping gives a flat zip.
+        run: cp "${{ github.workspace }}/telora.sbom.cdx.json" "${{ runner.temp }}/release-artifacts/"
+      - name: Append SBOM checksum to SHA256SUMS / SHA512SUMS
+        # The initial `Compute SHA-*` steps ran before the SBOM was
+        # generated (Syft hasn't scanned the workspace yet at that
+        # point), so the SBOM line is appended here after the SBOM
+        # has been staged next to the binaries. `>>` preserves the
+        # binary checksums already on disk.
+        run: |
+          set -euo pipefail
+          ART_DIR="${RUNNER_TEMP}/release-artifacts"
+          ( cd "${ART_DIR}" && sha256sum telora.sbom.cdx.json ) >> "${ART_DIR}/SHA256SUMS"
+          ( cd "${ART_DIR}" && sha512sum telora.sbom.cdx.json ) >> "${ART_DIR}/SHA512SUMS"
+          cat "${ART_DIR}/SHA256SUMS"
+          cat "${ART_DIR}/SHA512SUMS"
       - name: Upload bundle for the publisher job
         # The bundle includes 4 binaries + 2 checksum files + the
         # CycloneDX SBOM. Strip is performed on each binary in a
-        # dedicated step above.
+        # dedicated step above. The SBOM is staged next to the
+        # binaries by the previous step so v4 of
+        # actions/upload-artifact emits a flat zip (single-line
+        # glob, all 7 files under one common parent).
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: telora-release-bundle
-          path: |
-            ${{ runner.temp }}/release-artifacts/
-            ${{ github.workspace }}/telora.sbom.cdx.json
+          path: ${{ runner.temp }}/release-artifacts/*
           retention-days: 7
           if-no-files-found: error
 
@@ -422,7 +453,7 @@ jobs:
   # `make install` then packs everything into the AUR tree.
   build-aur-package:
     name: 'Build · AUR package (Arch)'
-    needs: [build-release]
+    needs: [build-release, validate-tag-input]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # contents: read is enough — the AUR build only downloads the
@@ -445,7 +476,23 @@ jobs:
         # conventional group for AUR package builds and the
         # overhead is small.
         run: |
-          pacman -Sy --noconfirm --needed base-devel git
+          pacman -Syu --noconfirm --needed base-devel git
+
+      - name: Checkout telora at the tagged commit
+        # The AUR job references in-repo paths via `working-directory:`
+        # (notably `pkg/` for PKGBUILD and `telora-bin.install`), but the
+        # archlinux container starts with an empty workspace — no step
+        # in `build-aur-package` inherits a checkout from `build-release`,
+        # so `pkg/` and friends are absent. Without this step the
+        # PKGBUILD-update / makepkg / verify steps all fail with
+        # `OCI runtime exec failed: chdir to cwd (.../pkg) ... no such
+        # file or directory`. Pin `ref` to the tag (not the branch tip)
+        # so the checkout matches the binaries we just downloaded from
+        # the build-release artefact.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
 
       - name: Verify arch matches the release binaries
         # Sanity check: the AUR package is `x86_64`, so the
@@ -489,23 +536,33 @@ jobs:
           set -euo pipefail
           VERSION="${TAG#v}"
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
-          sed -i "s|^echo \":: Telora [0-9].*|echo \":: Telora ${VERSION} has been installed.\"|" telora-bin.install
+          sed -i 's|^\([[:space:]]*\)echo ":: Telora [0-9].*|\1echo ":: Telora '"${VERSION}"' has been installed."|' telora-bin.install
           echo "After update:"
           grep -E '^(pkgver|pkgrel)=' PKGBUILD
-          grep -E '^echo' telora-bin.install
+          grep -E '^[[:space:]]*echo ":: Telora '"${VERSION}"' has been installed."' telora-bin.install || { echo "ERROR: post-install message not updated"; exit 1; }
 
-      - name: Build AUR package
+      - name: Build AUR package as non-root user
         # `-s` installs missing `makedepends` automatically (none
         # expected: PKGBUILD declares only `make`, which base-devel
         # provides). `--noconfirm` skips the interactive package
         # selection prompts. `--nocheck` skips the (none) check
         # function. The resulting `.pkg.tar.zst` lands in
         # `$GITHUB_WORKSPACE/pkg/`.
+        #
+        # GitHub Actions `container:` jobs run as root, and `makepkg`
+        # hard-rejects root invocations since pacman 5.0. We
+        # `useradd` a build user, `su` into it for the makepkg call,
+        # then restore root ownership of the workspace so the upload
+        # step below can read the `.pkg.tar.zst`.
         working-directory: pkg
         run: |
           set -euo pipefail
+          useradd -m -s /bin/bash build
+          chown -R build:build "$GITHUB_WORKSPACE"
           cd "$GITHUB_WORKSPACE/pkg"
-          makepkg -s --noconfirm --nocheck
+          su build -c 'makepkg -s --noconfirm --nocheck'
+          # Restore ownership so the upload step can read the .pkg.tar.zst
+          chown -R root:root "$GITHUB_WORKSPACE/pkg"
           ls -la *.pkg.tar.zst
 
       - name: Verify AUR package contents
