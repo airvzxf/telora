@@ -65,8 +65,16 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let cache_root = cli.voxora_cache.clone().unwrap_or_else(default_cache_dir);
-    let source = build_source(cli.voxora_cache.as_deref())?;
+    // Single source of truth for the cache root — `list` and
+    // `download` scan the same directory `download` writes to.
+    // Empty CLI strings are filtered so `--voxora-cache ""` falls
+    // through to the default (matching the daemon's behaviour).
+    let cache_root = cli
+        .voxora_cache
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(default_cache_dir);
+    let source = build_source(Some(&cache_root))?;
 
     match cli.command {
         Commands::List => list_cmd(&cache_root),
@@ -141,6 +149,18 @@ fn path_cmd(cache_root: &Path) -> Result<()> {
 /// Mirror of `voxora_hf::cache::default_cache_root`. Kept private
 /// there to keep the voxora-hf API surface minimal; duplicated here
 /// because we only need it for the `path` subcommand.
+///
+/// Intentionally a legacy-mode mirror of the operator's on-disk
+/// layout from voxora 0.1.x. It deliberately does NOT go through
+/// `voxora-config` — voxora-hf 0.2's default-features change
+/// enabled `voxora-config`, whose `cache_root()` returns just
+/// `$XDG_CACHE_HOME/voxora` (without the `models/huggingface`
+/// suffix), which would orphan every model that telora has shipped
+/// to the operator since 0.1.x.
+///
+/// `main()` ALWAYS passes this helper's result into
+/// [`build_source`] so the source the daemon reads and the path
+/// `path` reports are guaranteed to be the same directory.
 fn default_cache_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR") {
         return PathBuf::from(custom);
@@ -149,12 +169,21 @@ fn default_cache_dir() -> PathBuf {
     base.join("voxora").join("models").join("huggingface")
 }
 
+/// Char-boundary-aware truncation. The previous implementation
+/// byte-sliced the string and could panic on multi-byte UTF-8 paths
+/// (the operator's home directory was the easy reproducer). Budget
+/// here is in Unicode scalar values, not bytes — the right unit
+/// for "we want this to fit in a column".
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("...{}", &s[s.len().saturating_sub(max - 3)..])
+    if s.chars().count() <= max {
+        return s.to_string();
     }
+    let cut = s
+        .char_indices()
+        .nth_back(max.saturating_sub(3))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("...{}", &s[cut..])
 }
 
 fn human_bytes(n: u64) -> String {

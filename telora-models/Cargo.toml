@@ -2,6 +2,7 @@
 name = "telora-models"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # voxora-hf is the source of truth for Hugging Face model resolution.

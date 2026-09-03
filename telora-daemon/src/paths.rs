@@ -11,6 +11,13 @@
 //!
 //! The parent directory is created with mode 0o700 before any caller
 //! tries to bind.
+//!
+//! Also owns [`default_voxora_cache_dir`] — the voxora model-cache
+//! root. That helper lives here (not in a `voxora` module) because
+//! it is the same kind of cross-platform path-resolution cascade
+//! the socket resolver does, but its cascade is hardcoded to mirror
+//! the one in `telora-models/src/main.rs::default_cache_dir` so
+//! daemons and CLI tools see the same on-disk location.
 
 use anyhow::{Context, Result};
 use config::Environment;
@@ -56,6 +63,150 @@ pub struct ResolvedPaths {
 #[allow(dead_code)]
 pub fn default_paths_config() -> PathsConfig {
     PathsConfig::default()
+}
+
+/// Default on-disk location for the voxora Hugging Face model cache.
+///
+/// Honours the cascade (first match wins):
+///
+///   1. `$VOXORA_CACHE_DIR` — explicit override, no suffix appended.
+///      The override is sanitised: paths containing `..` components
+///      are rejected, and absolute paths must live under
+///      [`dirs::cache_dir`] (canonicalised comparison). Anything
+///      else is logged and the cascade falls through to the XDG
+///      default.
+///   2. `$XDG_CACHE_HOME/voxora/models/huggingface`. If
+///      `dirs::cache_dir()` returns `None` (no `HOME`,
+///      no `XDG_CACHE_HOME`, etc.), the helper returns
+///      [`anyhow::Error`] instead of silently falling back to a
+///      relative `.cache` — the daemon has nowhere to land and we
+///      would rather fail loudly than route model downloads to
+///      `/.cache/voxora/...`.
+///
+/// The `models/huggingface` suffix is **load-bearing** for
+/// backwards compatibility with every on-disk cache telora has
+/// shipped since 0.1.x. voxora-hf 0.2's default-features change
+/// enabled `voxora-config`, whose `cache_root()` returns just
+/// `$XDG_CACHE_HOME/voxora` — passing that to
+/// `HuggingFaceSource::cache_dir(...)` orphans every existing
+/// cached model and forces a 3 GB re-download. The fix lives in
+/// `main.rs`: it ALWAYS passes an explicit `cache_dir` here, with
+/// this function as the fallback when neither `--voxora-cache`
+/// nor `$VOXORA_CACHE_DIR` is set.
+///
+/// Mirrors [`telora_models::default_cache_dir`](../../telora_models/default_cache_dir.v.html)
+/// (private); the duplication is deliberate and noted in the plan
+/// (`adopt voxora 0.2` / `RATIONALE §1`). Do NOT switch to
+/// `voxora-config` here.
+pub fn default_voxora_cache_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR")
+        && !custom.is_empty()
+        && let Some(accepted) = sanitize_voxora_cache_override(Path::new(&custom))
+    {
+        return Ok(accepted);
+    }
+    let base = dirs::cache_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine a safe voxora cache directory: dirs::cache_dir() returned None; \
+             set $VOXORA_CACHE_DIR or $XDG_CACHE_HOME"
+        )
+    })?;
+    Ok(base.join("voxora").join("models").join("huggingface"))
+}
+
+/// Resolve the voxora model-cache root, mirroring the daemon's
+/// production wiring (`main.rs::main`). Honours the override
+/// sources in priority order:
+///
+///   1. `args_override` — `--voxora-cache` from the CLI.
+///   2. `env_override` — `$VOXORA_CACHE_DIR` from the environment.
+///   3. The XDG default from [`default_voxora_cache_dir`].
+///
+/// BOTH override sources flow through
+/// [`sanitize_voxora_cache_override`]. Empty / whitespace-only
+/// inputs are filtered out so `--voxora-cache ""` and
+/// `VOXORA_CACHE_DIR=""` both fall through cleanly (asymmetric
+/// handling here would silently point the cache at the CWD's
+/// `.cache`, per airvzxf/telora#79). When the sanitiser rejects a
+/// candidate (because it contains a `..` component or otherwise
+/// escapes the XDG cache root), this helper falls through to the
+/// XDG default rather than honouring the unsafe path — same
+/// security posture as [`default_voxora_cache_dir`].
+///
+/// `pub` so `main.rs::main` (and the integration-style test in
+/// `cache_dir_tests`) call this exact code path. `main.rs` used
+/// to short-circuit on `args.voxora_cache` / `$VOXORA_CACHE_DIR`
+/// and feed the raw string into `PathBuf::from` — that meant
+/// `VOXORA_CACHE_DIR=/tmp/foo/../bar` was accepted verbatim,
+/// contradicting the F2 commit's claim that the sanitiser gates
+/// the override. Routing through this helper closes that gap.
+pub fn resolve_voxora_cache(
+    args_override: Option<&str>,
+    env_override: Option<&str>,
+) -> Result<PathBuf> {
+    let candidate = args_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_override.filter(|s| !s.is_empty()));
+    if let Some(s) = candidate
+        && let Some(accepted) = sanitize_voxora_cache_override(Path::new(s))
+    {
+        return Ok(accepted);
+    }
+    default_voxora_cache_dir()
+}
+
+/// Defensive sanitiser for `VOXORA_CACHE_DIR`. Returns `Some(path)`
+/// if the override is acceptable, `None` (after a `log::warn!`) if
+/// the caller should fall through to the XDG default.
+///
+/// Rejects:
+///   * any `..` path component (an attacker who controls the env
+///     var could otherwise redirect the cache to a system path);
+///   * absolute paths that do not live under `dirs::cache_dir()`,
+///     comparing canonical forms when the path exists on disk and
+///     the raw path otherwise.
+///
+/// Relative paths with no `..` components are accepted — the
+/// operator is responsible for where they resolve to.
+///
+/// `pub` so [`resolve_voxora_cache`] can wire it into both
+/// `args.voxora_cache` and `$VOXORA_CACHE_DIR` — the production
+/// daemon routes both through this sanitiser (see
+/// `main.rs::resolve_voxora_cache` callers).
+pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        log::warn!(
+            "VOXORA_CACHE_DIR={candidate:?} contains a `..` component; \
+             ignoring and falling back to the XDG default"
+        );
+        return None;
+    }
+    let xdg = dirs::cache_dir()?;
+    let accepted = if candidate.exists() {
+        match std::fs::canonicalize(candidate) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "VOXORA_CACHE_DIR={candidate:?} canonicalize failed ({e}); \
+                     ignoring and falling back to the XDG default"
+                );
+                return None;
+            }
+        }
+    } else {
+        candidate.to_path_buf()
+    };
+    if accepted.is_absolute() && !accepted.starts_with(&xdg) {
+        log::warn!(
+            "VOXORA_CACHE_DIR={candidate:?} does not live under the XDG cache \
+             directory {xdg:?}; ignoring and falling back to the XDG default"
+        );
+        return None;
+    }
+    Some(accepted)
 }
 
 /// Build the `TELORA_*` environment-variable source for the config
@@ -175,8 +326,10 @@ mod tests {
     use std::sync::Mutex;
 
     // XDG_RUNTIME_DIR is process-global, so serialise tests that
-    // touch it to avoid cross-talk.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // touch it to avoid cross-talk. `pub(super)` so the
+    // `cache_dir_tests` sibling module can share the same lock
+    // (it guards `VOXORA_CACHE_DIR` mutations across the workspace).
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_prefers_xdg_runtime_dir_when_set() {
@@ -295,5 +448,213 @@ mod tests {
         let dir = base.join(format!("telora-paths-test-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("create test tempdir");
         dir
+    }
+}
+
+/// Tests for the `default_voxora_cache_dir` cascade.
+///
+/// Kept in a separate module from the main `tests` module because
+/// the env-var contract under test is small and tightly scoped; a
+/// dedicated module keeps the failure output unambiguous.
+#[cfg(test)]
+mod cache_dir_tests {
+    use super::*;
+
+    /// The XDG prefix used by the under-cache-dir check in the
+    /// sanitiser. We don't assert the literal because `dirs::cache_dir`
+    /// depends on the host's `HOME` / `XDG_CACHE_HOME`.
+    fn xdg_cache_root() -> PathBuf {
+        dirs::cache_dir().expect("dirs::cache_dir() must be Some in the test environment")
+    }
+
+    #[test]
+    fn default_voxora_cache_dir_uses_voxora_models_huggingface_suffix() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+
+        let resolved = default_voxora_cache_dir().expect("XDG path must resolve");
+
+        let expected_suffix = Path::new("voxora").join("models").join("huggingface");
+        assert!(
+            resolved.ends_with(&expected_suffix),
+            "default voxora cache must end with `voxora/models/huggingface`, got: {}",
+            resolved.display()
+        );
+        // And the prefix must be the XDG cache root.
+        let xdg = xdg_cache_root();
+        assert!(
+            resolved.starts_with(&xdg),
+            "default voxora cache must live under the XDG cache root {xdg:?}, got: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn default_voxora_cache_dir_honours_voxora_cache_dir_override() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        // Use a path that lives under the XDG cache root so the
+        // sanitiser accepts it.
+        let override_path = xdg_cache_root().join("telora-voxora-cache-override");
+        unsafe {
+            std::env::set_var("VOXORA_CACHE_DIR", &override_path);
+        }
+
+        let resolved = default_voxora_cache_dir().expect("override path must resolve");
+        assert_eq!(resolved, override_path);
+
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn default_voxora_cache_dir_rejects_parent_dir_segments() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        // Path contains a `..` component — the sanitiser must refuse
+        // it and fall through to the XDG default. The literal path
+        // DOES exist on a typical Linux host (we construct it via
+        // `PathBuf` to dodge the under-prefix check), so we cannot
+        // rely on canonicalisation to neutralise the `..`.
+        let bad = PathBuf::from("/tmp/foo/../bar");
+        unsafe {
+            std::env::set_var("VOXORA_CACHE_DIR", &bad);
+        }
+
+        let resolved = default_voxora_cache_dir().expect("XDG path must resolve");
+
+        // The result MUST NOT be `/tmp/bar` — that's the silent data
+        // corruption we are guarding against.
+        assert_ne!(
+            resolved,
+            PathBuf::from("/tmp/bar"),
+            "sanitiser must not honour a VOXORA_CACHE_DIR with a `..` component"
+        );
+        // The XDG default is `xdg_cache_root()/voxora/models/huggingface`.
+        let expected_suffix = Path::new("voxora").join("models").join("huggingface");
+        assert!(
+            resolved.ends_with(&expected_suffix),
+            "fallback path must be the XDG default, got: {}",
+            resolved.display()
+        );
+
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+    }
+
+    /// End-to-end check that `resolve_voxora_cache` (the helper
+    /// `main.rs::main` actually calls) routes the `VOXORA_CACHE_DIR`
+    /// override through the sanitiser. The pre-fix `main.rs`
+    /// short-circuited on `args.voxora_cache` / `VOXORA_CACHE_DIR`
+    /// BEFORE invoking `default_voxora_cache_dir`, which meant the
+    /// sanitiser was dead code in production. This test exercises
+    /// the full wiring via the new helper so a future refactor that
+    /// re-introduces the short-circuit fails the test instead of
+    /// silently regressing the F2 security posture.
+    #[test]
+    fn resolve_voxora_cache_rejects_parent_dir_via_env_override() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        // Make sure no prior test left VOXORA_CACHE_DIR behind —
+        // the helper's contract is "env override goes through the
+        // sanitiser", so the override has to be set for this test
+        // to be meaningful.
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+
+        let bad = "/tmp/this-is-a-test/cache-root/../../etc";
+        let resolved = resolve_voxora_cache(None, Some(bad)).expect("XDG path must resolve");
+
+        // The unsafe override must NOT be honoured. `/tmp/etc` is
+        // the verbatim path after collapsing `..`; if the helper
+        // ever stops sanitising, this assertion fires.
+        assert_ne!(
+            resolved,
+            PathBuf::from("/tmp/etc"),
+            "resolve_voxora_cache must not honour an env override with a `..` component; got: {}",
+            resolved.display()
+        );
+        // And it must have fallen through to the XDG default.
+        let expected_suffix = Path::new("voxora").join("models").join("huggingface");
+        assert!(
+            resolved.ends_with(&expected_suffix),
+            "fallback path must be the XDG default, got: {}",
+            resolved.display()
+        );
+
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+    }
+
+    /// Same protection as the env-override test above, but exercised
+    /// through the CLI flag (`--voxora-cache`) path. The pre-fix
+    /// `main.rs` accepted `args.voxora_cache` verbatim via
+    /// `PathBuf::from(c)`, so `--voxora-cache /tmp/foo/../bar`
+    /// would have produced `/tmp/bar` on disk. The new
+    /// `resolve_voxora_cache` helper routes the CLI override
+    /// through the same sanitiser.
+    #[test]
+    fn resolve_voxora_cache_rejects_parent_dir_via_cli_override() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        let bad = "/tmp/another-cli-test/cache/../elsewhere";
+        let resolved = resolve_voxora_cache(Some(bad), None).expect("XDG path must resolve");
+
+        assert_ne!(
+            resolved,
+            PathBuf::from("/tmp/another-cli-test/elsewhere"),
+            "resolve_voxora_cache must not honour a CLI override with a `..` component; got: {}",
+            resolved.display()
+        );
+        let expected_suffix = Path::new("voxora").join("models").join("huggingface");
+        assert!(
+            resolved.ends_with(&expected_suffix),
+            "fallback path must be the XDG default, got: {}",
+            resolved.display()
+        );
+    }
+
+    /// CLI flag must win over env override (priority order documented
+    /// in [`resolve_voxora_cache`]). When BOTH are supplied, the
+    /// sanitiser accepts the CLI value (it lives under the XDG cache
+    /// root) and the env value is never inspected.
+    #[test]
+    fn resolve_voxora_cache_cli_override_wins_over_env_override() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        let cli = xdg_cache_root().join("telora-voxora-cache-cli-wins");
+        // Deliberately bogus env value: if the CLI value were not
+        // honoured, the helper would inspect this and fall through
+        // to the XDG default, and the assertion below would fail.
+        let env = "/tmp/foo/../bar";
+
+        let resolved = resolve_voxora_cache(Some(cli.to_str().unwrap()), Some(env))
+            .expect("override must resolve");
+
+        assert_eq!(resolved, cli);
+        // Sanity: the env value would have collapsed to /tmp/bar.
+        assert_ne!(resolved, PathBuf::from("/tmp/bar"));
+    }
+
+    /// Empty strings on either input are filtered (so
+    /// `--voxora-cache ""` and `VOXORA_CACHE_DIR=""` both fall
+    /// through cleanly, per airvzxf/telora#79). When BOTH inputs
+    /// are empty, the helper returns the XDG default.
+    #[test]
+    fn resolve_voxora_cache_treats_empty_inputs_as_absent() {
+        let _guard = tests::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("VOXORA_CACHE_DIR");
+        }
+
+        let resolved = resolve_voxora_cache(Some(""), Some("")).expect("XDG path must resolve");
+
+        let expected_suffix = Path::new("voxora").join("models").join("huggingface");
+        assert!(
+            resolved.ends_with(&expected_suffix),
+            "empty inputs must fall through to the XDG default, got: {}",
+            resolved.display()
+        );
     }
 }
