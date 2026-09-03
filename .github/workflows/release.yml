@@ -410,6 +410,13 @@ jobs:
     needs: [build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # contents: read is enough — the AUR build only downloads the
+    # build-release artefact and stages it under makepkg's
+    # filesystem. The package itself is uploaded via the upload-
+    # artefact action which uses the runner's per-job token, not the
+    # workflow's GITHUB_TOKEN contents scope.
+    permissions:
+      contents: read
     container:
       image: archlinux:latest
       # makepkg needs to chroot the build by default; privileged
