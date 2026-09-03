@@ -32,12 +32,25 @@ pub struct StatusResponse {
 /// `model_kind` is a free-form string at the JSON layer so we can
 /// pass it verbatim over the socket; the daemon validates it via
 /// [`voxora_bridge::ModelKind::from_config`].
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// `Default` is derived so a flattened top-level field can supply
+/// an empty `SttConfig` when the user's `telora.toml` omits every
+/// STT key (see [`DaemonConfig`]). All fields also carry
+/// `#[serde(default)]` because `#[serde(flatten)]` does not invoke
+/// the inner struct's `Default` for partially-present data — every
+/// missing field needs its own default to keep existing partial
+/// `telora.toml` files (e.g. those that omit `model_path`) loading.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SttConfig {
+    #[serde(default)]
     pub model_id: String,
+    #[serde(default)]
     pub model_kind: String,
+    #[serde(default)]
     pub model_path: String,
+    #[serde(default)]
     pub language: String,
+    #[serde(default)]
     pub max_recording_seconds: u32,
 }
 
@@ -60,18 +73,21 @@ pub struct PathsConfig {
     pub control_socket: Option<String>,
 }
 
-/// Top-level daemon configuration rooted at `telora.toml`. Wraps the
-/// STT config and the `[paths]` overrides so deserialisation sees
-/// the full shape instead of a bare `SttConfig`.
+/// Top-level daemon configuration rooted at `telora.toml`.
+///
+/// STT fields (`model_id`, `model_kind`, `language`, etc.) are kept
+/// at the top level for backwards compatibility with the original
+/// `telora.toml` format. The `[paths]` overrides are a separate
+/// section added in EPIC #27.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonConfig {
-    #[serde(default = "default_stt_config")]
+    /// STT configuration, inlined at the top level via
+    /// `#[serde(flatten)]` so existing `telora.toml` files with
+    /// flat `model_id = "..."` continue to work.
+    #[serde(flatten, default)]
     pub stt: SttConfig,
-    /// `[paths]` overrides. Wired into the daemon's bind path in
-    /// sub-issue #34; until then the field is populated but not
-    /// read by `main`.
+    /// `[paths]` section. See [`PathsConfig`].
     #[serde(default)]
-    #[allow(dead_code)]
     pub paths: PathsConfig,
 }
 
