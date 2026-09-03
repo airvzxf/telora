@@ -29,7 +29,7 @@ The daemon resolves the id through `voxora-hf` (which downloads, caches and veri
 ## Development Workflow
 
 ### 1. Prerequisites
-- Rust (Edition 2024)
+- Rust (Edition 2024, MSRV 1.85)
 - Podman (for containerized builds)
 - GTK4 and Layer Shell libraries (if building locally)
 - CUDA Toolkit (for GPU acceleration)

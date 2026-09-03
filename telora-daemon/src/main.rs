@@ -417,13 +417,20 @@ async fn main() -> Result<()> {
     // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default
     // (asymmetric handling here would silently point the cache at
     // CWD-relative ".cache", per airvzxf/telora#79).
-    let voxora_cache = if let Some(c) = args.voxora_cache.as_deref().filter(|s| !s.is_empty()) {
-        std::path::PathBuf::from(c)
-    } else if let Some(c) = std::env::var_os("VOXORA_CACHE_DIR").filter(|v| !v.is_empty()) {
-        std::path::PathBuf::from(c)
-    } else {
-        paths::default_voxora_cache_dir().context("resolving default voxora cache directory")?
-    };
+    //
+    // BOTH override sources flow through
+    // `paths::resolve_voxora_cache`, which routes the candidate
+    // through `sanitize_voxora_cache_override`. An earlier version
+    // short-circuited on `args.voxora_cache` / `VOXORA_CACHE_DIR`
+    // here, which meant `VOXORA_CACHE_DIR=/tmp/foo/../bar` was
+    // accepted verbatim and the F2 commit's claim that the
+    // sanitiser gates the override was false. Going through the
+    // helper closes that gap.
+    let voxora_cache = paths::resolve_voxora_cache(
+        args.voxora_cache.as_deref(),
+        std::env::var("VOXORA_CACHE_DIR").ok().as_deref(),
+    )
+    .context("resolving voxora cache directory")?;
 
     // Tighten the cache directory's mode so other local users cannot
     // read model weights or plant a symlink that whisper.cpp's mmap

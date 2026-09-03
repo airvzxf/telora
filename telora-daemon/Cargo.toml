@@ -2,6 +2,7 @@
 name = "telora-daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # voxora-bridge replaces the direct whisper-rs dependency. voxora-bridge
