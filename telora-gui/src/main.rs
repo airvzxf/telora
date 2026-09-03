@@ -95,7 +95,7 @@ fn main() {
             .next()
             .unwrap_or_else(|| "telora-gui".to_string());
         println!(
-            "telora-gui — Telora Assistant UI (Wayland overlay)\n\
+            "telora-gui {version} — Telora Assistant UI (Wayland overlay)\n\
              \n\
              USAGE:\n\
              {bin_name}\n\
@@ -122,6 +122,7 @@ fn main() {
              telora(1), telora-daemon(1), telora.service(5)",
             control_sock = control_sock.display(),
             daemon_sock = daemon_sock.display(),
+            version = env!("CARGO_PKG_VERSION"),
         );
         std::process::exit(0);
     }
