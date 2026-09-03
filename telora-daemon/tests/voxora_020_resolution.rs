@@ -33,9 +33,10 @@
 
 use std::sync::Arc;
 
+use telora_daemon::BridgeTranscriber;
 use tempfile::TempDir;
 use voxora_bridge::{AsrError, EngineFamily, HuggingFaceSource, ModelSource, ResolveOptions};
-use voxora_registry::{ModelId, Registry, RegistryHfExt};
+use voxora_registry::{ModelId, Registry, RegistryError, RegistryHfExt};
 
 /// Build a hand-rolled HF cache layout that mirrors
 /// `voxora-hf`'s `<cache_root>/<org>/<repo>/<revision>/` convention
@@ -146,7 +147,7 @@ async fn resolve_rejects_cache_with_marker_but_missing_file() {
     let registry_err = registry
         .resolve(&parsed, &opts)
         .await
-        .expect_err("registry must propagate the ModelNotFound from voxora-hf");
+        .expect_err("registry must reject 3-segment id when the cache marker lies about the file");
 
     // The registry wraps the source error in RegistryError::Parse;
     // the underlying cause is `AsrError::ModelNotFound("...is marked
@@ -167,8 +168,207 @@ async fn resolve_rejects_cache_with_marker_but_missing_file() {
         other => panic!("expected AsrError::ModelNotFound, got {other:?}"),
     }
 
-    // Just smoke-test the registry error shape — it must be a
-    // RegistryError (not ModelNotFound directly) since the
-    // registry today wraps source failures.
-    let _ = registry_err;
+    // The registry error must itself reference the missing file
+    // (the source error is wrapped via `RegistryError::Parse`), so
+    // operators debugging a failed REFRESH see the offending file
+    // name without having to follow the chain by hand.
+    let display = format!("{registry_err:?}");
+    assert!(
+        display.contains("ggml-tiny.en.bin") || display.contains("ModelNotFound"),
+        "registry error must name the missing file, got: {display}"
+    );
+    // Belt and braces: confirm the variant shape we expect.
+    assert!(
+        matches!(registry_err, RegistryError::Parse(_)),
+        "expected RegistryError::Parse, got {registry_err:?}"
+    );
+}
+
+// ---- Daemon-API regression tests for F2 follow-up (S1, B2, etc.) ----
+//
+// These tests drive `BridgeTranscriber::from_id` directly (the
+// daemon's public API) instead of going through the registry in
+// isolation. They pin the lex-sort fix at the daemon's surface (Test4)
+// and the new security / config-mismatch guards (Test2, Test3, Test6).
+
+/// Build a 2-bins cache (no `.complete` marker) for the
+/// 2-segment-Whisper rejection test. The marker is intentionally
+/// absent so the lex-sort path is the only one that could possibly
+/// succeed — but the daemon must reject this BEFORE any engine
+/// load because `ModelDir.entry` is `None`.
+fn build_cache_with_two_ggml_bins_no_marker() -> TempDir {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp
+        .path()
+        .join("ggerganov")
+        .join("whisper.cpp")
+        .join("main");
+    std::fs::create_dir_all(&dir).expect("mkdir cache layout");
+    std::fs::write(dir.join("ggml-base.bin"), b"b").expect("write base");
+    std::fs::write(dir.join("ggml-large-v3.bin"), b"L").expect("write large-v3");
+    // Deliberately no `.complete` marker — we want to verify the
+    // daemon rejects this BEFORE voxora-hf tries to download.
+    tmp
+}
+
+/// Build a Qwen3-ASR cache layout so the Qwen descriptor accepts
+/// the resolve, then run `from_id` with `EngineFamily::Whisper` to
+/// trigger the cross-check.
+fn build_cache_with_qwen_config() -> TempDir {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp.path().join("Qwen").join("Qwen3-ASR-0.6B").join("main");
+    std::fs::create_dir_all(&dir).expect("mkdir cache layout");
+    // The cross-check fires before any engine load — the stub file
+    // is enough to make `voxora-hf::resolve` think the model is
+    // cached.
+    std::fs::write(dir.join("config.json"), b"{}").expect("write config");
+    std::fs::write(dir.join(".complete"), b"").expect("write complete marker");
+    tmp
+}
+
+/// Build a cache where `ggml-large-v3.bin` is a symlink pointing at
+/// an arbitrary readable file (`/etc/hostname`). voxora-hf's
+/// `is_file()` probe follows the symlink and reports the cache as
+/// complete; `BridgeTranscriber::from_id` must refuse on its own
+/// before whisper.cpp's mmap has a chance to follow the symlink.
+fn build_cache_with_symlinked_bin() -> TempDir {
+    let tmp = TempDir::new().expect("tempdir");
+    let dir = tmp
+        .path()
+        .join("ggerganov")
+        .join("whisper.cpp")
+        .join("main");
+    std::fs::create_dir_all(&dir).expect("mkdir cache layout");
+    // Pick any file we know exists on the test host. /etc/hostname
+    // is the conventional choice — short, present on every Linux
+    // host we run CI on, and harmless to read.
+    let target = std::path::PathBuf::from("/etc/hostname");
+    assert!(
+        target.is_file(),
+        "/etc/hostname must exist for the symlink-refusal test to be meaningful"
+    );
+    std::os::unix::fs::symlink(&target, dir.join("ggml-large-v3.bin"))
+        .expect("create symlink in cache");
+    std::fs::write(dir.join(".complete"), b"").expect("write complete marker");
+    tmp
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_id_cross_check_rejects_family_id_mismatch() {
+    let tmp = build_cache_with_qwen_config();
+    let result = BridgeTranscriber::from_id(
+        "Qwen/Qwen3-ASR-0.6B",
+        EngineFamily::Whisper,
+        Some(tmp.path().to_path_buf()),
+        None,
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("cross-check must fail when the user pins Whisper but id resolves to Qwen"),
+        Err(e) => e,
+    };
+    let display = format!("{err:#}");
+    assert!(
+        display.contains("does not match"),
+        "cross-check error must mention the mismatch, got: {display}"
+    );
+    // The Display rendering of `EngineFamily` must be the canonical
+    // spelling ("whisper" / "qwen3-asr"), NOT the Debug spelling
+    // ("EngineFamily::Whisper"). Operators see this string in the
+    // daemon's log.
+    assert!(
+        !display.contains("EngineFamily::"),
+        "cross-check error must use Display, not Debug, got: {display}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_id_two_segment_whisper_rejects_with_actionable_error() {
+    let tmp = build_cache_with_two_ggml_bins_no_marker();
+    let result = BridgeTranscriber::from_id(
+        "ggerganov/whisper.cpp",
+        EngineFamily::Whisper,
+        Some(tmp.path().to_path_buf()),
+        None,
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("2-segment whisper id without entry must be rejected"),
+        Err(e) => e,
+    };
+    let display = format!("{err:#}");
+    assert!(
+        display.contains("3-segment form") || display.contains("ggml-<variant>"),
+        "2-segment whisper error must point the user at the 3-segment form, got: {display}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_id_surfaces_resolved_path_matching_dir_entry_end_to_end() {
+    let tmp = build_cache_with_two_ggml_bins();
+    let result = BridgeTranscriber::from_id(
+        "ggerganov/whisper.cpp/ggml-large-v3.bin",
+        EngineFamily::Whisper,
+        Some(tmp.path().to_path_buf()),
+        None,
+    )
+    .await;
+    match result {
+        Ok(bridge) => {
+            let p = bridge.resolved_path();
+            assert!(
+                p.ends_with("ggml-large-v3.bin"),
+                "resolved_path must name the requested file, got: {p}"
+            );
+            assert!(
+                !p.ends_with("ggml-base.bin"),
+                "resolved_path must NOT lex-sort to base, got: {p}"
+            );
+        }
+        Err(e) => {
+            // The stub bytes won't pass whisper.cpp's header check
+            // — that's fine. The structural guarantee we care about
+            // is that the error context names the RIGHT file (the
+            // requested `ggml-large-v3.bin`), not the lex-sort
+            // winner `ggml-base.bin`.
+            let display = format!("{e:#}");
+            assert!(
+                display.contains("ggml-large-v3.bin"),
+                "error context must name the requested file, got: {display}"
+            );
+            assert!(
+                !display.contains("ggml-base.bin"),
+                "error must not mention the lex-sorted base file, got: {display}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_id_rejects_symlinked_model_file() {
+    let tmp = build_cache_with_symlinked_bin();
+    let result = BridgeTranscriber::from_id(
+        "ggerganov/whisper.cpp/ggml-large-v3.bin",
+        EngineFamily::Whisper,
+        Some(tmp.path().to_path_buf()),
+        None,
+    )
+    .await;
+    let err = match result {
+        Ok(_) => {
+            panic!("BridgeTranscriber must refuse a symlinked model file before any engine load")
+        }
+        Err(e) => e,
+    };
+    let display = format!("{err:#}");
+    assert!(
+        display.contains("symlink"),
+        "symlink-refusal error must say `symlink`, got: {display}"
+    );
+    // And it must point at the offending path so the operator can
+    // investigate.
+    assert!(
+        display.contains("ggml-large-v3.bin"),
+        "symlink-refusal error must name the offending file, got: {display}"
+    );
 }

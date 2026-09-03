@@ -279,6 +279,57 @@ async fn build_transcriber(
     Ok((Box::new(bridge), resolved_path))
 }
 
+/// Enforce a `0o700` mode on the voxora model-cache root so other
+/// local users cannot read model weights or plant a symlink inside
+/// the cache (whisper.cpp's mmap follows symlinks — see
+/// `transcriber::refuse_if_symlink` for the engine-side guard).
+///
+/// If the directory already exists with a broader mode we log a
+/// warning but DO NOT abort — the operator may have shared this
+/// directory with another tool by design. If it does not exist, we
+/// create it with `0o700` via `paths::ensure_dir_0700`.
+#[cfg(unix)]
+fn secure_voxora_cache_dir(cache: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::metadata(cache) {
+        Ok(md) if md.is_dir() => {
+            let mode = md.permissions().mode();
+            if mode & 0o077 != 0 {
+                warn!(
+                    "voxora cache directory {} has mode {:o} (world/group readable); \
+                     this is a security risk in multi-user environments. \
+                     Continuing — set the mode to 0o700 if no other tool needs shared access.",
+                    cache.display(),
+                    mode & 0o777
+                );
+            }
+        }
+        Ok(_) => {
+            warn!(
+                "voxora cache path {} exists but is not a directory; leaving it untouched",
+                cache.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(create_err) = paths::ensure_dir_0700(cache) {
+                warn!(
+                    "could not create voxora cache directory {} with mode 0o700: {create_err}; \
+                     voxora-hf will create it on first download with its own (broader) mode",
+                    cache.display()
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "cannot stat voxora cache directory {}: {e}; \
+                 voxora-hf will create it on first download",
+                cache.display()
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -361,16 +412,26 @@ async fn main() -> Result<()> {
     // would orphan the operator's 3 GB of cached models and trigger
     // a re-download against the new (wrong) root — airvzxf/telora#79
     // took that exact shape from a different cause.
-    let voxora_cache = args
-        .voxora_cache
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("VOXORA_CACHE_DIR")
-                .filter(|v| !v.is_empty())
-                .map(std::path::PathBuf::from)
-        })
-        .unwrap_or_else(paths::default_voxora_cache_dir);
+    //
+    // Empty CLI / env strings are filtered out so `--voxora-cache ""`
+    // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default
+    // (asymmetric handling here would silently point the cache at
+    // CWD-relative ".cache", per airvzxf/telora#79).
+    let voxora_cache = if let Some(c) = args.voxora_cache.as_deref().filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(c)
+    } else if let Some(c) = std::env::var_os("VOXORA_CACHE_DIR").filter(|v| !v.is_empty()) {
+        std::path::PathBuf::from(c)
+    } else {
+        paths::default_voxora_cache_dir().context("resolving default voxora cache directory")?
+    };
+
+    // Tighten the cache directory's mode so other local users cannot
+    // read model weights or plant a symlink that whisper.cpp's mmap
+    // would happily follow. We do this AFTER the explicit override
+    // is honoured (so operators who intentionally share a cache
+    // across UIDs see a warning rather than an abort).
+    #[cfg(unix)]
+    secure_voxora_cache_dir(&voxora_cache);
 
     info!("Starting Telora Daemon...");
     info!("Model kind: {}", stt_config.model_kind);
@@ -486,20 +547,22 @@ async fn main() -> Result<()> {
                         "Command: REFRESH (model_kind={} model_id={})",
                         new_config.model_kind, new_config.model_id
                     );
-                    let mut reload_transcriber = false;
-                    if new_config.model_id != stt_config.model_id
-                        || new_config.model_kind != stt_config.model_kind
-                    {
-                        reload_transcriber = true;
-                    }
-
-                    stt_config = new_config;
-
-                    if reload_transcriber {
-                        info!("Model changed, reloading transcriber...");
-                        match build_transcriber(&stt_config, voxora_cache.clone()).await {
+                    // Atomicity: the engine swap and the config
+                    // mutation MUST happen together. Build the new
+                    // transcriber FIRST and only commit the new
+                    // `stt_config` on success — otherwise a failed
+                    // model load (wrong id, mmap error, …) would
+                    // leave the daemon reporting the new model_id /
+                    // model_kind in `STATUS` while transcription
+                    // still runs through the old engine. Silent
+                    // corruption: a closed ticket of #79's shape.
+                    let needs_reload = new_config.model_id != stt_config.model_id
+                        || new_config.model_kind != stt_config.model_kind;
+                    if needs_reload {
+                        match build_transcriber(&new_config, voxora_cache.clone()).await {
                             Ok((new_transcriber, resolved_path)) => {
                                 transcriber = new_transcriber;
+                                stt_config = new_config;
                                 stt_config.model_path = resolved_path;
                                 info!("Transcriber reloaded successfully.");
                                 let _ = response_tx.send(Ok(()));
@@ -508,9 +571,18 @@ async fn main() -> Result<()> {
                                 error!("Failed to reload transcriber: {}", e);
                                 let _ = response_tx
                                     .send(Err(anyhow::anyhow!("Failed to load model: {}", e)));
+                                // stt_config and transcriber are
+                                // intentionally left untouched on
+                                // failure — atomicity guarantee.
                             }
                         }
                     } else {
+                        // No engine swap needed, but other fields
+                        // (language, max_recording_seconds) still
+                        // need to take effect. The new config is
+                        // safe to commit because no engine load
+                        // happened.
+                        stt_config = new_config;
                         info!("Configuration updated (no model change).");
                         let _ = response_tx.send(Ok(()));
                     }

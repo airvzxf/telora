@@ -31,7 +31,7 @@ pub struct StatusResponse {
 ///
 /// `model_kind` is a free-form string at the JSON layer so we can
 /// pass it verbatim over the socket; the daemon validates it via
-/// [`voxora_bridge::ModelKind::from_config`].
+/// [`voxora_bridge::EngineFamily::from_config`].
 ///
 /// `Default` is derived so a flattened top-level field can supply
 /// an empty `SttConfig` when the user's `telora.toml` omits every
@@ -123,6 +123,10 @@ pub enum Command {
     GetStatus {
         response_tx: oneshot::Sender<StatusResponse>,
     },
+    /// Reload the STT configuration. Handled atomically: the new
+    /// `BridgeTranscriber` is built FIRST and the `stt_config`
+    /// mutation is committed only on success — see
+    /// `main::Command::ReloadConfig` for the failure semantics.
     ReloadConfig {
         new_config: SttConfig,
         response_tx: oneshot::Sender<Result<()>>,

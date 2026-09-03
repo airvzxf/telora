@@ -24,7 +24,7 @@ model_kind = "qwen3-asr"
 model_id   = "Qwen/Qwen3-ASR-0.6B"
 ```
 
-The daemon resolves the id through `voxora-hf` (which downloads, caches and verifies) and loads the engine adapter that matches `model_kind`. To add a brand-new engine (e.g. Parakeet), implement `voxora_core::AsrEngine` in a new `voxora-*` adapter crate and re-export it from `voxora-bridge` behind a feature flag. No changes in `telora-daemon` are required for the engine itself; only a new `ModelKind` variant in `voxora-bridge::ModelKind`.
+The daemon resolves the id through `voxora-hf` (which downloads, caches and verifies) and loads the engine adapter that matches `model_kind`. To add a brand-new engine (e.g. Parakeet), implement `voxora_core::AsrEngine` in a new `voxora-*` adapter crate and re-export it from `voxora-bridge` behind a feature flag. No changes in `telora-daemon` are required for the engine itself; only a new variant on `voxora_engine::EngineFamily` (re-exported as `voxora_bridge::EngineFamily`). The enum is `#[non_exhaustive]`, so existing match arms remain source-compatible — but every consumer that exhaustively matches today must add a wildcard arm before the new variant will compile.
 
 ## Development Workflow
 

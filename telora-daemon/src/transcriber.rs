@@ -28,7 +28,20 @@
 //! 0.2.0 and is no longer wired up here). Whisper speaks ISO 639-1
 //! directly; Qwen3-ASR wants full English names ("english",
 //! "chinese", …) and the bridge keeps a closed 20-entry table.
+//!
+//! # Symlink refusal (security)
+//!
+//! voxora-hf and voxora-whisper both follow symlinks when probing a
+//! resolved path (`is_file()` and `std::fs::metadata` are
+//! symlink-following). If the operator's cache directory is shared
+//! with another local user — or an attacker can plant a single
+//! symlink inside the cache root — whisper.cpp's mmap call would
+//! happily map the symlink target instead of the requested model.
+//! We refuse to load any model path whose final component (or the
+//! directory itself, for Qwen) is a symlink. See
+//! [`refuse_if_symlink`].
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -120,9 +133,9 @@ impl BridgeTranscriber {
         // the wrong engine instead of failing loudly.
         if resolved.descriptor.family != model_kind {
             return Err(anyhow!(
-                "model_kind {model_kind:?} does not match model_id {model_id:?} \
-                 (registry resolved to {:?}); fix your telora.toml",
-                resolved.descriptor.family
+                "model_kind {model_kind} does not match model_id {model_id:?} \
+                 (registry resolved to {family}); fix your telora.toml",
+                family = resolved.descriptor.family
             ));
         }
 
@@ -146,6 +159,7 @@ impl BridgeTranscriber {
                          ggerganov/whisper.cpp/ggml-<variant>.bin"
                     )
                 })?;
+                refuse_if_symlink(&bin)?;
                 let engine = WhisperEngine::load(&bin).with_context(|| {
                     format!("failed to load Whisper model from {}", bin.display())
                 })?;
@@ -161,6 +175,7 @@ impl BridgeTranscriber {
                 // resolved dir is the source of truth for the
                 // surfaced path (it is what the status response
                 // reports to the GUI).
+                refuse_if_symlink(&dir.path)?;
                 let engine =
                     voxora_bridge::QwenAsrEngine::from_hf(hf_source.as_ref(), model_id, &opts)
                         .await
@@ -298,6 +313,62 @@ fn iso_to_qwen_name(iso: &str) -> Option<String> {
         _ => return None,
     };
     Some(name.to_string())
+}
+
+/// Refuse to load a model from a path that is (or whose final
+/// component is) a symbolic link.
+///
+/// voxora-hf's `is_file()` probe and voxora-whisper's
+/// `std::fs::metadata` both follow symlinks — so a planted symlink
+/// at the resolved path would otherwise be handed to whisper.cpp's
+/// mmap and the daemon would happily map whatever file the symlink
+/// points to. The voxora cache directory is the operator's machine
+/// root and is not a hardened location, so we treat any symlink
+/// along the model's resolved path as a hostile tamper.
+///
+/// `path` may not exist yet (the resolved path can point at a file
+/// we are about to download). In that case we walk the existing
+/// ancestors and refuse if any of them is a symlink — same threat
+/// model, just one level up.
+fn refuse_if_symlink(p: &Path) -> Result<()> {
+    let md = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Path does not exist (cache miss; voxora-hf will
+            // download). Walk the existing ancestors and refuse if
+            // any of them is itself a symlink — the download would
+            // land inside a directory the attacker controls.
+            let mut cur = p.parent();
+            while let Some(ancestor) = cur {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                if let Ok(am) = std::fs::symlink_metadata(ancestor)
+                    && am.file_type().is_symlink()
+                {
+                    return Err(anyhow!(
+                        "refusing to load model: parent {ancestor:?} of {p:?} is a symlink; \
+                         the voxora cache must contain a regular directory"
+                    ));
+                }
+                cur = ancestor.parent();
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "refusing to load model from {p:?}: cannot stat ({e}); \
+                 the voxora cache must be readable"
+            ));
+        }
+    };
+    if md.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing to load model from symlink {p:?}; \
+             the voxora cache must contain a regular file"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
