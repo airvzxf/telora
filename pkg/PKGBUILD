@@ -1,6 +1,6 @@
 # Maintainer: Wolf <wolf@localhost>
 pkgname=telora-bin
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Telora: Professional Speech-to-Text Assistant (Pre-built binaries)"
 arch=('x86_64')
