@@ -25,7 +25,7 @@
 //! [`EngineFamily`] is the canonical spelling used in config files
 //! and CLI flags (re-exported through voxora-bridge from voxora-
 //! engine; the older `voxora-bridge::ModelKind` was deprecated in
-//! 0.2.0 and is no longer wired up here). Whisper speaks ISO 639-1
+//! voxora 0.2.0 and removed in 0.3.0). Whisper speaks ISO 639-1
 //! directly; Qwen3-ASR wants full English names ("english",
 //! "chinese", …) and the bridge keeps a closed 20-entry table.
 //!
@@ -87,7 +87,7 @@ impl BridgeTranscriber {
     ///
     /// `cache_dir` must be pinned explicitly so the operator's
     /// existing `~/.cache/voxora/models/huggingface` cache survives
-    /// the bump; voxora-hf 0.2 would otherwise default to a
+    /// the bump; voxora-hf 0.4 would otherwise default to a
     /// voxora-config-derived root that drops the `models/huggingface`
     /// suffix and orphans every cached model.
     pub async fn from_id(

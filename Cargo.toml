@@ -3,42 +3,62 @@ resolver = "2"
 members = ["telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
-# Pinned to voxora-bridge 0.2.0's MSRV as published on crates.io
-# (voxora-bridge 0.3.0 will bump to 1.86). The CI workflow
-# (`.github/workflows/ci.yml`) installs this exact toolchain via
+# Pinned to voxora-bridge 0.4.x's MSRV as published on crates.io
+# (voxora-bridge 0.3+ bumped the MSRV to 1.86). The CI workflow
+# (`.github/workflows/ci.yml`) installs `stable` via
 # `dtolnay/rust-toolchain`, so a workspace member or transitive
-# dep that ever requires a feature newer than 1.85 will fail the
+# dep that ever requires a feature newer than 1.86 will fail the
 # build at the rustc stage instead of silently slipping through
 # on an older GH-hosted apt rustc.
-rust-version = "1.85"
+rust-version = "1.86"
 
-# voxora 0.2.x is on crates.io and carries the structural fix for
-# airvzxf/telora#79: `voxora-hf::resolve_single_file` now rejects a
-# cache whose `.complete` marker is set but the requested file is
-# missing (`AsrError::ModelNotFound`), and the new `ModelDir::entry`
-# field names the exact file for `org/repo/file` resolves so the
-# daemon never has to lex-sort `*.bin` files.
+# voxora 0.4 is a breaking release that closes voxora issue #42:
+# the `voxora-core` deprecation shim that shipped in 0.3 has been
+# removed entirely, and the traits it used to re-export
+# (`AsrEngine`, `ModelSource`, `ResolveOptions`, `AsrError`,
+# `ModelCapabilities`, `ModelDir`, …) now live in `voxora-traits`.
+# `voxora-bridge` re-exports `voxora_traits::*` in its umbrella
+# surface, so consumers that already pull `voxora-bridge`
+# (`telora-daemon`) keep working with `voxora_bridge::AsrEngine`,
+# `voxora_bridge::ModelSource`, etc. without seeing the deprecation
+# warning that bit them on the 0.3 line.
+#
+# voxora 0.2.x carried the structural fix for airvzxf/telora#79:
+# `voxora-hf::resolve_single_file` rejects a cache whose
+# `.complete` marker is set but the requested file is missing
+# (`AsrError::ModelNotFound`), and `ModelDir::entry` names the
+# exact file for `org/repo/file` resolves so the daemon never has
+# to lex-sort `*.bin` files. voxora 0.3 / 0.4 keep those
+# semantics — the registry test (`voxora_020_resolution`) still
+# pins the same shape against the current line.
 #
 # `voxora-registry` (new in 0.2) gives us the canonical resolution
 # path `Registry::resolve(&ModelId::parse(id), &opts) → ResolvedModel {
-# descriptor, model_dir }`. telora-daemon now goes through it, with
-# `Registry::with_builtin_descriptors()` (via `RegistryHfExt`) so the
-# built-in Whisper + Qwen3Asr descriptors are registered. We DO NOT
-# use `hf_registry()` because it constructs its own `HuggingFaceSource`
-# internally and bypasses the `cache_dir` override the operator needs
-# to keep their existing `~/.cache/voxora/models/huggingface/…` cache.
+# descriptor, model_dir }`. telora-daemon still goes through it,
+# with `Registry::with_builtin_descriptors()` (via `RegistryHfExt`)
+# so the built-in Whisper + Qwen3Asr descriptors are registered.
+# We DO NOT use `hf_registry()` because it constructs its own
+# `HuggingFaceSource` internally and bypasses the `cache_dir`
+# override the operator needs to keep their existing
+# `~/.cache/voxora/models/huggingface/…` cache.
 #
-# telora-daemon pulls voxora-bridge with the `cuda-whisper` feature
-# (see telora-daemon/Cargo.toml) to enable GPU-accelerated whisper.cpp
-# on Pascal sm_61+ hardware; qwen3-asr stays on CPU because candle's
-# WMMA kernels require sm_70+.
+# telora-daemon pulls voxora-bridge 0.4 with the `cuda-whisper`
+# feature (see telora-daemon/Cargo.toml) to enable GPU-accelerated
+# whisper.cpp on Pascal sm_61+ hardware; qwen3-asr stays on CPU
+# because candle's WMMA kernels require sm_70+.
+#
+# telora-models now depends on `voxora-traits` directly (instead
+# of pulling `voxora-bridge` with its whisper / qwen3asr feature
+# baggage). telora-models is a model-management CLI — it only
+# needs the trait surface (`ModelSource`, `ResolveOptions`) and
+# not the engine adapters.
 [workspace.dependencies]
-voxora-core      = "0.2"
-voxora-hf        = "0.2"
-voxora-bridge    = "0.2"
-voxora-registry  = "0.2"
+voxora-hf        = "0.4"
+voxora-bridge    = "0.4"
+voxora-registry  = "0.4"
+voxora-traits    = "0.4"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

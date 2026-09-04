@@ -85,7 +85,7 @@ pub fn default_paths_config() -> PathsConfig {
 ///
 /// The `models/huggingface` suffix is **load-bearing** for
 /// backwards compatibility with every on-disk cache telora has
-/// shipped since 0.1.x. voxora-hf 0.2's default-features change
+/// shipped since 0.1.x. voxora-hf 0.4's default-features change
 /// enabled `voxora-config`, whose `cache_root()` returns just
 /// `$XDG_CACHE_HOME/voxora` — passing that to
 /// `HuggingFaceSource::cache_dir(...)` orphans every existing
@@ -96,7 +96,7 @@ pub fn default_paths_config() -> PathsConfig {
 ///
 /// Mirrors [`telora_models::default_cache_dir`](../../telora_models/default_cache_dir.v.html)
 /// (private); the duplication is deliberate and noted in the plan
-/// (`adopt voxora 0.2` / `RATIONALE §1`). Do NOT switch to
+/// (`adopt voxora 0.4` / `RATIONALE §1`). Do NOT switch to
 /// `voxora-config` here.
 pub fn default_voxora_cache_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR")

@@ -406,7 +406,7 @@ async fn main() -> Result<()> {
     // their absence the daemon falls back to
     // `$XDG_CACHE_HOME/voxora/models/huggingface` (the legacy
     // 0.1.x layout). The `models/huggingface` suffix is
-    // load-bearing: voxora-hf 0.2's default-features change enabled
+    // load-bearing: voxora-hf 0.4's default-features change enabled
     // `voxora-config`, whose `cache_root()` returns just
     // `$XDG_CACHE_HOME/voxora`. Letting `from_id` see `None` here
     // would orphan the operator's 3 GB of cached models and trigger

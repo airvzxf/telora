@@ -25,7 +25,7 @@
 - [ ] **Unit Tests**: Increase coverage for audio processing and socket communication.
 - [ ] **Integrity Checks**: Add SHA256 checksum verification for model downloads in `telora-models`. (Voxora-hf already does this; `telora-models` does not need its own.)
 - [ ] **CI/CD**: Automate binary releases for different distributions.
-- [ ] **Deprecate `telora-models` in favour of `voxora-cli`**: `telora-models` is now a thin wrapper around `voxora-hf`. Once the package ecosystem catches up, retire `telora-models` and tell users to call `voxora-cli list/download` directly.
+- [ ] **Deprecate `telora-models` in favour of `voxora`**: `telora-models` is now a thin wrapper around `voxora-hf`. Once the package ecosystem catches up, retire `telora-models` and tell users to call `voxora list/download` directly.
 
 ## Core & Stability (Developer & DevOps).
 - [ ] **Modernize IPC**: Replace custom text-based protocol with a structured format (JSON-RPC or Varlink) to support metadata (confidence, durat

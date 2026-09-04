@@ -8,11 +8,11 @@
 //!
 //! All models live in voxora's cache:
 //! `$XDG_CACHE_HOME/voxora/models/huggingface`. `telora-models`
-//! exposes the same view as `voxora-cli list`.
+//! exposes the same view as `voxora list`.
 //!
 //! # Migration
 //!
-//! New flows should call `voxora-cli` directly. `telora-models` is
+//! New flows should call `voxora` directly. `telora-models` is
 //! kept here so old documentation and packaging recipes keep
 //! working. Going forward the plan is to retire it; see
 //! `TODO.md`.
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use voxora_core::{ModelSource, ResolveOptions};
+use voxora_traits::{ModelSource, ResolveOptions};
 
 #[derive(Parser)]
 #[command(
@@ -31,7 +31,7 @@ use voxora_core::{ModelSource, ResolveOptions};
     long_about = "telora-models is a thin wrapper around `voxora-hf`. \
                   Same UX as before, but all downloads go through \
                   voxora's cache at $XDG_CACHE_HOME/voxora/models/huggingface. \
-                  New flows should call `voxora-cli` directly."
+                  New flows should call `voxora` directly."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -152,7 +152,7 @@ fn path_cmd(cache_root: &Path) -> Result<()> {
 ///
 /// Intentionally a legacy-mode mirror of the operator's on-disk
 /// layout from voxora 0.1.x. It deliberately does NOT go through
-/// `voxora-config` — voxora-hf 0.2's default-features change
+/// `voxora-config` — voxora-hf 0.4's default-features change
 /// enabled `voxora-config`, whose `cache_root()` returns just
 /// `$XDG_CACHE_HOME/voxora` (without the `models/huggingface`
 /// suffix), which would orphan every model that telora has shipped

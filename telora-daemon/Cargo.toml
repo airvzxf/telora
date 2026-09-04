@@ -5,16 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# voxora-bridge replaces the direct whisper-rs dependency. voxora-bridge
-# defaults to `["whisper", "qwen3asr"]`, which is exactly what the
-# daemon needs so users can switch model_kind without a rebuild.
+# voxora-bridge 0.4 replaces the direct whisper-rs dependency.
+# voxora-bridge defaults to `["whisper", "qwen3asr"]`, which is
+# exactly what the daemon needs so users can switch model_kind
+# without a rebuild. voxora-bridge 0.4 also re-exports
+# `voxora_traits::*`, so the trait surface used by the daemon
+# (`AsrEngine`, `EngineFamily`, `ModelSource`, `ResolveOptions`,
+# `AsrError`, `ModelDir`) is reachable via `voxora_bridge::*`
+# without pulling the deprecated `voxora-core` shim.
 #
 # `cuda-whisper` enables ggml-cuda for whisper.cpp (Pascal sm_61+ OK).
 # We deliberately leave `cuda-qwen3asr` off: candle's WMMA kernels
 # require sm_70+ (Volta), so the qwen3-asr backend stays on CPU on
 # Pascal and older. Bump to `cuda` (umbrella) on sm_70+ hardware.
 voxora-bridge = { workspace = true, features = ["cuda-whisper"] }
-# voxora-registry owns the canonical resolution path
+# voxora-registry 0.4 owns the canonical resolution path
 # (`Registry::resolve(&ModelId::parse(id), &opts) -> ResolvedModel`)
 # the daemon goes through so it never has to lex-sort `*.bin`
 # files in a cache directory. Direct dep (not pulled transitively

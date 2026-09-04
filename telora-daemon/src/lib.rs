@@ -49,3 +49,73 @@ pub use paths::telora_env_source;
 // touch these; they are surfaced strictly for the binary wiring.
 pub use audio::AudioEngine;
 pub use transcriber::{BridgeTranscriber, Transcriber};
+
+#[cfg(test)]
+mod voxora_migration_pins {
+    //! Pin the voxora 0.4 migration contract: no workspace member may
+    //! depend on `voxora-core` (the deprecation shim removed in voxora
+    //! 0.4.0). If this test fails, either the migration was rolled
+    //! back or a stray dep snuck in — both deserve a code review.
+
+    #[test]
+    fn no_workspace_member_depends_on_voxora_core() {
+        for (member, body) in workspace_member_cargo_toms() {
+            let offender = first_voxora_core_dep(body);
+            assert!(
+                offender.is_none(),
+                "workspace member {member} declares `voxora-core` as a dependency \
+                 (removed in voxora 0.4); offending line: {:?}. \
+                 Use `voxora-traits` (the canonical home) or pull the type via \
+                 `voxora-bridge`'s re-export.",
+                offender.unwrap_or("<none>")
+            );
+        }
+    }
+
+    /// Read every workspace member's `Cargo.toml` and return
+    /// (crate-name, contents) pairs. Cheap — runs once at test time.
+    fn workspace_member_cargo_toms() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "telora-daemon",
+                include_str!("../../telora-daemon/Cargo.toml"),
+            ),
+            ("telora-gui", include_str!("../../telora-gui/Cargo.toml")),
+            ("telora", include_str!("../../telora-ctl/Cargo.toml")),
+            (
+                "telora-models",
+                include_str!("../../telora-models/Cargo.toml"),
+            ),
+        ]
+    }
+
+    /// Walk `body` line-by-line and return the first line that looks
+    /// like a `voxora-core = ...` dep declaration.
+    ///
+    /// TOML has no string-based "is this a dep?" check, so we model
+    /// the minimum surface we need:
+    ///   * comment lines (`# ...`) are ignored;
+    ///   * `<key> = ...` lines where `<key>` is exactly `voxora-core`
+    ///     count as deps.
+    ///
+    /// Comments that mention `voxora-core` are intentionally allowed
+    /// — every workspace member has a comment explaining why the
+    /// migration dropped it.
+    fn first_voxora_core_dep(body: &str) -> Option<&str> {
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let after_key = trimmed
+                .strip_prefix("voxora-core")
+                .or_else(|| trimmed.strip_prefix("\"voxora-core\""));
+            if let Some(rest) = after_key
+                && rest.trim_start().starts_with('=')
+            {
+                return Some(line);
+            }
+        }
+        None
+    }
+}
