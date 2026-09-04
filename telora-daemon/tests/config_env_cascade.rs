@@ -8,7 +8,10 @@
 //! deserialisation — no field in [`telora_daemon::DaemonConfig`]
 //! matches.
 //!
-//! The fix lives in [`telora_daemon::paths::telora_env_source`],
+//! The fix lives in [`telora_daemon::telora_env_source`] (originally
+//! at `telora_daemon::paths::telora_env_source` before the EPIC #28
+//! `telora-common` extraction moved the runtime path helpers out and
+//! the voxora-cache helpers into `cache_paths`),
 //! which `telora-daemon/src/main.rs::load_config` calls into. The
 //! helper sets both `.prefix_separator("_")` (to keep the `TELORA_`
 //! prefix matching) and `.separator("__")` (so the rest of the name
@@ -27,7 +30,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use config::{Config, File};
-use telora_daemon::{DaemonConfig, paths::telora_env_source};
+use telora_daemon::{DaemonConfig, telora_env_source};
 use tempfile::TempDir;
 
 /// Process-global mutex serialising every test in this file. Each

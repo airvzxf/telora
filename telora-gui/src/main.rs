@@ -15,12 +15,12 @@ mod config;
 mod connection;
 mod focus;
 mod input;
-mod paths;
 mod text;
 mod ui;
 
 use config::GuiConfig;
 use connection::{ControlServer, SocketClient};
+use telora_common::paths::{control_socket_path, daemon_socket_path};
 use ui::Osd;
 
 fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
@@ -89,8 +89,8 @@ fn main() {
         // cascade → /run/user/<uid>/ → /tmp fallback). Built with
         // `format!` because the literal `println!("...")` form
         // could not interpolate the dynamic paths.
-        let daemon_sock = paths::daemon_socket_path();
-        let control_sock = paths::control_socket_path();
+        let daemon_sock = daemon_socket_path();
+        let control_sock = control_socket_path();
         let bin_name = std::env::args()
             .next()
             .unwrap_or_else(|| "telora-gui".to_string());
@@ -336,7 +336,7 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
 }
 
 async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
-    let server = ControlServer::bind(&paths::control_socket_path())?;
+    let server = ControlServer::bind(&control_socket_path())?;
     info!("Control server listening...");
 
     loop {

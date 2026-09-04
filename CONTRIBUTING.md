@@ -4,6 +4,7 @@ Thank you for your interest in improving Telora!
 
 ## Project Structure
 
+- `telora-common`: Shared library crate. Owns the socket-path resolver (`paths::resolve`, `paths::daemon_socket_path`, `paths::control_socket_path`) and the atomic `umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`). Consumed by `telora-daemon`, `telora-gui`, and `telora-ctl`.
 - `telora-daemon`: Rust daemon handling audio input and speech-to-text. Loads Whisper (whisper.cpp) or Qwen3-ASR (candle) through `voxora-bridge`.
 - `telora-gui`: GTK4 client for Wayland OSD overlay, visual feedback and control.
 - `telora-ctl`: CLI control client (binary name: `telora`) for sending commands to the GUI via Unix socket.

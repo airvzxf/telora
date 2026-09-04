@@ -31,6 +31,7 @@ cpal = "0.15"
 anyhow = "1.0"
 tokio = { version = "1.36", features = ["full"] }
 log = "0.4"
+telora-common = { workspace = true }
 # Used by `paths::default_voxora_cache_dir` to resolve
 # `$XDG_CACHE_HOME/voxora/models/huggingface` when neither
 # `--voxora-cache` nor `VOXORA_CACHE_DIR` is set. The

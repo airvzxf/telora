@@ -3570,6 +3570,19 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "telora-common",
+ "tokio",
+]
+
+[[package]]
+name = "telora-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "nix",
+ "socket2 0.5.10",
+ "tempfile",
  "tokio",
 ]
 
@@ -3592,6 +3605,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "telora-common",
  "tempfile",
  "tokio",
  "voxora-bridge",
@@ -3611,6 +3625,7 @@ dependencies = [
  "log",
  "nix",
  "serde",
+ "telora-common",
  "tempfile",
  "tokio",
  "toml 0.8.23",

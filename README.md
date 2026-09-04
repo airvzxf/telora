@@ -203,7 +203,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check that confirms it is owned by the current UID, so an attacker cannot redirect the bind to a foreign socket.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check that confirms it is owned by the current UID, so an attacker cannot redirect the bind to a foreign socket. The shared helper (`telora_common::socket_bind::bind_unix_socket`) wraps the umask tightening in an RAII guard so it is restored even if the bind panics.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -327,6 +327,23 @@ not a full TOCTOU fix. Adding `O_NOFOLLOW` to the bind path
 tracked as a mid-term follow-up.
 
 ## Development
+
+### Workspace layout
+
+```
+telora-common/    Shared library: socket-path resolver + atomic bind helper
+telora-daemon/    Audio capture + STT engine + IPC socket server
+telora-gui/       GTK4 Wayland OSD overlay + GUI control socket
+telora-ctl/       CLI control client (binary `telora`)
+telora-models/    Thin voxora-hf wrapper (legacy, see TODO.md)
+```
+
+`telora-common` owns the socket-path resolver (`paths::resolve`,
+`paths::daemon_socket_path`, `paths::control_socket_path`) and the
+`umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`). All
+three binaries consume that surface; new shared types belong there.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full structure and
+license notes.
 
 For detailed development instructions, local installation to `~/.local`, and coding standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
