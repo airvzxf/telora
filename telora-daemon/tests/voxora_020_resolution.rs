@@ -1,5 +1,5 @@
 //! End-to-end regression for `airvzxf/telora#79` against the
-//! voxora 0.2.0 resolver.
+//! registry introduced in voxora 0.2.0.
 //!
 //! Before the fix, `telora-daemon/src/transcriber.rs::from_id` would
 //! take the on-disk directory returned by `voxora_hf::resolve_single_file`,
@@ -10,7 +10,7 @@
 //! daemon mmap'd the wrong weights (147 MB, 6 audio layers) instead
 //! of the requested 3 GB model.
 //!
-//! voxora 0.2.0 ships two independent fixes:
+//! The voxora 0.2.0 resolver shipped two independent fixes:
 //!
 //! 1. `voxora-hf::resolve_single_file` no longer trusts the
 //!    `.complete` marker blindly — if the marker is set but the
@@ -20,10 +20,15 @@
 //!    caller asked for in 3-segment `org/repo/file` resolves, so the
 //!    daemon no longer has to scan the directory at all.
 //!
-//! These tests pin both behaviours against a hand-rolled cache
-//! layout. They run by default (no `#[ignore]`) and use only a few
-//! bytes per stub file — the file contents do not matter, only the
-//! names and the `.complete` marker shape.
+//! These tests still pin both behaviours against a hand-rolled cache
+//! layout under the current voxora 0.4 line. The registry semantics
+//! introduced in voxora 0.2.0 are stable across the 0.2 → 0.3 → 0.4
+//! bumps (voxora 0.4 removed the `voxora-core` deprecation shim and
+//! moved those traits into `voxora-traits`, but `voxora-bridge`
+//! re-exports `voxora_traits::*` so the imports below still resolve
+//! unchanged). They run by default (no `#[ignore]`) and use only a
+//! few bytes per stub file — the file contents do not matter, only
+//! the names and the `.complete` marker shape.
 //!
 //! Run with:
 //!
@@ -152,8 +157,10 @@ async fn resolve_rejects_cache_with_marker_but_missing_file() {
     // The registry wraps the source error in RegistryError::Parse;
     // the underlying cause is `AsrError::ModelNotFound("...is marked
     // complete but does not contain...")`. We surface that to
-    // `voxora_core::AsrError::ModelNotFound` via the source's own
-    // resolve so the assertion can be precise.
+    // `voxora_traits::AsrError::ModelNotFound` (re-exported through
+    // `voxora_bridge::AsrError` since voxora 0.4 dropped the
+    // `voxora-core` shim) via the source's own resolve so the
+    // assertion can be precise.
     let direct = source
         .resolve("ggerganov/whisper.cpp/ggml-tiny.en.bin", &opts)
         .await

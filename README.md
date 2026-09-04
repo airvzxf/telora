@@ -234,16 +234,16 @@ daemon download on first use (it logs progress) or pre-fetch with
 either tool:
 
 ```bash
-# Pre-fetch with voxora-cli (recommended for new flows):
-voxora-cli download Qwen/Qwen3-ASR-0.6B
-voxora-cli download ggerganov/whisper.cpp/ggml-base.bin
+# Pre-fetch with voxora (recommended for new flows):
+voxora download Qwen/Qwen3-ASR-0.6B
+voxora download ggerganov/whisper.cpp/ggml-base.bin
 
 # Or use the legacy telora-models wrapper:
 telora-models download Qwen/Qwen3-ASR-0.6B
 telora-models download ggerganov/whisper.cpp/ggml-base.bin
 
 # See what's already cached:
-voxora-cli list
+voxora list
 telora-models list
 ```
 
