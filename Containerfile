@@ -39,25 +39,27 @@ WORKDIR /app
 
 # 2. DEPENDENCIES: Manifests
 COPY Cargo.toml Cargo.lock ./
+COPY telora-common/Cargo.toml ./telora-common/
 COPY telora-daemon/Cargo.toml ./telora-daemon/
 COPY telora-gui/Cargo.toml ./telora-gui/
 COPY telora-ctl/Cargo.toml ./telora-ctl/
 COPY telora-models/Cargo.toml ./telora-models/
 
 # 3. CACHE: Compile dependencies with dummy sources
-RUN mkdir -p telora-daemon/src telora-gui/src telora-ctl/src telora-models/src && \
+RUN mkdir -p telora-common/src telora-daemon/src telora-gui/src telora-ctl/src telora-models/src && \
+    echo "" > telora-common/src/lib.rs && \
     echo "fn main() {}" > telora-daemon/src/main.rs && \
     echo "fn main() {}" > telora-gui/src/main.rs && \
     echo "fn main() {}" > telora-ctl/src/main.rs && \
     echo "fn main() {}" > telora-models/src/main.rs && \
     cargo build --release --workspace && \
-    rm -rf telora-daemon/src telora-gui/src telora-ctl/src telora-models/src
+    rm -rf telora-common/src telora-daemon/src telora-gui/src telora-ctl/src telora-models/src
 
 # 4. SOURCE: Copy entire project context
 COPY . .
 
 # 5. BUILD: Final compilation
-RUN touch telora-daemon/src/main.rs telora-gui/src/main.rs telora-ctl/src/main.rs telora-models/src/main.rs && \
+RUN touch telora-common/src/lib.rs telora-daemon/src/main.rs telora-gui/src/main.rs telora-ctl/src/main.rs telora-models/src/main.rs && \
     cargo clippy --release --workspace -- -D warnings && \
     cargo build --release --workspace
 

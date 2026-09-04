@@ -15,11 +15,11 @@ serde = { version = "1.0", features = ["derive"] }
 async-channel = "2.2"
 toml = "0.8"
 wl-clipboard-rs = "0.9"
-# `fs` feature gates `nix::sys::stat::umask`, used by
-# `ControlServer::bind` to make the `bind(2)` create the socket with
-# mode 0o600 atomically (mirroring `telora-daemon`'s pattern). The
-# feature set is the minimum needed for that one call; we do not pull
-# in `signal`/`user` because the GUI never uses those.
+telora-common = { workspace = true }
+# `fs` feature gates `nix::sys::stat::umask`; the bind helper in
+# `telora-common` uses it for atomic mode-0o600 socket creation
+# (mirroring `telora-daemon`'s pattern). The feature set is the
+# minimum needed for that one call.
 nix = { version = "0.27", features = ["fs"] }
 
 [dev-dependencies]

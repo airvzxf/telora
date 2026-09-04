@@ -16,16 +16,17 @@
 //!   * `main.rs` becomes a thin wrapper that imports from the crate
 //!     root via `use telora_daemon::*;`.
 //!
-//! The split is **structural only** — no behavior changes. All tests
-//! that previously lived inside `socket::tests` and `paths::tests`
-//! keep the same assertions and now run via `cargo test -p
-//! telora-daemon --lib` instead of the old `--bin telora-daemon`
-//! mode.
+//! The split is **structural only** — no behavior changes. The
+//! runtime path / resolver / bind helper deduplication landed in
+//! EPIC #28 (`telora-common`); this crate now re-exports them under
+//! the `paths` module name so external callers (and the binary) keep
+//! working without an import-path rewrite, while the voxora-cache
+//! helpers stay daemon-local because no other crate needs them.
 
-pub mod paths;
 pub mod socket;
 
 mod audio;
+mod cache_paths;
 mod transcriber;
 mod vad;
 
@@ -39,10 +40,25 @@ pub use socket::{
     default_stt_config,
 };
 
+// Re-export the runtime path resolver from `telora-common` under the
+// historical `paths` module name. Tests, integration tests, and the
+// binary reach into `telora_daemon::paths::*`; renaming the
+// import-path everywhere would balloon this EPIC with churn that has
+// nothing to do with the dedup itself.
+pub use telora_common::paths;
+
 // Re-export the env-var source helper for integration tests.
 // `main.rs::load_config` also calls this helper so the test pins the
 // production behaviour in one place.
-pub use paths::telora_env_source;
+pub use cache_paths::telora_env_source;
+
+// Re-export the voxora-cache helpers used by the binary. They stay
+// private to the daemon because no other crate consumes them (the
+// GUI and `telora-ctl` never touch the model cache); the binary and
+// the integration-style tests reach them through these re-exports.
+pub use cache_paths::{
+    default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override,
+};
 
 // Re-export the items `main.rs` (the binary) needs from the
 // otherwise-private `audio` and `transcriber` modules. Tests do not
@@ -76,6 +92,10 @@ mod voxora_migration_pins {
     /// (crate-name, contents) pairs. Cheap — runs once at test time.
     fn workspace_member_cargo_toms() -> Vec<(&'static str, &'static str)> {
         vec![
+            (
+                "telora-common",
+                include_str!("../../telora-common/Cargo.toml"),
+            ),
             (
                 "telora-daemon",
                 include_str!("../../telora-daemon/Cargo.toml"),

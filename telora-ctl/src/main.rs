@@ -1,60 +1,11 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use telora_common::paths::control_socket_path;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 
 use log::info;
-
-/// Resolve the GUI's control socket path from the same XDG cascade
-/// the GUI and daemon use (see `telora-gui/src/paths.rs` and
-/// `telora-daemon/src/paths.rs`). Falls back through:
-///   1. `$XDG_RUNTIME_DIR/telora/control.sock`
-///   2. `/run/user/<uid>/telora/control.sock`
-///   3. `/tmp/telora-<uid>/control.sock`
-///
-/// Mirrors the GUI's resolver to keep behavior consistent across
-/// the three crates (sub-issue #34); intentionally inline because
-/// `telora-ctl` has no other socket-path plumbing.
-fn control_socket_path() -> std::path::PathBuf {
-    let uid = current_uid();
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
-        && !xdg.is_empty()
-        && is_writable(Path::new(&xdg))
-    {
-        return Path::new(&xdg).join("telora").join("control.sock");
-    }
-    let run_user = format!("/run/user/{uid}");
-    if is_writable(Path::new(&run_user)) {
-        return Path::new(&run_user).join("telora").join("control.sock");
-    }
-    Path::new(&format!("/tmp/telora-{uid}")).join("control.sock")
-}
-
-/// Read the real UID of the current process from
-/// `/proc/self/status`. Matches the helper in `telora-gui`'s
-/// `paths` module; we re-implement it here to avoid pulling
-/// `nix` solely for `getuid` in this minimal CLI.
-fn current_uid() -> u32 {
-    let Ok(contents) = std::fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:")
-            && let Some(first) = rest.split_whitespace().next()
-        {
-            return first.parse().unwrap_or(0);
-        }
-    }
-    0
-}
-
-fn is_writable(p: &Path) -> bool {
-    std::fs::metadata(p)
-        .map(|m| !m.permissions().readonly())
-        .unwrap_or(false)
-}
 
 #[derive(Parser)]
 #[command(author, version, about = "Telora CLI - Control client", long_about = None)]

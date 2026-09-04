@@ -1,0 +1,17 @@
+[package]
+name = "telora-common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+nix = { version = "0.27", features = ["fs", "user"] }
+tokio = { version = "1.36", features = ["net"] }
+socket2 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.36", features = ["full", "test-util"] }

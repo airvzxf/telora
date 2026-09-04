@@ -5,7 +5,7 @@ use log::{error, info, warn};
 use ringbuf::HeapRb;
 use telora_daemon::{
     AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
-    Transcriber, paths,
+    Transcriber, paths, resolve_voxora_cache, telora_env_source,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -91,13 +91,13 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     }
 
     // 4. Environment variables - Highest priority. The source
-    // construction is centralised in [`paths::telora_env_source`]
-    // because `config` 0.13's defaults silently drop
-    // `TELORA_PATHS__SOCKET_DIR`; see that helper's rustdoc for the
-    // why. The integration test
+    // construction is centralised in [`telora_env_source`] (the
+    // daemon's voxora-cache helper module) because `config` 0.13's
+    // defaults silently drop `TELORA_PATHS__SOCKET_DIR`; see that
+    // helper's rustdoc for the why. The integration test
     // `telora-daemon/tests/config_env_cascade.rs` calls the same
     // helper to pin the behaviour.
-    builder = builder.add_source(paths::telora_env_source());
+    builder = builder.add_source(telora_env_source());
 
     let mut cfg: DaemonConfig = match builder.build() {
         Ok(c) => c
@@ -287,7 +287,8 @@ async fn build_transcriber(
 /// If the directory already exists with a broader mode we log a
 /// warning but DO NOT abort — the operator may have shared this
 /// directory with another tool by design. If it does not exist, we
-/// create it with `0o700` via `paths::ensure_dir_0700`.
+/// create it with `0o700` via `paths::ensure_dir_0700` (re-exported
+/// from `telora_common`).
 #[cfg(unix)]
 fn secure_voxora_cache_dir(cache: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -419,14 +420,14 @@ async fn main() -> Result<()> {
     // CWD-relative ".cache", per airvzxf/telora#79).
     //
     // BOTH override sources flow through
-    // `paths::resolve_voxora_cache`, which routes the candidate
-    // through `sanitize_voxora_cache_override`. An earlier version
+    // [`resolve_voxora_cache`], which routes the candidate through
+    // [`sanitize_voxora_cache_override`]. An earlier version
     // short-circuited on `args.voxora_cache` / `VOXORA_CACHE_DIR`
     // here, which meant `VOXORA_CACHE_DIR=/tmp/foo/../bar` was
     // accepted verbatim and the F2 commit's claim that the
     // sanitiser gates the override was false. Going through the
     // helper closes that gap.
-    let voxora_cache = paths::resolve_voxora_cache(
+    let voxora_cache = resolve_voxora_cache(
         args.voxora_cache.as_deref(),
         std::env::var("VOXORA_CACHE_DIR").ok().as_deref(),
     )
@@ -463,9 +464,9 @@ async fn main() -> Result<()> {
     // Socket
     let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
     // Resolve the socket location through the [paths] cascade
-    // introduced in #30-#33. Sub-issue #34 deleted the legacy
-    // /tmp/telora-sock constants; every call site now goes through
-    // this resolver.
+    // introduced in EPIC #27. EPIC #28 lifted the resolver into
+    // `telora_common::paths` so the daemon, GUI, and CLI all share
+    // the same cascade.
     let paths_cfg = paths::PathsConfig {
         runtime_dir: paths_config.runtime_dir.clone(),
         socket_dir: paths_config.socket_dir.clone(),
