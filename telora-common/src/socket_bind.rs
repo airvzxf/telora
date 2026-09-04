@@ -66,7 +66,9 @@ pub fn bind_unix_socket(path: &Path, instance_name: &str) -> Result<UnixListener
 
     info!(
         "Listening on unix socket: {} (restricted to 0600)",
-        path.display()
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
     );
 
     Ok(listener)
