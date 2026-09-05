@@ -98,5 +98,13 @@ or `VOXORA_CACHE_DIR=DIR`. The CLI value wins over the environment value;
 invalid absolute paths, traversal components, whitespace padding, and
 escaping symlink prefixes fall back to the XDG cache directory.
 
+Running the daemon and GUI outside systemd requires no special flag — they
+both bind their sockets manually under `$XDG_RUNTIME_DIR/telora/` (with
+the standard `/tmp/telora-<uid>/` last-resort fallback documented in the
+README troubleshooting section). The daemon does expose
+`--no-activation` to *force* the manual bind even when `LISTEN_FDS` is
+inherited from a parent shell, which is useful for isolating
+filesystem-only behaviour during debugging.
+
 ## Questions?
 Feel free to open an issue or a discussion on GitHub.

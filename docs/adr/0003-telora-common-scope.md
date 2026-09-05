@@ -30,7 +30,10 @@ resolver moved into `telora-common::cache`.
 
 The crate remains a leaf: it must not depend on the binary crates or pull in
 GTK, audio, CUDA, or Voxora engine dependencies. Small filesystem-oriented
-dependencies are acceptable when they serve one of these shared concerns.
+dependencies are acceptable when they serve one of these shared concerns
+(e.g. `libsystemd = "0.7"` is a Linux-only dep on `socket_bind` for
+FD adoption via `sd_listen_fds`; it is not exposed in the crate's public
+API).
 
 The wire protocol types (`Command`, responses, and future protocol error
 traits) are deliberately not part of this decision. They remain daemon-owned

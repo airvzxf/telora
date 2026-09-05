@@ -207,7 +207,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is tightened to `0600` through the pinned parent directory. The helper does not mutate the process-global umask. The remaining symlink-swap limitation is described in [Socket bind hardening](#socket-bind-hardening). The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove sockets on stop. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is tightened to `0600` through the pinned parent directory. The helper does not mutate the process-global umask. The remaining symlink-swap limitation is described in [Socket bind hardening](#socket-bind-hardening). All three systemd units (`telora.service`, `telora-daemon.service`, `telora-daemon.socket`) declare `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`; the socket unit's `RemoveOnStop=yes` removes the daemon socket inode when the socket is stopped, so no `ExecStopPost` is required. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -277,10 +277,29 @@ there on first use. There is no per-user / per-system split anymore
 Start the assistant (this will automatically start the background daemon):
 
 ```bash
-systemctl --user enable --now telora.service
+systemctl --user daemon-reload
+systemctl --user enable --now telora-daemon.socket telora.service
 ```
 
-The `telora` systemd service launches `telora-gui` (the Wayland OSD overlay), which in turn communicates with `telora-daemon` (the audio engine). Systemd handles both for you.
+`telora-daemon.socket` is the on-demand activation listener for the audio
+daemon — systemd starts `telora-daemon` the first time anything connects to
+`daemon.sock`. `telora.service` is the persistent Wayland OSD (`telora-gui`).
+The GUI's `Requires=telora-daemon.socket` ensures the listener is up before
+the GUI launches. Without enabling both, the GUI will sit idle waiting for
+the socket that the daemon never starts.
+
+### Development / ad-hoc runs
+
+Outside systemd (dev shells, CI, ad-hoc debugging) start the binaries
+directly. The daemon exposes `--no-activation` to skip the systemd
+`LISTEN_FDS` lookup and bind `daemon.sock` manually under
+`$XDG_RUNTIME_DIR/telora/`. The GUI does not need any flag — its
+`bind_unix_socket` path is already filesystem-only.
+
+```bash
+RUST_LOG=info ./bin/telora-daemon
+RUST_LOG=info ./bin/telora-gui
+```
 
 ## Troubleshooting
 
@@ -288,10 +307,12 @@ The `telora` systemd service launches `telora-gui` (the Wayland OSD overlay), wh
 
 **Sockets**: by default, `telora-daemon` and `telora-gui` place their Unix
 sockets under `$XDG_RUNTIME_DIR/telora/` (typically
-`/run/user/<uid>/telora/`). The directory is created by systemd
-(`RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700` in
-`telora-daemon.service` and `telora.service`) and torn down on
-`systemctl --user stop`.
+`/run/user/<uid>/telora/`). The directory is created by systemd on all
+three units (`RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700` on
+`telora.service`, `telora-daemon.service`, and `telora-daemon.socket`) so
+the GUI can still bind `control.sock` even if the daemon socket is
+stopped. The socket inode itself is removed by `RemoveOnStop=yes` on
+`telora-daemon.socket`; no `ExecStopPost` is required.
 
 **Override the daemon location**: set `[paths] socket_dir = "..."` in
 `telora.toml` or `TELORA_PATHS__SOCKET_DIR=/tmp/foo`. These settings are

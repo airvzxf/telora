@@ -19,7 +19,7 @@ make ownership and restart ordering ambiguous.
 
 | Option | Trade-off |
 | --- | --- |
-| **A. Filesystem-only control socket** | The GUI continues to call `bind_unix_socket`; it preserves the existing persistent OSD model and manual foreground fallback. |
+| **A. Filesystem-only control socket** | The GUI continues to call `bind_unix_socket`; it preserves the existing persistent OSD model and the daemon's `--no-activation` flag covers the manual filesystem bind for development runs. |
 | **B. `telora-gui.socket` with `Accept=no`** | Symmetric with the daemon, but adds another activation lifecycle and FD handoff without a user-visible benefit. |
 | **C. `Accept=yes`** | Rejected: systemd would manage connections rather than the long-lived GUI process. |
 
@@ -38,11 +38,18 @@ the daemon's socket unit.
 
 - The daemon can start on demand from `telora-daemon.socket` without changing
 the GUI's persistent process model.
-- The GUI retains the manual-bind fallback used by foreground/development runs.
+- The daemon exposes `--no-activation` for development runs; the GUI has no
+manual-bind flag because its bind path is always filesystem-only.
 - `control.sock` cleanup remains the GUI's responsibility; the daemon service
 must not unlink it in `ExecStopPost`.
-- Both services publish the canonical socket paths explicitly; `PassEnvironment=`
-alone is not used as sibling-service inheritance.
+- Both services publish the canonical socket paths explicitly:
+  - `[paths] socket_dir = "..."` in `telora.toml` (operator config).
+  - `TELORA_PATHS__SOCKET_DIR` env var (highest priority).
+  - `$XDG_RUNTIME_DIR/telora/` resolved by `telora-common::paths`.
+  The systemd units inject the resolved paths via direct `Environment=`
+  lines; `PassEnvironment=` alone is not used as sibling-service
+  inheritance because user-manager environment is not populated by the
+  units.
 
 ## References
 
