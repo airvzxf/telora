@@ -53,8 +53,37 @@ use voxora_bridge::{
 use voxora_registry::{ModelId, Registry, RegistryHfExt};
 
 /// Internal transcription contract used by the daemon's main loop.
-pub trait Transcriber: Send {
-    fn transcribe(&mut self, audio_data: &[f32], language: Option<&str>) -> Result<String>;
+///
+/// `transcribe` takes `&self` (not `&mut self`) because the
+/// underlying voxora engine is held behind `Arc<dyn AsrEngine>`
+/// and is itself `Send + Sync`. Sharing a read lock across the
+/// call lets the daemon's event loop keep STATUS / START / STOP
+/// responsive while a REFRESH in `tokio::spawn` commits a new
+/// engine under the write lock — see issue #93.
+pub trait Transcriber: Send + Sync {
+    fn transcribe(&self, audio_data: &[f32], language: Option<&str>) -> Result<String>;
+}
+
+/// No-op transcriber used as a sentinel during REFRESH. While the
+/// daemon drops the old engine and waits for the new one, the
+/// `Processing` branch of the event loop can still fire (e.g. a
+/// STOP that arrived in the swap window); this stub returns an
+/// empty string so the daemon stays processable instead of
+/// panicking on a `None` engine.
+///
+/// Also used as the install-target when a REFRESH starts: the
+/// main loop takes a write lock, replaces the live engine with
+/// `NoopTranscriber`, drops the lock, then awaits `build_transcriber`
+/// in the spawned task before committing the real engine. That
+/// keeps the swap window bounded by `max(old, new) + build_scratch`
+/// instead of `old + new + build_scratch` (#94).
+#[derive(Debug, Default)]
+pub struct NoopTranscriber;
+
+impl Transcriber for NoopTranscriber {
+    fn transcribe(&self, _audio_data: &[f32], _language: Option<&str>) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// No-op transcriber used as a sentinel during REFRESH. While the
@@ -76,9 +105,10 @@ impl Transcriber for NoopTranscriber {
 ///
 /// Holds `Arc<dyn AsrEngine>` so the same instance can be shared
 /// across reloads without rebuilding the underlying context every
-/// time. The trait requires `&mut self` for symmetry with the
-/// legacy `WhisperTranscriber`, but the implementation is `&self`
-/// internally — voxora engines are `Send + Sync`.
+/// time. The trait method is `&self` because the engine itself is
+/// `Send + Sync`; that is what allows the daemon to take only a
+/// read lock for `transcribe` and reserve the write lock for
+/// engine swaps (issue #93).
 pub struct BridgeTranscriber {
     engine: Arc<dyn AsrEngine>,
     model_id: String,
@@ -263,7 +293,7 @@ impl BridgeTranscriber {
 }
 
 impl Transcriber for BridgeTranscriber {
-    fn transcribe(&mut self, audio_data: &[f32], language: Option<&str>) -> Result<String> {
+    fn transcribe(&self, audio_data: &[f32], language: Option<&str>) -> Result<String> {
         let lang = match language {
             Some(s) => self.map_language(s).ok_or_else(|| {
                 anyhow!(
