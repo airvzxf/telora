@@ -31,12 +31,16 @@ makepkg -si
 
 ## Configuration
 
-You can configure the daemon using a TOML file. The daemon looks for configuration in the following order:
+You can configure the daemon using a TOML file. Configuration files are
+merged from lowest to highest priority in this order:
 
-1.  **CLI Arguments**: (e.g., `--config my_config.toml` or `--language en`)
-2.  **User Config**: `~/.config/telora/config.toml`
-3.  **System Config**: `/etc/telora.toml`
-4.  **Environment Variables**: (e.g., `TELORA_LANGUAGE=fr`)
+1. **System Config**: `/etc/telora.toml`
+2. **User Config**: `~/.config/telora/config.toml`
+3. **Explicit Config File**: `--config my_config.toml`
+4. **Environment Variables**: e.g. `TELORA_LANGUAGE=fr`
+
+After those sources are merged, direct value flags such as `--language en`
+override the resulting configuration.
 
 ### Example Configuration (`config.toml`)
 
@@ -67,8 +71,8 @@ language = "es"
 
 # Maximum recording time in seconds.
 # The daemon will automatically stop and process the audio if this limit is reached.
-# Default is 300 seconds (5 minutes). Set to a higher value for long dictations,
-# or lower to prevent memory abuse.
+# This example sets 300 seconds (5 minutes); when the field is omitted,
+# the daemon default is 600 seconds (10 minutes). Lower it to prevent memory abuse.
 max_recording_seconds = 300
 ```
 
@@ -203,7 +207,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check that confirms it is owned by the current UID, so an attacker cannot redirect the bind to a foreign socket. The shared helper (`telora_common::socket_bind::bind_unix_socket`) wraps the umask tightening in an RAII guard so it is restored even if the bind panics.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is created with mode `0600` using `umask 0o177`. A defensive `chmod 0600` follows the bind, and the remaining symlink-swap limitation is described in [Known limitation: `bind(2)` does not set `O_NOFOLLOW`](#known-limitation-bind2-does-not-set-onofollow). The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove sockets on stop. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID. The shared helper (`telora_common::socket_bind::bind_unix_socket`) wraps the umask tightening in an RAII guard so it is restored even if the bind panics.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -289,9 +293,10 @@ sockets under `$XDG_RUNTIME_DIR/telora/` (typically
 `telora-daemon.service` and `telora.service`) and torn down on
 `systemctl --user stop`.
 
-**Override the location**: set `[paths] socket_dir = "..."` in
-`telora.toml` (or `TELORA_PATHS__SOCKET_DIR=/tmp/foo`); both
-daemon and CLI respect the cascade.
+**Override the daemon location**: set `[paths] socket_dir = "..."` in
+`telora.toml` or `TELORA_PATHS__SOCKET_DIR=/tmp/foo`. These settings are
+read by the daemon configuration cascade; the GUI and CLI use the shared
+XDG runtime cascade and should run in the same user session.
 
 **Inspect live sockets**:
 
@@ -316,7 +321,7 @@ rm -rf /tmp/telora-$(id -u)
 ```
 
 **EPERM on bind (historical)**: current systemd installations create a
-private runtime directory and enforce ownership and mode `0600`. If you
+private runtime directory with mode `0700` and sockets with mode `0600`. If you
 still see a bind error, inspect `[paths] socket_dir` and remove only a
 stale socket owned by your user.
 

@@ -8,13 +8,15 @@
 
 Telora has five workspace members: `telora-common`, `telora-daemon`,
 `telora-gui`, `telora-ctl`, and `telora-models`. Before the extraction in
-EPIC #28, socket-path resolution and Unix-socket binding were duplicated across
-binary crates. The legacy model-management wrapper also carried a separate
-Voxora cache resolver whose validation diverged from the daemon.
+[EPIC #28](https://github.com/airvzxf/telora/issues/28), socket-path
+resolution and Unix-socket binding were duplicated across binary crates. The
+legacy model-management wrapper also carried a separate Voxora cache resolver
+whose validation diverged from the daemon.
 
 The duplicated implementations created drift in directory permissions, socket
-creation, and cache-override validation. The cache drift was closed by issue
-#103 when the shared resolver moved into `telora-common::cache`.
+creation, and cache-override validation. The cache drift was closed by
+[issue #103](https://github.com/airvzxf/telora/issues/103) when the shared
+resolver moved into `telora-common::cache`.
 
 ## Decision
 
@@ -58,8 +60,8 @@ until a separate IPC design is accepted.
 
 ## References
 
-- EPIC #28 — extraction of the shared paths and bind helper.
-- Issue #103 — shared Voxora cache validation.
+- [EPIC #28](https://github.com/airvzxf/telora/issues/28) — extraction of the shared paths and bind helper.
+- [Issue #103](https://github.com/airvzxf/telora/issues/103) — shared Voxora cache validation.
 - `telora-common/src/lib.rs` and `telora-common/README.md` — current public
   surface and dependency policy.
 - `CONTRIBUTING.md` — workspace and lockfile contribution rules.

@@ -37,9 +37,10 @@ directly.
 
 ## Adding new shared code
 
-New shared types belong here. A good rule of thumb: if the same
-snippet is being written twice across workspace binaries, lift it into
-`telora-common` and re-export it. Each module owns one concern:
+New shared types belong here only when they fit the leaf-crate boundary and
+serve more than one workspace consumer. If a repeated snippet is a candidate,
+first confirm that it belongs to one of the modules below; avoid pulling daemon
+protocol, GUI, audio, CUDA, or other binary-specific concerns into this crate.
 
 | Module        | Concern                                       |
 |---------------|-----------------------------------------------|
