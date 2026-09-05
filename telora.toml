@@ -66,7 +66,6 @@ max_recording_seconds = 300
 #   TELORA_PATHS__DAEMON_SOCKET
 #   TELORA_PATHS__CONTROL_SOCKET
 [paths]
-runtime_dir     = ""
 socket_dir      = ""
 daemon_socket   = ""
 control_socket  = ""

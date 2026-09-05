@@ -22,7 +22,7 @@ echo "--> [2/4] Testing telora-daemon..."
 ./bin/telora-daemon --version
 
 echo "--> [3/4] Testing telora-gui..."
-./bin/telora-gui --version
+./bin/telora-gui --help | head -5
 
 echo "--> [4/4] Testing telora..."
 ./bin/telora --version

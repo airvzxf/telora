@@ -44,6 +44,13 @@ clap = { version = "4.4", features = ["derive"] }
 config = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `sd_notify` is required by `Type=notify` in the systemd unit; the
+# daemon signals readiness only after `SocketServer::bind` succeeds,
+# closing the startup-race window that `Type=simple` allowed.
+# `libsystemd` is already a workspace dep via `telora-common` (used
+# for FD inheritance); the daemon only needs the `daemon` module
+# for `notify(READY=1)`.
+libsystemd = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

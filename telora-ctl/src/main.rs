@@ -35,7 +35,7 @@ async fn send_control_command(cmd: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
@@ -49,8 +49,14 @@ fn main() {
     let rt = Runtime::new().expect("Failed to create Tokio runtime");
     rt.block_on(async {
         match send_control_command(cmd_str).await {
-            Ok(_) => info!("Command '{}' sent successfully.", cmd_str),
-            Err(e) => log::error!("Failed to send command: {}", e),
+            Ok(()) => {
+                info!("Command '{}' sent successfully.", cmd_str);
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Failed to send command: {}", e);
+                Err(e)
+            }
         }
-    });
+    })
 }

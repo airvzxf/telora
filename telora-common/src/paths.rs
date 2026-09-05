@@ -15,7 +15,7 @@
 //! re-check closes the silent umask-leak the GUI's pre-extraction
 //! `ensure_parent_dir_0700` did not perform.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -31,11 +31,6 @@ use std::path::{Path, PathBuf};
 /// that do not have a `telora.toml` in hand.
 #[derive(Debug, Clone, Default)]
 pub struct PathsConfig {
-    /// Override for `XDG_RUNTIME_DIR`. Surfaced via `telora.toml`
-    /// `[paths] runtime_dir = "..."`; consumed by the systemd-aware
-    /// wiring that EPIC #34 landed.
-    #[allow(dead_code)]
-    pub runtime_dir: Option<String>,
     pub socket_dir: Option<String>,
     pub daemon_socket: Option<String>,
     pub control_socket: Option<String>,
@@ -89,11 +84,23 @@ pub fn control_socket_path() -> PathBuf {
 }
 
 fn last_resort_daemon_sock() -> PathBuf {
-    PathBuf::from(format!("/tmp/telora-{}", current_uid())).join("daemon.sock")
+    let dir = format!("/tmp/telora-{}", current_uid());
+    // Pre-create the parent at mode 0o700 so the GUI's
+    // `UnixStream::connect` does not race the daemon's bind-time
+    // `ensure_dir_0700`. Without this, a cold-boot GUI on a host
+    // with no XDG_RUNTIME_DIR and no writable `/run/user/<uid>/`
+    // would hit `ENOENT` until the daemon first started and
+    // `bind_unix_socket` materialised the directory.
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    PathBuf::from(dir).join("daemon.sock")
 }
 
 fn last_resort_control_sock() -> PathBuf {
-    PathBuf::from(format!("/tmp/telora-{}", current_uid())).join("control.sock")
+    let dir = format!("/tmp/telora-{}", current_uid());
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    PathBuf::from(dir).join("control.sock")
 }
 
 /// Resolve socket paths according to explicit systemd environment values,
@@ -104,8 +111,6 @@ pub fn resolve(cfg: &PathsConfig) -> Result<ResolvedPaths> {
     let env_daemon = env_socket_path("TELORA_DAEMON_SOCKET");
     let env_control = env_socket_path("TELORA_CONTROL_SOCKET");
     let socket_dir = pick_socket_dir(cfg, env_daemon.as_deref(), env_control.as_deref())?;
-    ensure_dir_0700(&socket_dir)
-        .with_context(|| format!("creating socket directory {}", socket_dir.display()))?;
     let daemon_sock = env_daemon
         .or_else(|| {
             cfg.daemon_socket
@@ -122,11 +127,47 @@ pub fn resolve(cfg: &PathsConfig) -> Result<ResolvedPaths> {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| socket_dir.join("control.sock"));
+    validate_unix_socket_path(&daemon_sock)
+        .with_context(|| format!("validating daemon socket path {}", daemon_sock.display()))?;
+    validate_unix_socket_path(&control_sock)
+        .with_context(|| format!("validating control socket path {}", control_sock.display()))?;
+    ensure_dir_0700(&socket_dir)
+        .with_context(|| format!("creating socket directory {}", socket_dir.display()))?;
     Ok(ResolvedPaths {
         socket_dir,
         daemon_sock,
         control_sock,
     })
+}
+
+/// Validate that a Unix-socket path fits the kernel's `sun_path` limit.
+///
+/// On Linux, `sun_path` is 108 bytes including the trailing NUL; a path
+/// longer than that makes `bind(2)` return `ENAMETOOLONG`, but only after
+/// the daemon has spent potentially minutes loading the model and the
+/// audio engine. Catch the failure at config-load time so the operator
+/// sees a clear error before the bind is attempted.
+#[cfg(target_os = "linux")]
+fn validate_unix_socket_path(path: &Path) -> Result<()> {
+    const SUN_PATH_MAX: usize = 108;
+    let len = path.as_os_str().len();
+    if len >= SUN_PATH_MAX {
+        bail!(
+            "socket path {} exceeds Linux sun_path limit ({} bytes, limit {})",
+            path.display(),
+            len,
+            SUN_PATH_MAX
+        );
+    }
+    Ok(())
+}
+
+/// On non-Linux targets, the `sun_path` limit is OS-specific (BSD: 104,
+/// macOS: 104) and bind is rarely used there. Skip the check; the bind
+/// will surface its own diagnostic if the path is invalid.
+#[cfg(not(target_os = "linux"))]
+fn validate_unix_socket_path(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn env_socket_path(name: &str) -> Option<PathBuf> {
@@ -394,5 +435,60 @@ pub(crate) mod tests {
         let dir = base.join(format!("telora-common-paths-test-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("create test tempdir");
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_rejects_daemon_socket_path_exceeding_sun_path_limit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Build a socket_dir whose joined `/daemon.sock` exceeds 108
+        // bytes (Linux sun_path limit). The directory does not need
+        // to exist on disk — the sun_path check fires before the
+        // `ensure_dir_0700` step.
+        let too_long = format!("/{}/{}", "a".repeat(100), "b".repeat(50));
+        let cfg = PathsConfig {
+            socket_dir: Some(too_long),
+            ..PathsConfig::default()
+        };
+        let joined = format!("{}/daemon.sock", cfg.socket_dir.as_deref().unwrap());
+        assert!(
+            joined.len() >= 108,
+            "test pre-condition: joined path must exceed sun_path limit (got {} bytes)",
+            joined.len()
+        );
+
+        let err = resolve(&cfg).expect_err("resolve should fail when socket path exceeds sun_path");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sun_path"),
+            "error must mention sun_path; got: {msg}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_accepts_daemon_socket_path_under_sun_path_limit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Build a socket_dir whose joined `/daemon.sock` is exactly
+        // 107 bytes (one under the limit). The resolver must accept
+        // it; the sun_path validator must not fire.
+        let tmp = tempfile_like();
+        let socket_dir = format!("{}/telora", tmp.display());
+        let joined = format!("{socket_dir}/daemon.sock");
+        assert!(
+            joined.len() < 108,
+            "test pre-condition: joined path must fit under sun_path limit (got {} bytes)",
+            joined.len()
+        );
+
+        let cfg = PathsConfig {
+            socket_dir: Some(socket_dir.clone()),
+            ..PathsConfig::default()
+        };
+        let resolved = resolve(&cfg).expect("resolve should succeed under sun_path limit");
+        assert_eq!(resolved.socket_dir, PathBuf::from(&socket_dir));
+        assert_eq!(resolved.daemon_sock, PathBuf::from(&joined));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

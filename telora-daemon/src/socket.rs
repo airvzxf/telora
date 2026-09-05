@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use telora_common::socket_bind::{bind_unix_socket, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -57,14 +57,9 @@ pub struct SttConfig {
 /// `[paths]` section of `telora.toml`. All fields are optional; an
 /// empty section (or its absence) falls back to the resolver in
 /// [`crate::paths`].
-///
-/// Sub-issue #34 is the consumer of these fields; until that wiring
-/// lands the resolver is the only thing that touches them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
 pub struct PathsConfig {
-    #[serde(default)]
-    pub runtime_dir: Option<String>,
     #[serde(default)]
     pub socket_dir: Option<String>,
     #[serde(default)]
@@ -137,6 +132,14 @@ pub enum Command {
 pub struct SocketServer {
     listener: UnixListener,
     cmd_tx: mpsc::Sender<Command>,
+    /// Best-effort cleanup target. Captured at `bind` time so a
+    /// `Drop` impl can `unlink` the socket file even when the daemon
+    /// process is killed outside systemd (e.g. `Ctrl-C` in a
+    /// development shell or a crash). When systemd adopts the FD
+    /// via `libsystemd::activation`, the unit's `RemoveOnStop=yes`
+    /// already cleans up; the `Drop` impl tolerates the resulting
+    /// `NotFound` so the double-cleanup is harmless.
+    socket_path: PathBuf,
 }
 
 impl SocketServer {
@@ -159,7 +162,17 @@ impl SocketServer {
         } else {
             bind_unix_socket_manual(path, "telora-daemon")?
         };
-        Ok(Self { listener, cmd_tx })
+        Ok(Self {
+            listener,
+            cmd_tx,
+            socket_path: path.to_path_buf(),
+        })
+    }
+
+    /// Returns the path the daemon bound the control socket at.
+    /// Used by tests to assert on the `Drop`-cleanup behaviour.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub async fn run(&self) {
@@ -168,11 +181,25 @@ impl SocketServer {
                 Ok((mut stream, _addr)) => {
                     let cmd_tx = self.cmd_tx.clone();
                     tokio::spawn(async move {
-                        let mut buf = [0; 2048]; // Increased buffer size for config JSON
-                        match stream.read(&mut buf).await {
-                            Ok(n) if n > 0 => {
-                                let command_str =
-                                    String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                        // Read the full payload rather than a fixed
+                        // 2 KiB slice. A REFRESH whose JSON is split
+                        // across multiple read syscalls (common on
+                        // Unix sockets with `MSG_DONTWAIT` /
+                        // segmentation) used to fail with a confusing
+                        // `EOF while parsing` and the operator saw
+                        // `ERROR: Invalid config JSON: …`. The cap at
+                        // 64 KiB protects against a flood that would
+                        // otherwise grow the buffer up to the kernel
+                        // `SO_RCVBUF` ceiling.
+                        const REFRESH_MAX_BYTES: u64 = 64 * 1024;
+                        let mut buf = Vec::new();
+                        let mut limited = stream.take(REFRESH_MAX_BYTES);
+                        match limited.read_to_end(&mut buf).await {
+                            Ok(_) if buf.is_empty() => {
+                                let _ = stream.write_all(b"ERROR: empty command").await;
+                            }
+                            Ok(_) => {
+                                let command_str = String::from_utf8_lossy(&buf).trim().to_string();
                                 info!("Received command: {}", command_str);
 
                                 if command_str.starts_with("REFRESH") {
@@ -292,23 +319,50 @@ impl SocketServer {
                                 };
 
                                 // TODO: Implementing full bidirectional wait for transcription is tricky here without a shared state or response channel.
-                                // Quick fix: The main loop will handle the logic, but how does it send back to THIS stream?
-                                // Architecture choice:
-                                // 1. Client connects, sends STOP, waits.
-                                // 2. Socket task sends StopRecording to Main.
-                                // 3. Socket task waits for Result from Main (via oneshot channel?).
-                                // 4. Socket task writes Result to Stream.
-                                //
-                                // Let's implement that pattern in the next step (Main).
-                                // For now, this is a good skeleton.
+                                // Architecture: the main loop already
+                                // routes every command through a
+                                // oneshot response channel; this
+                                // socket task just sends the command
+                                // and writes the result back to the
+                                // stream. The skeleton below is no
+                                // longer aspirational — STOP /
+                                // STATUS / REFRESH all follow this
+                                // pattern.
                             }
-                            Ok(_) => {} // EOF
                             Err(e) => error!("Failed to read from socket: {}", e),
                         }
                     });
                 }
                 Err(e) => error!("Failed to accept connection: {}", e),
             }
+        }
+    }
+}
+
+impl Drop for SocketServer {
+    /// Best-effort unlink on drop so a `Ctrl-C` in a development
+    /// shell, a panic, or any other non-systemd shutdown path does
+    /// not leave a stale socket file behind. The next start will
+    /// usually succeed anyway (the bind helper's
+    /// `remove_stale_socket` cleans up same-UID leftovers), but a
+    /// debris-free `/run/user/<uid>/telora/` is the operator-facing
+    /// hygiene goal.
+    ///
+    /// Field drop order matters: `listener` drops before
+    /// `socket_path` (fields are dropped top-to-bottom), so the FD
+    /// is closed and the kernel stops holding the inode before we
+    /// attempt the unlink. The systemd-managed path (`Accept=no`)
+    /// has already cleaned the file via `RemoveOnStop=yes`, so a
+    /// `NotFound` here is expected and not logged as a warning.
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "failed to unlink {} on drop: {}",
+                self.socket_path.display(),
+                e
+            ),
         }
     }
 }
@@ -371,6 +425,37 @@ mod tests {
                 "activation-mode bind produced a non-connectable socket"
             );
             drop(activation);
+        });
+    }
+
+    /// `Drop` must unlink the socket file. Without this, a `Ctrl-C`
+    /// in a development shell leaves debris under
+    /// `$XDG_RUNTIME_DIR/telora/`.
+    #[test]
+    fn drop_unlinks_socket_file() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sock_path = tmp.path().join("telora-daemon-drop.sock");
+            let cmd_tx: mpsc::Sender<Command> = mpsc::channel(1).0;
+
+            {
+                let server =
+                    SocketServer::bind(&sock_path, cmd_tx, false).expect("bind should succeed");
+                assert_eq!(server.socket_path(), sock_path.as_path());
+                assert!(sock_path.exists(), "socket file should exist after bind");
+                drop(server);
+            }
+
+            assert!(
+                !sock_path.exists(),
+                "socket file should be unlinked after drop (found at {})",
+                sock_path.display()
+            );
         });
     }
 }

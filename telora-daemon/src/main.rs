@@ -165,25 +165,31 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
 async fn run_refresh_client(config: SttConfig, socket_path: &str) -> Result<()> {
     let mut stream = match UnixStream::connect(socket_path).await {
         Ok(s) => s,
-        Err(_) => {
-            eprintln!("Error: Daemon is not running.");
-            return Ok(());
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to connect to daemon at {}: {} (is the daemon running?)",
+                socket_path,
+                e
+            ));
         }
     };
 
     let config_json = serde_json::to_string(&config)?;
     let command = format!("REFRESH {}", config_json);
 
-    if let Err(e) = stream.write_all(command.as_bytes()).await {
-        eprintln!("Failed to send refresh command to daemon: {}", e);
-        return Ok(());
-    }
+    stream
+        .write_all(command.as_bytes())
+        .await
+        .context("Failed to send refresh command to daemon")?;
 
+    // Cap the response at 64 KiB to avoid an unbounded read if the
+    // daemon ever leaks a non-terminating stream.
     let mut buf = Vec::new();
-    if let Err(e) = stream.read_to_end(&mut buf).await {
-        eprintln!("Failed to read response from daemon: {}", e);
-        return Ok(());
-    }
+    let mut limited = stream.take(64 * 1024);
+    limited
+        .read_to_end(&mut buf)
+        .await
+        .context("Failed to read response from daemon")?;
 
     let response = String::from_utf8_lossy(&buf);
     println!("{}", response);
@@ -371,7 +377,6 @@ async fn main() -> Result<()> {
         // Both errors are surfaced on stderr.
         let paths_cfg = match load_config(&args) {
             Ok(c) => paths::PathsConfig {
-                runtime_dir: c.paths.runtime_dir.clone(),
                 socket_dir: c.paths.socket_dir.clone(),
                 daemon_socket: c.paths.daemon_socket.clone(),
                 control_socket: c.paths.control_socket.clone(),
@@ -407,16 +412,16 @@ async fn main() -> Result<()> {
             }
         };
         let paths_cfg = paths::PathsConfig {
-            runtime_dir: cfg.paths.runtime_dir.clone(),
             socket_dir: cfg.paths.socket_dir.clone(),
             daemon_socket: cfg.paths.daemon_socket.clone(),
             control_socket: cfg.paths.control_socket.clone(),
         };
         let resolved = paths::resolve(&paths_cfg).context("resolving daemon socket path")?;
         let daemon_sock = resolved.daemon_sock.to_string_lossy().into_owned();
-        if let Err(e) = run_refresh_client(cfg.stt, &daemon_sock).await {
-            eprintln!("Error refreshing daemon: {}", e);
-        }
+        // Propagate failures so `telora-daemon refresh` exits non-zero
+        // on connection / write / read errors. Hotkey wrappers and CI
+        // jobs rely on the exit code to detect a successful refresh.
+        run_refresh_client(cfg.stt, &daemon_sock).await?;
         return Ok(());
     }
 
@@ -501,7 +506,6 @@ async fn main() -> Result<()> {
     // `telora_common::paths` so the daemon, GUI, and CLI all share
     // the same cascade.
     let paths_cfg = paths::PathsConfig {
-        runtime_dir: paths_config.runtime_dir.clone(),
         socket_dir: paths_config.socket_dir.clone(),
         daemon_socket: paths_config.daemon_socket.clone(),
         control_socket: paths_config.control_socket.clone(),
@@ -514,6 +518,24 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         socket_server.run().await;
     });
+
+    // Type=notify: signal systemd that we are ready to accept
+    // connections. Without this, the unit's `Type=simple` flips
+    // `ActiveState=active` before the model has loaded and the
+    // socket has bound, opening a startup-race window where a
+    // client `telora-daemon status` reports `STOPPED` while the
+    // daemon is mid-load. The call is gated on `NOTIFY_SOCKET`
+    // (set by systemd) and `target_os = "linux"` so non-systemd
+    // invocations (development shell, CI) do not produce noisy
+    // error logs.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            if let Err(e) = libsystemd::daemon::notify(true, &[libsystemd::daemon::STATE_READY]) {
+                log::warn!("sd_notify(READY=1) failed: {}", e);
+            }
+        }
+    }
 
     // 2. Event Loop
     let mut state = State::Idle;

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use telora_common::paths;
 use telora_common::socket_bind::bind_unix_socket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +30,7 @@ impl SocketClient {
 #[derive(Debug)]
 pub struct ControlServer {
     listener: UnixListener,
+    socket_path: PathBuf,
 }
 
 impl ControlServer {
@@ -44,7 +45,17 @@ impl ControlServer {
     /// would be wrong here).
     pub fn bind(path: &Path) -> Result<Self> {
         let listener = bind_unix_socket(path, "telora-gui")?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            socket_path: path.to_path_buf(),
+        })
+    }
+
+    /// Returns the path the GUI bound the control socket at.
+    /// Used by tests to assert on the `Drop`-cleanup behaviour.
+    #[allow(dead_code)]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub async fn next_command(&self) -> Result<String> {
@@ -52,5 +63,22 @@ impl ControlServer {
         let mut buf = [0; 1024];
         let n = stream.read(&mut buf).await?;
         Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
+    }
+}
+
+impl Drop for ControlServer {
+    /// Best-effort unlink on drop so a `Ctrl-C` in a development
+    /// shell, a panic, or any other non-systemd shutdown path does
+    /// not leave a stale socket file behind.
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "failed to unlink {} on drop: {}",
+                self.socket_path.display(),
+                e
+            ),
+        }
     }
 }
