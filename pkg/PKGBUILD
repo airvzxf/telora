@@ -4,7 +4,7 @@
 # "Note on AUR package checksums" for the canonical verification path
 # (`makepkg -g`).
 pkgname=telora-bin
-pkgver=0.2.1
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Telora: Professional Speech-to-Text Assistant (Pre-built binaries)"
 arch=('x86_64')
