@@ -89,11 +89,23 @@ pub fn control_socket_path() -> PathBuf {
 }
 
 fn last_resort_daemon_sock() -> PathBuf {
-    PathBuf::from(format!("/tmp/telora-{}", current_uid())).join("daemon.sock")
+    let dir = format!("/tmp/telora-{}", current_uid());
+    // Pre-create the parent at mode 0o700 so the GUI's
+    // `UnixStream::connect` does not race the daemon's bind-time
+    // `ensure_dir_0700`. Without this, a cold-boot GUI on a host
+    // with no XDG_RUNTIME_DIR and no writable `/run/user/<uid>/`
+    // would hit `ENOENT` until the daemon first started and
+    // `bind_unix_socket` materialised the directory.
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    PathBuf::from(dir).join("daemon.sock")
 }
 
 fn last_resort_control_sock() -> PathBuf {
-    PathBuf::from(format!("/tmp/telora-{}", current_uid())).join("control.sock")
+    let dir = format!("/tmp/telora-{}", current_uid());
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    PathBuf::from(dir).join("control.sock")
 }
 
 /// Resolve socket paths according to explicit systemd environment values,
