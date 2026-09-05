@@ -9,12 +9,14 @@ Type=simple
 ExecStart=/usr/bin/telora-daemon
 Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
 Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
-# The socket unit owns daemon.sock; RuntimeDirectory and ExecStopPost must
-# not remove the systemd-managed inode while the socket unit is active.
+RuntimeDirectory=telora
+RuntimeDirectoryMode=0700
 # Hardening (light, optional but recommended)
 NoNewPrivileges=true
 PrivateTmp=true
-RestrictAddressFamilies=AF_UNIX
+# NOTE: `RestrictAddressFamilies=AF_UNIX` was deliberately removed.
+# voxora-hf uses `reqwest` to download model weights on first launch, which
+# needs AF_INET / AF_INET6. The daemon itself only listens on AF_UNIX.
 Restart=on-failure
 RestartSec=5
 

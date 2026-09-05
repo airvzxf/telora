@@ -1,7 +1,6 @@
 [Unit]
 Description=Telora Audio Daemon listening socket
 Before=telora-daemon.service
-PartOf=telora-daemon.service
 
 [Socket]
 ListenStream=%t/telora/daemon.sock
