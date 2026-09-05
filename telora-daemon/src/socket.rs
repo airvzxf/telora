@@ -168,11 +168,25 @@ impl SocketServer {
                 Ok((mut stream, _addr)) => {
                     let cmd_tx = self.cmd_tx.clone();
                     tokio::spawn(async move {
-                        let mut buf = [0; 2048]; // Increased buffer size for config JSON
-                        match stream.read(&mut buf).await {
-                            Ok(n) if n > 0 => {
-                                let command_str =
-                                    String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                        // Read the full payload rather than a fixed
+                        // 2 KiB slice. A REFRESH whose JSON is split
+                        // across multiple read syscalls (common on
+                        // Unix sockets with `MSG_DONTWAIT` /
+                        // segmentation) used to fail with a confusing
+                        // `EOF while parsing` and the operator saw
+                        // `ERROR: Invalid config JSON: …`. The cap at
+                        // 64 KiB protects against a flood that would
+                        // otherwise grow the buffer up to the kernel
+                        // `SO_RCVBUF` ceiling.
+                        const REFRESH_MAX_BYTES: u64 = 64 * 1024;
+                        let mut buf = Vec::new();
+                        let mut limited = stream.take(REFRESH_MAX_BYTES);
+                        match limited.read_to_end(&mut buf).await {
+                            Ok(_) if buf.is_empty() => {
+                                let _ = stream.write_all(b"ERROR: empty command").await;
+                            }
+                            Ok(_) => {
+                                let command_str = String::from_utf8_lossy(&buf).trim().to_string();
                                 info!("Received command: {}", command_str);
 
                                 if command_str.starts_with("REFRESH") {
@@ -292,17 +306,16 @@ impl SocketServer {
                                 };
 
                                 // TODO: Implementing full bidirectional wait for transcription is tricky here without a shared state or response channel.
-                                // Quick fix: The main loop will handle the logic, but how does it send back to THIS stream?
-                                // Architecture choice:
-                                // 1. Client connects, sends STOP, waits.
-                                // 2. Socket task sends StopRecording to Main.
-                                // 3. Socket task waits for Result from Main (via oneshot channel?).
-                                // 4. Socket task writes Result to Stream.
-                                //
-                                // Let's implement that pattern in the next step (Main).
-                                // For now, this is a good skeleton.
+                                // Architecture: the main loop already
+                                // routes every command through a
+                                // oneshot response channel; this
+                                // socket task just sends the command
+                                // and writes the result back to the
+                                // stream. The skeleton below is no
+                                // longer aspirational — STOP /
+                                // STATUS / REFRESH all follow this
+                                // pattern.
                             }
-                            Ok(_) => {} // EOF
                             Err(e) => error!("Failed to read from socket: {}", e),
                         }
                     });
