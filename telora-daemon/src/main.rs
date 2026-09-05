@@ -49,7 +49,7 @@ struct Args {
     max_recording_seconds: Option<u32>,
 
     /// Hugging Face cache directory (overrides config).
-    #[arg(long)]
+    #[arg(long, value_name = "DIR")]
     voxora_cache: Option<PathBuf>,
 }
 
@@ -417,18 +417,15 @@ async fn main() -> Result<()> {
     // took that exact shape from a different cause.
     //
     // Empty CLI / env strings are filtered out so `--voxora-cache ""`
-    // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default
-    // (asymmetric handling here would silently point the cache at
-    // CWD-relative ".cache", per airvzxf/telora#79).
+    // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default.
+    // A non-empty CLI override has precedence; if it fails validation,
+    // resolution goes directly to the XDG default rather than silently
+    // selecting the lower-priority environment value.
     //
-    // BOTH override sources flow through
-    // [`resolve_voxora_cache`], which routes the candidate through
-    // [`sanitize_voxora_cache_override`]. An earlier version
-    // short-circuited on `args.voxora_cache` / `VOXORA_CACHE_DIR`
-    // here, which meant `VOXORA_CACHE_DIR=/tmp/foo/../bar` was
-    // accepted verbatim and the F2 commit's claim that the
-    // sanitiser gates the override was false. Going through the
-    // helper closes that gap.
+    // Both override sources flow through the shared resolver and its
+    // traversal/symlink checks. An earlier daemon-only implementation
+    // short-circuited on the raw override and accepted
+    // `VOXORA_CACHE_DIR=/tmp/foo/../bar` verbatim.
     let env_cache_override = std::env::var_os("VOXORA_CACHE_DIR").map(PathBuf::from);
     let voxora_cache =
         resolve_voxora_cache(args.voxora_cache.as_deref(), env_cache_override.as_deref())

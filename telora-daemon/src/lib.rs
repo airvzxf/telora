@@ -49,10 +49,19 @@ pub use telora_common::paths;
 // production behaviour in one place.
 pub use cache_paths::telora_env_source;
 
-// Keep the original string-based daemon library API while the binary and
-// `telora-models` use the Path-based shared resolver directly.
+// Keep the original cache helper names available to downstream daemon
+// consumers while the binary and `telora-models` use the Path-based shared
+// resolver directly.
 pub use telora_common::cache::{default_voxora_cache_dir, sanitize_voxora_cache_override};
 
+/// Resolve the Voxora cache using the daemon crate's historical string API.
+///
+/// New code should call [`telora_common::cache::resolve_voxora_cache`] so it
+/// can preserve non-UTF-8 paths through a `Path` value.
+///
+/// # Errors
+///
+/// Returns an error when no usable XDG cache directory can be determined.
 pub fn resolve_voxora_cache(
     args_override: Option<&str>,
     env_override: Option<&str>,
