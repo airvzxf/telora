@@ -331,15 +331,15 @@ The shared bind helper creates the parent directory with mode `0700`. On Linux
 it opens the immediate parent with `O_PATH | O_NOFOLLOW | O_DIRECTORY`, keeps
 that directory descriptor alive through `bind(2)`, and applies `chmod 0600`
 relative to the pinned directory. Existing symlinks, directories, and regular
-files at the socket name are rejected instead of being removed automatically.
+files at the socket name are rejected; stale socket files owned by the current
+UID are removed to preserve restart idempotency.
 
-Linux `bind(2)` does not accept an `O_NOFOLLOW` flag, and the final socket name
-is not followed as a symlink by the kernel. The parent-descriptor check closes
-the parent-path substitution case; a same-UID process can still race the final
-name and cause a denial of service before `bind(2)`, so this is not a complete
-atomic-publish solution. Systemd socket activation remains the strongest
-production mitigation because systemd owns the listening socket before the
-service starts.
+Linux `bind(2)` does not accept an `O_NOFOLLOW` flag, so the helper rejects a
+final-name symlink before calling it and pins the parent path independently.
+A same-UID process can still race the final name and cause a bind conflict,
+so this is not a complete atomic-publish solution. Systemd socket activation
+remains the strongest production mitigation because systemd owns the listening
+socket before the service starts.
 
 ## Development
 
