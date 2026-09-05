@@ -23,10 +23,11 @@ model_kind = "whisper"
 #   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR (20 languages)
 #   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR (larger, 20 languages)
 #
-# To use a model that lives outside Hugging Face, point
-# `voxora_cache` (or the `--voxora-cache` CLI flag) at the
-# directory that already contains the weights — voxora-hf will pick
-# them up.
+# To use a model cache outside the default XDG location, pass
+# `--voxora-cache DIR` to the daemon or set `VOXORA_CACHE_DIR=DIR`.
+# The CLI value takes precedence over the environment value. Absolute
+# overrides must be under `$XDG_CACHE_HOME`; invalid overrides fall back
+# to `$XDG_CACHE_HOME/voxora/models/huggingface`.
 model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 
 # Legacy field: kept so old telora.toml files keep working.
@@ -56,9 +57,11 @@ max_recording_seconds = 300
 # If $XDG_RUNTIME_DIR is unset or not writable, falls back to
 #   /run/user/<uid>/telora  →  /tmp/telora-<uid>/  (last resort)
 #
-# Any non-empty field wins over the default.
-#
-# Env-var overrides (any source, precedence: env > file > built-in default):
+# Any non-empty field wins over the default. In a systemd user service,
+# the flat canonical variables below take precedence over these legacy fields:
+#   TELORA_DAEMON_SOCKET
+#   TELORA_CONTROL_SOCKET
+# For config-file/env cascading outside systemd, use:
 #   TELORA_PATHS__SOCKET_DIR
 #   TELORA_PATHS__DAEMON_SOCKET
 #   TELORA_PATHS__CONTROL_SOCKET

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use telora_common::cache::resolve_voxora_cache;
 use voxora_traits::{ModelSource, ResolveOptions};
 
 #[derive(Parser)]
@@ -62,18 +63,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
     // Single source of truth for the cache root — `list` and
-    // `download` scan the same directory `download` writes to.
-    // Empty CLI strings are filtered so `--voxora-cache ""` falls
-    // through to the default (matching the daemon's behaviour).
-    let cache_root = cli
-        .voxora_cache
-        .clone()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(default_cache_dir);
+    // `download` scan the same directory `download` writes to. Both
+    // CLI and environment overrides go through the shared sanitizer.
+    let cache_root = resolve_cache_root(cli.voxora_cache.as_deref())?;
     let source = build_source(Some(&cache_root))?;
 
     match cli.command {
@@ -81,6 +77,11 @@ async fn main() -> Result<()> {
         Commands::Download { model_id } => download_cmd(&source, &model_id).await,
         Commands::Path => path_cmd(&cache_root),
     }
+}
+
+fn resolve_cache_root(cli_override: Option<&Path>) -> Result<PathBuf> {
+    let env_override = std::env::var_os("VOXORA_CACHE_DIR").map(PathBuf::from);
+    resolve_voxora_cache(cli_override, env_override.as_deref())
 }
 
 fn build_source(cache: Option<&Path>) -> Result<voxora_hf::HuggingFaceSource> {
@@ -146,29 +147,6 @@ fn path_cmd(cache_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mirror of `voxora_hf::cache::default_cache_root`. Kept private
-/// there to keep the voxora-hf API surface minimal; duplicated here
-/// because we only need it for the `path` subcommand.
-///
-/// Intentionally a legacy-mode mirror of the operator's on-disk
-/// layout from voxora 0.1.x. It deliberately does NOT go through
-/// `voxora-config` — voxora-hf 0.4's default-features change
-/// enabled `voxora-config`, whose `cache_root()` returns just
-/// `$XDG_CACHE_HOME/voxora` (without the `models/huggingface`
-/// suffix), which would orphan every model that telora has shipped
-/// to the operator since 0.1.x.
-///
-/// `main()` ALWAYS passes this helper's result into
-/// [`build_source`] so the source the daemon reads and the path
-/// `path` reports are guaranteed to be the same directory.
-fn default_cache_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("VOXORA_CACHE_DIR") {
-        return PathBuf::from(custom);
-    }
-    let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
-    base.join("voxora").join("models").join("huggingface")
-}
-
 /// Char-boundary-aware truncation. The previous implementation
 /// byte-sliced the string and could panic on multi-byte UTF-8 paths
 /// (the operator's home directory was the easy reproducer). Budget
@@ -198,5 +176,81 @@ fn human_bytes(n: u64) -> String {
         format!("{} {}", n, UNITS[0])
     } else {
         format!("{:.1} {}", v, UNITS[i])
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        xdg_cache_home: Option<OsString>,
+        home: Option<OsString>,
+        voxora_cache_dir: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn setup(root: &Path) -> Self {
+            let previous = Self {
+                xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+                home: std::env::var_os("HOME"),
+                voxora_cache_dir: std::env::var_os("VOXORA_CACHE_DIR"),
+            };
+            unsafe {
+                std::env::set_var("XDG_CACHE_HOME", root);
+                std::env::set_var("HOME", root);
+                std::env::remove_var("VOXORA_CACHE_DIR");
+            }
+            previous
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            restore("XDG_CACHE_HOME", self.xdg_cache_home.take());
+            restore("HOME", self.home.take());
+            restore("VOXORA_CACHE_DIR", self.voxora_cache_dir.take());
+        }
+    }
+
+    fn restore(name: &str, value: Option<OsString>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn cache_override_traversal_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().expect("create test cache root");
+        let _env = EnvRestore::setup(root.path());
+        let bad = PathBuf::from("/tmp/foo/../bar");
+        unsafe {
+            std::env::set_var("VOXORA_CACHE_DIR", &bad);
+        }
+
+        let resolved = resolve_cache_root(None).expect("default cache should resolve");
+        assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
+        assert_ne!(resolved, PathBuf::from("/tmp/bar"));
+    }
+
+    #[test]
+    fn cli_cache_override_is_sanitized_too() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().expect("create test cache root");
+        let _env = EnvRestore::setup(root.path());
+        let bad = Path::new("/tmp/foo/../bar");
+
+        let resolved = resolve_cache_root(Some(bad)).expect("default cache should resolve");
+        assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
+        assert_ne!(resolved, PathBuf::from("/tmp/bar"));
     }
 }

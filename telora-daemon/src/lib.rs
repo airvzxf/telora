@@ -9,19 +9,16 @@
 //! library + binary:
 //!
 //!   * `lib.rs` (this file) re-exports the modules and items needed
-//!     by external callers (integration tests, future `telora-common`
-//!     reuse). The internal modules (`audio`, `transcriber`, `vad`)
-//!     stay private to the crate; only the specific types the binary
-//!     and the tests need are re-exported.
+//!     by external callers (integration tests and the binary). The
+//!     internal modules (`audio`, `transcriber`, `vad`) stay private
+//!     to the crate; only the specific types the binary and tests need
+//!     are re-exported.
 //!   * `main.rs` becomes a thin wrapper that imports from the crate
 //!     root via `use telora_daemon::*;`.
 //!
-//! The split is **structural only** — no behavior changes. The
-//! runtime path / resolver / bind helper deduplication landed in
-//! EPIC #28 (`telora-common`); this crate now re-exports them under
-//! the `paths` module name so external callers (and the binary) keep
-//! working without an import-path rewrite, while the voxora-cache
-//! helpers stay daemon-local because no other crate needs them.
+//! The shared runtime paths, socket bind helper, and Voxora cache
+//! resolver live in `telora-common`; this crate retains only the
+//! daemon-specific configuration environment source.
 
 pub mod socket;
 
@@ -52,13 +49,28 @@ pub use telora_common::paths;
 // production behaviour in one place.
 pub use cache_paths::telora_env_source;
 
-// Re-export the voxora-cache helpers used by the binary. They stay
-// private to the daemon because no other crate consumes them (the
-// GUI and `telora-ctl` never touch the model cache); the binary and
-// the integration-style tests reach them through these re-exports.
-pub use cache_paths::{
-    default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override,
-};
+// Keep the original cache helper names available to downstream daemon
+// consumers while the binary and `telora-models` use the Path-based shared
+// resolver directly.
+pub use telora_common::cache::{default_voxora_cache_dir, sanitize_voxora_cache_override};
+
+/// Resolve the Voxora cache using the daemon crate's historical string API.
+///
+/// New code should call [`telora_common::cache::resolve_voxora_cache`] so it
+/// can preserve non-UTF-8 paths through a `Path` value.
+///
+/// # Errors
+///
+/// Returns an error when no usable XDG cache directory can be determined.
+pub fn resolve_voxora_cache(
+    args_override: Option<&str>,
+    env_override: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    telora_common::cache::resolve_voxora_cache(
+        args_override.map(std::path::Path::new),
+        env_override.map(std::path::Path::new),
+    )
+}
 
 // Re-export the items `main.rs` (the binary) needs from the
 // otherwise-private `audio` and `transcriber` modules. Tests do not

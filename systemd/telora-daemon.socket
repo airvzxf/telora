@@ -1,0 +1,15 @@
+[Unit]
+Description=Telora Audio Daemon listening socket
+Before=telora-daemon.service
+
+[Socket]
+ListenStream=%t/telora/daemon.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+RuntimeDirectory=telora
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

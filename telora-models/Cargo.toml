@@ -17,10 +17,13 @@ rust-version.workspace = true
 # engine feature baggage).
 voxora-hf     = { workspace = true }
 voxora-traits = { workspace = true }
+telora-common = { workspace = true }
 
 anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
-dirs = "5"
 log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1.36", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,10 +1,12 @@
 [Unit]
 Description=Telora Assistant UI
-After=graphical-session.target telora-daemon.service
-Requires=telora-daemon.service
-BindsTo=telora-daemon.service
-# Wait until /run/user/<uid>/telora/ is mounted before starting the
-# GUI; otherwise the daemon-reload ordering vs GUI-restart races.
+After=graphical-session.target telora-daemon.socket
+# The GUI consumes the socket activation FDs that `telora-daemon.socket`
+# hands to `telora-daemon.service`. Depending on the socket unit (and not
+# on the daemon service directly) preserves the on-demand activation story
+# and avoids blinking the GUI on every daemon crash/restart cycle.
+Requires=telora-daemon.socket
+# The socket unit owns %t/telora; wait for that runtime directory.
 RequiresMountsFor=%t/telora
 
 [Service]
@@ -13,12 +15,15 @@ Type=simple
 #   vkQueuePresentKHR(): A swapchain no longer matches the surface properties exactly,
 #   but can still be used to present to the surface successfully. (VK_SUBOPTIMAL_KHR) (1000001003)
 Environment=GSK_RENDERER=gl
-ExecStart=/usr/bin/telora-gui
-# Same runtime dir as the daemon so the GUI control socket lives at
-# the same /run/user/<uid>/telora/control.sock the daemon's STATUS
-# stream can reach.
+Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
+Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
+# Keep the runtime directory alive while the GUI is running so the
+# control socket stays reachable even if `telora-daemon.socket` is stopped.
+# The daemon service and socket unit declare the same directory; systemd
+# joins them into one owned by the same UID when the first unit starts.
 RuntimeDirectory=telora
 RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/telora-gui
 Restart=on-failure
 RestartSec=5
 

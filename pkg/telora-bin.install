@@ -1,17 +1,23 @@
 post_install() {
     systemctl --user daemon-reload >/dev/null 2>&1 || true
-    # Encourage linger so /run/user/<uid>/telora/ persists across logouts
-    if ! loginctl show-user "$(id -un)" 2>/dev/null | grep -q 'Linger=yes'; then
+    # Encourage linger so /run/user/<uid>/telora/ persists across logouts.
+    # pacman runs the install hook as root, so derive the real user from
+    # $SUDO_USER (set by sudo / preserved by pacman) and fall back to id -un
+    # for the rare direct-root install.
+    local telora_user="${SUDO_USER:-$(id -un)}"
+    if ! loginctl show-user "${telora_user}" 2>/dev/null | grep -q 'Linger=yes'; then
         echo ":: Tip: enable linger so telora-daemon survives logout:"
-        echo "      loginctl enable-linger $(id -un)"
+        echo "::      sudo loginctl enable-linger ${telora_user}"
     fi
-    echo ":: Telora 0.2.1 has been installed."
+    echo ":: Telora 0.3.0 has been installed."
     echo ":: IMPORTANT: You need to download a speech model before using Telora."
     echo ":: Please run the following command to download the base model:"
     echo ":: "
-    echo "::     telora-models download base"
+    echo "::     telora-models download ggerganov/whisper.cpp/ggml-base.bin"
     echo ":: "
     echo ":: You can also list available models with 'telora-models list'."
+    echo ":: To enable socket activation, run:"
+    echo "::     systemctl --user enable --now telora-daemon.socket telora.service"
 }
 
 pre_upgrade() {
@@ -31,10 +37,13 @@ post_upgrade() {
 }
 
 pre_remove() {
-    # Remove sockets still living in /tmp (legacy locations from before the XDG migration).
-    rm -f /tmp/telora-sock /tmp/telora-control.sock
-    if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
-        systemctl --user stop telora-daemon.service || true
-        systemctl --user disable telora-daemon.service || true
-    fi
+    # Disable everything the package owns so we never leave a dangling
+    # symlink in graphical-session.target.wants/ pointing at the deleted
+    # binary. disable --now catches the socket (always pullable) and the
+    # GUI service even when inactive; telora-daemon.service gets the same
+    # treatment for symmetry. All calls ignore exit status so a missing
+    # user manager (rare in `pacman -R` context) doesn't fail the removal.
+    systemctl --user disable --now telora-daemon.socket >/dev/null 2>&1 || true
+    systemctl --user disable --now telora.service       >/dev/null 2>&1 || true
+    systemctl --user disable --now telora-daemon.service >/dev/null 2>&1 || true
 }

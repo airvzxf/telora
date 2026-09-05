@@ -31,12 +31,16 @@ makepkg -si
 
 ## Configuration
 
-You can configure the daemon using a TOML file. The daemon looks for configuration in the following order:
+You can configure the daemon using a TOML file. Configuration files are
+merged from lowest to highest priority in this order:
 
-1.  **CLI Arguments**: (e.g., `--config my_config.toml` or `--language en`)
-2.  **User Config**: `~/.config/telora/config.toml`
-3.  **System Config**: `/etc/telora.toml`
-4.  **Environment Variables**: (e.g., `TELORA_LANGUAGE=fr`)
+1. **System Config**: `/etc/telora.toml`
+2. **User Config**: `~/.config/telora/config.toml`
+3. **Explicit Config File**: `--config my_config.toml`
+4. **Environment Variables**: e.g. `TELORA_LANGUAGE=fr`
+
+After those sources are merged, direct value flags such as `--language en`
+override the resulting configuration.
 
 ### Example Configuration (`config.toml`)
 
@@ -67,8 +71,8 @@ language = "es"
 
 # Maximum recording time in seconds.
 # The daemon will automatically stop and process the audio if this limit is reached.
-# Default is 300 seconds (5 minutes). Set to a higher value for long dictations,
-# or lower to prevent memory abuse.
+# This example sets 300 seconds (5 minutes); when the field is omitted,
+# the daemon default is 600 seconds (10 minutes). Lower it to prevent memory abuse.
 max_recording_seconds = 300
 ```
 
@@ -203,7 +207,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the sockets are created at `0600` **atomically at `bind(2)` time** via `umask 0o177`, so there is no follow-up `chmod` and no TOCTOU window. The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove the sockets on stop. Override the location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check that confirms it is owned by the current UID, so an attacker cannot redirect the bind to a foreign socket. The shared helper (`telora_common::socket_bind::bind_unix_socket`) wraps the umask tightening in an RAII guard so it is restored even if the bind panics.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is tightened to `0600` through the pinned parent directory. The helper does not mutate the process-global umask. The remaining symlink-swap limitation is described in [Socket bind hardening](#socket-bind-hardening). All three systemd units (`telora.service`, `telora-daemon.service`, `telora-daemon.socket`) declare `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`; the socket unit's `RemoveOnStop=yes` removes the daemon socket inode when the socket is stopped, so no `ExecStopPost` is required. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -251,6 +255,15 @@ Both tools print the same view; `telora-models` exists only for
 backwards compatibility with the pre-voxora packaging recipes and
 will be retired (see `TODO.md`).
 
+To use a different cache location, pass `--voxora-cache DIR` to the
+`telora-daemon` or `telora-models` command, or set `VOXORA_CACHE_DIR`.
+The CLI value takes precedence over the environment value. Absolute
+paths must remain under `$XDG_CACHE_HOME`; traversal components,
+whitespace-padded values, and escaping or dangling symlink prefixes are
+rejected and fall back to the XDG default. Relative paths are retained
+for backwards compatibility and are resolved relative to the process
+working directory.
+
 ### Model Resolution (Precedence)
 
 When the daemon resolves `model_id`, it goes through voxora-hf's
@@ -264,10 +277,29 @@ there on first use. There is no per-user / per-system split anymore
 Start the assistant (this will automatically start the background daemon):
 
 ```bash
-systemctl --user enable --now telora.service
+systemctl --user daemon-reload
+systemctl --user enable --now telora-daemon.socket telora.service
 ```
 
-The `telora` systemd service launches `telora-gui` (the Wayland OSD overlay), which in turn communicates with `telora-daemon` (the audio engine). Systemd handles both for you.
+`telora-daemon.socket` is the on-demand activation listener for the audio
+daemon — systemd starts `telora-daemon` the first time anything connects to
+`daemon.sock`. `telora.service` is the persistent Wayland OSD (`telora-gui`).
+The GUI's `Requires=telora-daemon.socket` ensures the listener is up before
+the GUI launches. Without enabling both, the GUI will sit idle waiting for
+the socket that the daemon never starts.
+
+### Development / ad-hoc runs
+
+Outside systemd (dev shells, CI, ad-hoc debugging) start the binaries
+directly. The daemon needs `--no-activation` to skip the systemd
+`LISTEN_FDS` lookup and bind `daemon.sock` manually under
+`$XDG_RUNTIME_DIR/telora/`. The GUI does not need any flag — its
+`bind_unix_socket` path is already filesystem-only.
+
+```bash
+RUST_LOG=info ./bin/telora-daemon --no-activation
+RUST_LOG=info ./bin/telora-gui
+```
 
 ## Troubleshooting
 
@@ -275,14 +307,17 @@ The `telora` systemd service launches `telora-gui` (the Wayland OSD overlay), wh
 
 **Sockets**: by default, `telora-daemon` and `telora-gui` place their Unix
 sockets under `$XDG_RUNTIME_DIR/telora/` (typically
-`/run/user/<uid>/telora/`). The directory is created by systemd
-(`RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700` in
-`telora-daemon.service` and `telora.service`) and torn down on
-`systemctl --user stop`.
+`/run/user/<uid>/telora/`). The directory is created by systemd on all
+three units (`RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700` on
+`telora.service`, `telora-daemon.service`, and `telora-daemon.socket`) so
+the GUI can still bind `control.sock` even if the daemon socket is
+stopped. The socket inode itself is removed by `RemoveOnStop=yes` on
+`telora-daemon.socket`; no `ExecStopPost` is required.
 
-**Override the location**: set `[paths] socket_dir = "..."` in
-`telora.toml` (or `TELORA_PATHS__SOCKET_DIR=/tmp/foo`); both
-daemon and CLI respect the cascade.
+**Override the daemon location**: set `[paths] socket_dir = "..."` in
+`telora.toml` or `TELORA_PATHS__SOCKET_DIR=/tmp/foo`. These settings are
+read by the daemon configuration cascade; the GUI and CLI use the shared
+XDG runtime cascade and should run in the same user session.
 
 **Inspect live sockets**:
 
@@ -291,47 +326,48 @@ ss -lx | grep telora
 ls -la /run/user/$(id -u)/telora/
 ```
 
-**Legacy `/tmp/telora-sock` from before the XDG migration**:
-removing it manually is a one-liner:
+**Last-resort `/tmp/telora-<uid>/` fallback**: if `XDG_RUNTIME_DIR`
+is unset and `/run/user/<uid>` is not writable, the resolver logs the
+fallback and uses per-user `daemon.sock` and `control.sock` files there.
+Inspect the directory with:
 
 ```sh
-sudo rm -f /tmp/telora-sock /tmp/telora-control.sock
+ls -la /tmp/telora-$(id -u)/
 ```
 
-or with the AUR package's `pre_remove` hook:
+Remove an obsolete per-user fallback after stopping Telora with:
 
 ```sh
-sudo pacman -Rns telora-bin
+rm -rf /tmp/telora-$(id -u)
 ```
 
-**EPERM on bind (historical)**: this was the original symptom of
-a stale `/tmp/telora-sock` owned by another UID. After the XDG
-migration it can no longer happen — the runtime dir is owned by
-the current user and torn down by systemd. If you still see it,
-your `[paths] socket_dir` is pointing at `/tmp` and a stale file
-is blocking the bind; remove it as above.
+**EPERM on bind (historical)**: current systemd installations create a
+private runtime directory with mode `0700` and sockets with mode `0600`. If you
+still see a bind error, inspect `[paths] socket_dir` and remove only a
+stale socket owned by your user.
 
-### Known limitation: `bind(2)` does not set `O_NOFOLLOW`
+### Socket bind hardening
 
-The daemon and GUI sockets are created with `umask 0o177` so the
-mode is `0o600` atomically inside `bind(2)`, but the bind itself
-does **not** pass `O_NOFOLLOW`. A symlink swap race between the
-`symlink_metadata` ownership pre-check and the `bind(2)` syscall
-is therefore theoretically open for the duration of one scheduling
-slice. The current defence is the `symlink_metadata` pre-check
-plus umask enforcement — adequate for the EPIC's stated threat
-model (stale socket owned by another UID on the same machine) but
-not a full TOCTOU fix. Adding `O_NOFOLLOW` to the bind path
-(open the parent directory with `O_PATH`, then
-`linkat(AT_FDCWD, name, parent_fd, name, AT_EMPTY_PATH)`) is
-tracked as a mid-term follow-up.
+The shared bind helper creates the parent directory with mode `0700`. On Linux
+it opens the immediate parent with `O_PATH | O_NOFOLLOW | O_DIRECTORY`, keeps
+that directory descriptor alive through `bind(2)`, and applies `chmod 0600`
+relative to the pinned directory. Existing symlinks, directories, and regular
+files at the socket name are rejected; stale socket files owned by the current
+UID are removed to preserve restart idempotency.
+
+Linux `bind(2)` does not accept an `O_NOFOLLOW` flag, so the helper rejects a
+final-name symlink before calling it and pins the parent path independently.
+A same-UID process can still race the final name and cause a bind conflict,
+so this is not a complete atomic-publish solution. Systemd socket activation
+remains the strongest production mitigation because systemd owns the listening
+socket before the service starts.
 
 ## Development
 
 ### Workspace layout
 
 ```
-telora-common/    Shared library: socket-path resolver + atomic bind helper
+telora-common/    Shared paths, Unix-socket bind, and Voxora cache policy
 telora-daemon/    Audio capture + STT engine + IPC socket server
 telora-gui/       GTK4 Wayland OSD overlay + GUI control socket
 telora-ctl/       CLI control client (binary `telora`)
@@ -339,9 +375,11 @@ telora-models/    Thin voxora-hf wrapper (legacy, see TODO.md)
 ```
 
 `telora-common` owns the socket-path resolver (`paths::resolve`,
-`paths::daemon_socket_path`, `paths::control_socket_path`) and the
-`umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`). All
-three binaries consume that surface; new shared types belong there.
+`paths::daemon_socket_path`, `paths::control_socket_path`), the
+Linux-hardened Unix-bind helper (`socket_bind::bind_unix_socket`), and the
+Voxora cache policy (`cache::resolve_voxora_cache`). The daemon, GUI, CLI,
+and legacy model wrapper consume the relevant parts of that shared surface;
+new shared types belong there only when they preserve the leaf-crate boundary.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full structure and
 license notes.
 
@@ -377,6 +415,14 @@ git reset --hard origin/main
 ```bash
 git log --oneline -1   # expect: <sha> chore(release): vX.Y.Z — ...
 grep '^version' Cargo.toml   # expect: version = "X.Y.Z"
+```
+
+Before tagging, validate the committed lockfile with the same release command
+used by GitHub Actions. If this changes `Cargo.lock`, stop, commit the change,
+and repeat the verification from the resulting merge commit:
+
+```bash
+cargo build --release --locked --workspace --bins
 ```
 
 ③ **Tag with `-s` (GPG-signed), pointing at the merge SHA.** Never tag a local-only commit before it reaches `main`, and never tag a branch tip that will be squashed.

@@ -32,13 +32,8 @@ anyhow = "1.0"
 tokio = { version = "1.36", features = ["full"] }
 log = "0.4"
 telora-common = { workspace = true }
-# Used by `paths::default_voxora_cache_dir` to resolve
-# `$XDG_CACHE_HOME/voxora/models/huggingface` when neither
-# `--voxora-cache` nor `VOXORA_CACHE_DIR` is set. The
-# voxora-hf 0.2 default-features change removed the equivalent
-# `dirs::cache_dir()` cascade from `voxora-config`, which is
-# why we now resolve it ourselves on the telora side.
-dirs = "5"
+# The shared cache resolver lives in telora-common; keep the daemon focused
+# on its runtime and model-loading responsibilities.
 env_logger = "0.11"
 hound = "3.5"
 socket2 = "0.5"

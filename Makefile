@@ -29,6 +29,7 @@ install:
 	install -Dm755 $(CTL_BIN) $(DESTDIR)$(BINDIR)/telora
 	install -Dm755 $(MANAGER_BIN) $(DESTDIR)$(BINDIR)/telora-models
 	install -Dm644 systemd/telora-daemon.service $(DESTDIR)$(SYSTEMD_USER_DIR)/telora-daemon.service
+	install -Dm644 systemd/telora-daemon.socket $(DESTDIR)$(SYSTEMD_USER_DIR)/telora-daemon.socket
 	install -Dm644 systemd/telora.service $(DESTDIR)$(SYSTEMD_USER_DIR)/telora.service
 	install -Dm644 telora.toml $(DESTDIR)/etc/telora.toml
 	mkdir -p $(DESTDIR)$(DATADIR)/telora/models

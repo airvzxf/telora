@@ -3,12 +3,17 @@ use clap::{Parser, Subcommand};
 use config::{Config, File};
 use log::{error, info, warn};
 use ringbuf::HeapRb;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use telora_common::cache::resolve_voxora_cache;
 use telora_daemon::{
     AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
-    Transcriber, paths, resolve_voxora_cache, telora_env_source,
+    Transcriber, paths, telora_env_source,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
@@ -46,9 +51,16 @@ struct Args {
     #[arg(long)]
     max_recording_seconds: Option<u32>,
 
-    /// Hugging Face cache directory (overrides config).
+    /// Skip systemd socket activation and bind the daemon socket manually
+    /// in `$XDG_RUNTIME_DIR/telora/daemon.sock`. Use this when running the
+    /// daemon outside systemd (development, CI, ad-hoc debugging) without
+    /// inheriting `LISTEN_FDS` from a parent shell.
     #[arg(long)]
-    voxora_cache: Option<String>,
+    no_activation: bool,
+
+    /// Hugging Face cache directory (overrides config).
+    #[arg(long, value_name = "DIR")]
+    voxora_cache: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -91,8 +103,8 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     }
 
     // 4. Environment variables - Highest priority. The source
-    // construction is centralised in [`telora_env_source`] (the
-    // daemon's voxora-cache helper module) because `config` 0.13's
+    // construction is centralised in [`telora_env_source`] (the daemon's
+    // `TELORA_*` environment-source helper) because `config` 0.13's
     // defaults silently drop `TELORA_PATHS__SOCKET_DIR`; see that
     // helper's rustdoc for the why. The integration test
     // `telora-daemon/tests/config_env_cascade.rs` calls the same
@@ -414,24 +426,20 @@ async fn main() -> Result<()> {
     // a re-download against the new (wrong) root — airvzxf/telora#79
     // took that exact shape from a different cause.
     //
-    // Empty CLI / env strings are filtered out so `--voxora-cache ""`
-    // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default
-    // (asymmetric handling here would silently point the cache at
-    // CWD-relative ".cache", per airvzxf/telora#79).
+    // Empty environment values fall through to the XDG default. clap rejects
+    // an empty `--voxora-cache=` value before it reaches this resolver.
+    // A non-empty CLI override has precedence; if it fails validation,
+    // resolution goes directly to the XDG default rather than silently
+    // selecting the lower-priority environment value.
     //
-    // BOTH override sources flow through
-    // [`resolve_voxora_cache`], which routes the candidate through
-    // [`sanitize_voxora_cache_override`]. An earlier version
-    // short-circuited on `args.voxora_cache` / `VOXORA_CACHE_DIR`
-    // here, which meant `VOXORA_CACHE_DIR=/tmp/foo/../bar` was
-    // accepted verbatim and the F2 commit's claim that the
-    // sanitiser gates the override was false. Going through the
-    // helper closes that gap.
-    let voxora_cache = resolve_voxora_cache(
-        args.voxora_cache.as_deref(),
-        std::env::var("VOXORA_CACHE_DIR").ok().as_deref(),
-    )
-    .context("resolving voxora cache directory")?;
+    // Both override sources flow through the shared resolver and its
+    // traversal/symlink checks. An earlier daemon-only implementation
+    // short-circuited on the raw override and accepted
+    // `VOXORA_CACHE_DIR=/tmp/foo/../bar` verbatim.
+    let env_cache_override = std::env::var_os("VOXORA_CACHE_DIR").map(PathBuf::from);
+    let voxora_cache =
+        resolve_voxora_cache(args.voxora_cache.as_deref(), env_cache_override.as_deref())
+            .context("resolving voxora cache directory")?;
 
     // Tighten the cache directory's mode so other local users cannot
     // read model weights or plant a symlink that whisper.cpp's mmap
@@ -475,7 +483,8 @@ async fn main() -> Result<()> {
     };
     let resolved_paths = paths::resolve(&paths_cfg)?;
     let socket_server =
-        SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx).context("Failed to bind socket")?;
+        SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, !args.no_activation)
+            .context("Failed to bind socket")?;
 
     tokio::spawn(async move {
         socket_server.run().await;
@@ -494,7 +503,33 @@ async fn main() -> Result<()> {
         resolved_paths.daemon_sock.display()
     );
 
+    // Graceful shutdown: systemd sends SIGTERM on
+    // `systemctl --user stop telora-daemon.socket`; without a handler the
+    // loop dies abruptly with no log and no chance to drop the audio
+    // engine or socket server cleanly. SIGINT lets Ctrl-C in a dev shell
+    // do the same.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown_signal = Arc::clone(&shutdown);
+        let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => info!("Received SIGTERM; initiating graceful shutdown"),
+                _ = sigint.recv()  => info!("Received SIGINT; initiating graceful shutdown"),
+            }
+            shutdown_signal.store(true, Ordering::SeqCst);
+        });
+    }
+
     loop {
+        // Check shutdown flag at every tick (idle tick is 5 ms) so SIGTERM
+        // and SIGINT from systemd / Ctrl-C drain the loop promptly.
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown flag set; exiting event loop");
+            break;
+        }
+
         // Non-blocking check for commands
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -660,4 +695,7 @@ async fn main() -> Result<()> {
             audio_buffer.clear();
         }
     }
+
+    info!("Telora daemon stopped cleanly");
+    Ok(())
 }

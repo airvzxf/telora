@@ -588,7 +588,7 @@ jobs:
           tar -tf "$PKG" | sort
           tar -tf "$PKG" | grep -E '^usr/bin/(telora-daemon|telora-gui|telora|telora-models)$' \
             || { echo "ERROR: AUR package missing one or more binaries"; exit 1; }
-          tar -tf "$PKG" | grep -E '^usr/lib/systemd/user/telora.*\.service$' \
+          tar -tf "$PKG" | grep -E '^usr/lib/systemd/user/telora.*\.(service|socket)$' \
             || { echo "ERROR: AUR package missing systemd units"; exit 1; }
           tar -tf "$PKG" | grep -E '^etc/telora\.toml$' \
             || { echo "ERROR: AUR package missing /etc/telora.toml"; exit 1; }
