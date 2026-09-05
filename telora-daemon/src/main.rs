@@ -602,6 +602,17 @@ async fn main() -> Result<()> {
                     let needs_reload = new_config.model_id != stt_config.model_id
                         || new_config.model_kind != stt_config.model_kind;
                     if needs_reload {
+                        // #94 — drop the old engine BEFORE we start
+                        // loading the new one. Otherwise peak RSS
+                        // during the swap is `old_engine +
+                        // new_engine + build_scratch`, which OOMs
+                        // 16 GB laptops swapping between a
+                        // `ggml-large-v3.bin` (~3 GB) and a
+                        // Qwen3-ASR (~1.7 GB). Installing the
+                        // `NoopTranscriber` sentinel keeps the
+                        // `Processing` branch safe if a STOP
+                        // arrives in the swap window.
+                        transcriber = Box::new(NoopTranscriber);
                         match build_transcriber(&new_config, voxora_cache.clone()).await {
                             Ok((new_transcriber, resolved_path)) => {
                                 transcriber = new_transcriber;
@@ -617,6 +628,10 @@ async fn main() -> Result<()> {
                                 // stt_config and transcriber are
                                 // intentionally left untouched on
                                 // failure — atomicity guarantee.
+                                // The `NoopTranscriber` we just
+                                // installed stays in place so the
+                                // daemon can still answer
+                                // STATUS / transcribe (returns "").
                             }
                         }
                     } else {
