@@ -166,10 +166,12 @@ fn bind_unix_socket_impl(
             // `try_inherited_listener` (descriptor count, fallback reason).
             return Ok(listener);
         }
-        info!(
-            "Skipping systemd socket activation for {instance_name}; binding {path} manually",
-            path = path.display(),
-        );
+        // Fall through to manual bind: no `info!` here so the
+        // subsequent "Listening on unix socket" line is the only
+        // breadcrumb. Logging the path was redundant and was flagged
+        // by CodeQL's cleartext-logging rule on this branch (the
+        // path is already redacted on the bind-failure path; we
+        // avoid the false positive by not adding a second log).
     }
 
     ensure_parent_dir(path)?;
