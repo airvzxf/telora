@@ -416,8 +416,8 @@ async fn main() -> Result<()> {
     // a re-download against the new (wrong) root — airvzxf/telora#79
     // took that exact shape from a different cause.
     //
-    // Empty CLI / env strings are filtered out so `--voxora-cache ""`
-    // and `VOXORA_CACHE_DIR=""` both fall through to the XDG default.
+    // Empty environment values fall through to the XDG default. clap rejects
+    // an empty `--voxora-cache=` value before it reaches this resolver.
     // A non-empty CLI override has precedence; if it fails validation,
     // resolution goes directly to the XDG default rather than silently
     // selecting the lower-priority environment value.

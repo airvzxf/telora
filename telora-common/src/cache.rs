@@ -49,16 +49,21 @@ pub fn resolve_voxora_cache(
     args_override: Option<&Path>,
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(args_override) = args_override.filter(|path| !is_blank(path)) {
+    if let Some(args_override) = args_override {
+        if is_blank(args_override) {
+            return xdg_default_cache_dir();
+        }
         if let Some(accepted) = sanitize_with_source(args_override, "--voxora-cache") {
             return Ok(accepted);
         }
         return xdg_default_cache_dir();
     }
 
-    if let Some(env_override) = env_override.filter(|path| !is_blank(path)) {
-        if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
-            return Ok(accepted);
+    if let Some(env_override) = env_override {
+        if !is_blank(env_override) {
+            if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
+                return Ok(accepted);
+            }
         }
     }
 
@@ -94,10 +99,8 @@ fn sanitize_with_source(candidate: &Path, source: &str) -> Option<PathBuf> {
         return None;
     }
 
-    if candidate
-        .to_str()
-        .is_some_and(|value| value != value.trim())
-    {
+    let lossy_candidate = candidate.to_string_lossy();
+    if lossy_candidate != lossy_candidate.trim() {
         log::warn!(
             "{source}={candidate:?} has leading or trailing whitespace; \
              ignoring and falling back to the XDG default"
@@ -180,7 +183,7 @@ fn is_blank(path: &Path) -> bool {
         return true;
     }
 
-    path.to_str().is_some_and(|value| value.trim().is_empty())
+    path.to_string_lossy().trim().is_empty()
 }
 
 fn has_dangling_symlink_prefix(path: &Path) -> bool {
@@ -244,6 +247,8 @@ fn canonicalize_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -435,12 +440,17 @@ mod tests {
         let _lock = lock_env();
         let (root, _env) = test_cache_root();
         let bad_cli = Path::new("/tmp/another-cli-test/cache/../elsewhere");
+        let blank_cli = Path::new("\t");
         let safe_env = root.path().join("env-cache");
 
         let resolved =
             resolve_voxora_cache(Some(bad_cli), Some(&safe_env)).expect("default resolves");
         assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
         assert_ne!(resolved, safe_env);
+        let blank_resolved =
+            resolve_voxora_cache(Some(blank_cli), Some(&safe_env)).expect("default resolves");
+        assert!(blank_resolved.ends_with(Path::new("voxora/models/huggingface")));
+        assert_ne!(blank_resolved, safe_env);
     }
 
     #[test]
@@ -477,5 +487,19 @@ mod tests {
         assert!(sanitize_voxora_cache_override(Path::new(" /tmp/escape")).is_none());
         assert!(sanitize_voxora_cache_override(Path::new("/tmp/escape ")).is_none());
         assert!(sanitize_voxora_cache_override(Path::new("relative/../escape")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_path_with_trailing_whitespace() {
+        let _lock = lock_env();
+        let (root, _env) = test_cache_root();
+        let mut bytes = root.path().as_os_str().as_bytes().to_vec();
+        bytes.extend_from_slice(b"/cache");
+        bytes.push(0xff);
+        bytes.push(b' ');
+        let candidate = PathBuf::from(OsString::from_vec(bytes));
+
+        assert!(sanitize_voxora_cache_override(&candidate).is_none());
     }
 }
