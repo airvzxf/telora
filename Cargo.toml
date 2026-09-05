@@ -3,7 +3,7 @@ resolver = "2"
 members = ["telora-common", "telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 # Pinned to voxora-bridge 0.4.x's MSRV as published on crates.io
 # (voxora-bridge 0.3+ bumped the MSRV to 1.86). The CI workflow
