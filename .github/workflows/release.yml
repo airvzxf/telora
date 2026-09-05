@@ -369,6 +369,20 @@ jobs:
           "${ART_DIR}/telora" --version
           "${ART_DIR}/telora-models" --version
 
+      - name: Write .syft.yaml for SBOM source metadata
+        # Syft does not interpolate workflow expressions inside a
+        # checked-in `.syft.yaml`, and env-var expansion in the
+        # config file is unreliable across Syft versions. Generate
+        # the config from the validated tag so the SBOM's
+        # `metadata.component` matches the actual release.
+        run: |
+          TAG="${{ needs.validate-tag-input.outputs.tag }}"
+          VERSION="${TAG#v}"
+          printf 'source:\n  name: telora\n  version: %s\n' "${VERSION}" \
+            > .syft.yaml
+          echo "Wrote .syft.yaml:"
+          cat .syft.yaml
+
       - name: Generate SBOM (CycloneDX JSON)
         # Anchore's sbom-action builds a CycloneDX JSON in-tree.
         # The default 'docker' build-mode would spin Docker; we use
@@ -376,16 +390,17 @@ jobs:
         # (transitive deps from Cargo.lock, licenses from Cargo.toml,
         # project metadata from the workspace package).
         #
-        # The action (v0.24.0) does NOT accept `source-name` /
-        # `source-version` as direct inputs; Syft's source metadata
-        # is configured via a `.syft.yaml` config file referenced
-        # through `with: config:`. Adding a Syft config file is out
-        # of scope for this release fix; the SBOM continues to
-        # report source as "directory@<sha>" until that lands.
+        # Source metadata is supplied through `.syft.yaml` (the
+        # v0.24.0 action does NOT accept `source-name` /
+        # `source-version` as direct inputs). The config file is
+        # generated at runtime from the validated tag so the SBOM's
+        # `metadata.component` carries the actual release version
+        # instead of the placeholder `directory@<sha>`.
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           format: cyclonedx-json
           artifact-name: telora.sbom.cdx.json
+          config: .syft.yaml
 
       - name: Download SBOM into workspace
         # anchore/sbom-action no longer writes the SBOM to the
