@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use telora_common::cache::resolve_voxora_cache;
 use telora_daemon::{
-    AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
-    Transcriber, paths, telora_env_source,
+    AudioEngine, BridgeTranscriber, Command, DaemonConfig, NoopTranscriber, SocketServer,
+    StatusResponse, SttConfig, Transcriber, paths, telora_env_source,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
 async fn notify_client_auto_stop(control_socket: &str) {
@@ -76,6 +76,21 @@ enum State {
     Idle,
     Recording,
     Processing,
+}
+
+/// State shared between the main event loop and the REFRESH
+/// background task. Wrapped in `Arc<tokio::sync::RwLock<_>>` so the
+/// rebuild path can run on a spawned task (issue #93) while the
+/// main loop keeps `STATUS` / `START` / `STOP` responsive.
+///
+/// Atomicity contract: the engine swap and the `stt_config` mutation
+/// commit together under a single write lock — see the REFRESH
+/// handler below. While the rebuild runs, the engine is replaced by
+/// a [`NoopTranscriber`] sentinel so any in-flight transcribe call
+/// returns an empty string instead of panicking on a `None` engine.
+struct DaemonState {
+    transcriber: Box<dyn Transcriber>,
+    stt_config: SttConfig,
 }
 
 /// Load and merge configuration from the four-tier cascade
@@ -454,11 +469,21 @@ async fn main() -> Result<()> {
     info!("Model id:   {}", stt_config.model_id);
     info!("Language:   {}", stt_config.language);
 
-    // 1. Initialize Components — voxora engine via BridgeTranscriber
-    let (mut transcriber, resolved_path) = build_transcriber(&stt_config, voxora_cache.clone())
+    // 1. Initialize Components — voxora engine via BridgeTranscriber.
+    // The engine and its config are bundled into a `DaemonState` and
+    // wrapped in `Arc<RwLock<_>>` so the REFRESH handler can rebuild
+    // the engine on a `tokio::spawn`'d task (issue #93) without
+    // blocking the event loop on a multi-second / multi-minute
+    // model load.
+    let (initial_transcriber, resolved_path) = build_transcriber(&stt_config, voxora_cache.clone())
         .await
         .context("Failed to load voxora engine")?;
     stt_config.model_path = resolved_path;
+
+    let daemon_state = Arc::new(RwLock::new(DaemonState {
+        transcriber: initial_transcriber,
+        stt_config,
+    }));
 
     // Audio Engine initialization
     let rb = HeapRb::<f32>::new(16000 * 30); // 30 seconds buffer
@@ -566,19 +591,22 @@ async fn main() -> Result<()> {
                     pending_result = None;
                 }
                 Command::GetStatus { response_tx } => {
-                    let status_resp = StatusResponse {
-                        active: true,
-                        pid: std::process::id(),
-                        model_id: stt_config.model_id.clone(),
-                        model_kind: stt_config.model_kind.clone(),
-                        model_path: stt_config.model_path.clone(),
-                        language: stt_config.language.clone(),
-                        max_recording_seconds: stt_config.max_recording_seconds,
-                        state: match state {
-                            State::Idle => "Idle".to_string(),
-                            State::Recording => "Recording".to_string(),
-                            State::Processing => "Processing".to_string(),
-                        },
+                    let status_resp = {
+                        let s = daemon_state.read().await;
+                        StatusResponse {
+                            active: true,
+                            pid: std::process::id(),
+                            model_id: s.stt_config.model_id.clone(),
+                            model_kind: s.stt_config.model_kind.clone(),
+                            model_path: s.stt_config.model_path.clone(),
+                            language: s.stt_config.language.clone(),
+                            max_recording_seconds: s.stt_config.max_recording_seconds,
+                            state: match state {
+                                State::Idle => "Idle".to_string(),
+                                State::Recording => "Recording".to_string(),
+                                State::Processing => "Processing".to_string(),
+                            },
+                        }
                     };
                     let _ = response_tx.send(status_resp);
                 }
@@ -590,44 +618,85 @@ async fn main() -> Result<()> {
                         "Command: REFRESH (model_kind={} model_id={})",
                         new_config.model_kind, new_config.model_id
                     );
-                    // Atomicity: the engine swap and the config
-                    // mutation MUST happen together. Build the new
-                    // transcriber FIRST and only commit the new
-                    // `stt_config` on success — otherwise a failed
-                    // model load (wrong id, mmap error, …) would
-                    // leave the daemon reporting the new model_id /
-                    // model_kind in `STATUS` while transcription
-                    // still runs through the old engine. Silent
-                    // corruption: a closed ticket of #79's shape.
-                    let needs_reload = new_config.model_id != stt_config.model_id
-                        || new_config.model_kind != stt_config.model_kind;
-                    if needs_reload {
-                        match build_transcriber(&new_config, voxora_cache.clone()).await {
-                            Ok((new_transcriber, resolved_path)) => {
-                                transcriber = new_transcriber;
-                                stt_config = new_config;
-                                stt_config.model_path = resolved_path;
-                                info!("Transcriber reloaded successfully.");
-                                let _ = response_tx.send(Ok(()));
-                            }
-                            Err(e) => {
-                                error!("Failed to reload transcriber: {}", e);
-                                let _ = response_tx
-                                    .send(Err(anyhow::anyhow!("Failed to load model: {}", e)));
-                                // stt_config and transcriber are
-                                // intentionally left untouched on
-                                // failure — atomicity guarantee.
-                            }
-                        }
-                    } else {
+                    // Atomicity contract (issue #93): the engine
+                    // swap and the `stt_config` mutation commit
+                    // together under the same `RwLock` write guard.
+                    // Cheap path (no model change) commits the
+                    // config delta inline; needs-reload path
+                    // `tokio::spawn`s the rebuild so the main loop
+                    // keeps ticking through the multi-second /
+                    // multi-minute engine load.
+                    let needs_reload = {
+                        let s = daemon_state.read().await;
+                        new_config.model_id != s.stt_config.model_id
+                            || new_config.model_kind != s.stt_config.model_kind
+                    };
+                    if !needs_reload {
                         // No engine swap needed, but other fields
                         // (language, max_recording_seconds) still
                         // need to take effect. The new config is
                         // safe to commit because no engine load
                         // happened.
-                        stt_config = new_config;
+                        let mut s = daemon_state.write().await;
+                        s.stt_config = new_config;
                         info!("Configuration updated (no model change).");
                         let _ = response_tx.send(Ok(()));
+                    } else {
+                        // Hand the rebuild off to a spawned task so
+                        // the event loop keeps draining commands
+                        // (STATUS / START / STOP) while the new
+                        // engine loads. The `oneshot::Sender`
+                        // survives the move — it is `Send + 'static`
+                        // — so the socket handler's `rx.await` sees
+                        // the result when this task eventually fires
+                        // `.send(Ok(()))` or drops the sender.
+                        let daemon_state_bg = Arc::clone(&daemon_state);
+                        let voxora_cache_bg = voxora_cache.clone();
+                        tokio::spawn(async move {
+                            // Clone `new_config` so we can both
+                            // commit the metadata under the lock
+                            // and use the original to build the
+                            // new engine.
+                            let new_config_for_build = new_config.clone();
+
+                            // Step 1: drop the old engine first
+                            // (#94). Installing a `NoopTranscriber`
+                            // sentinel under the write lock keeps
+                            // any in-flight `transcribe` call safe
+                            // (returns `""`) and lets `STATUS`
+                            // immediately reflect the new
+                            // `model_id` / `model_kind` the user
+                            // just asked for.
+                            {
+                                let mut s = daemon_state_bg.write().await;
+                                s.transcriber = Box::new(NoopTranscriber);
+                                s.stt_config = new_config;
+                            } // old engine dropped here, lock released
+
+                            // Step 2: build the new engine outside
+                            // the lock. This is the multi-second /
+                            // multi-minute await we used to do on
+                            // the event loop — now off-loaded to a
+                            // worker.
+                            match build_transcriber(&new_config_for_build, voxora_cache_bg).await {
+                                Ok((new_transcriber, resolved_path)) => {
+                                    let mut s = daemon_state_bg.write().await;
+                                    s.transcriber = new_transcriber;
+                                    s.stt_config.model_path = resolved_path;
+                                    info!("Transcriber reloaded successfully.");
+                                    let _ = response_tx.send(Ok(()));
+                                }
+                                Err(e) => {
+                                    error!("Failed to reload transcriber: {}", e);
+                                    let _ = response_tx
+                                        .send(Err(anyhow::anyhow!("Failed to load model: {}", e)));
+                                    // `NoopTranscriber` stays in
+                                    // place — the daemon still
+                                    // answers STATUS and
+                                    // transcribe (returns "").
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -644,13 +713,17 @@ async fn main() -> Result<()> {
 
             // If Recording, save to buffer
             if state == State::Recording {
-                // Safety limit: User-defined or default maximum time
-                if audio_buffer.len() < 16000 * stt_config.max_recording_seconds as usize {
+                // Safety limit: User-defined or default maximum time.
+                // Snapshot the limit under the read lock so a
+                // REFRESH that lands mid-recording doesn't race with
+                // the buffer-cap check.
+                let max_seconds = daemon_state.read().await.stt_config.max_recording_seconds;
+                if audio_buffer.len() < 16000 * max_seconds as usize {
                     audio_buffer.extend_from_slice(&chunk_buf);
                 } else {
                     warn!(
                         "Audio buffer limit reached ({}s). Stopping recording automatically.",
-                        stt_config.max_recording_seconds
+                        max_seconds
                     );
                     state = State::Processing;
                     // Notify client to stop UI and request result
@@ -675,7 +748,17 @@ async fn main() -> Result<()> {
                 warn!("Audio buffer empty, skipping transcription.");
                 "".to_string()
             } else {
-                match transcriber.transcribe(&audio_buffer, Some(&stt_config.language)) {
+                // Read-lock just for the transcribe call. The guard
+                // is dropped at the end of the `match` because
+                // `transcribe` is fully synchronous (no `.await`
+                // inside) — that is what lets the spawned REFRESH
+                // task take a write lock between transcribe calls
+                // without deadlocking the read guard.
+                let s = daemon_state.read().await;
+                match s
+                    .transcriber
+                    .transcribe(&audio_buffer, Some(&s.stt_config.language))
+                {
                     Ok(text) => text,
                     Err(e) => {
                         error!("Transcription failed: {}", e);

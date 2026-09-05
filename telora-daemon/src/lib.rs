@@ -76,7 +76,7 @@ pub fn resolve_voxora_cache(
 // otherwise-private `audio` and `transcriber` modules. Tests do not
 // touch these; they are surfaced strictly for the binary wiring.
 pub use audio::AudioEngine;
-pub use transcriber::{BridgeTranscriber, Transcriber};
+pub use transcriber::{BridgeTranscriber, NoopTranscriber, Transcriber};
 
 #[cfg(test)]
 mod voxora_migration_pins {
