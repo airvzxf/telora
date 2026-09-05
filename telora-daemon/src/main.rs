@@ -487,6 +487,24 @@ async fn main() -> Result<()> {
         socket_server.run().await;
     });
 
+    // Type=notify: signal systemd that we are ready to accept
+    // connections. Without this, the unit's `Type=simple` flips
+    // `ActiveState=active` before the model has loaded and the
+    // socket has bound, opening a startup-race window where a
+    // client `telora-daemon status` reports `STOPPED` while the
+    // daemon is mid-load. The call is gated on `NOTIFY_SOCKET`
+    // (set by systemd) and `target_os = "linux"` so non-systemd
+    // invocations (development shell, CI) do not produce noisy
+    // error logs.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            if let Err(e) = libsystemd::daemon::notify(true, &[libsystemd::daemon::STATE_READY]) {
+                log::warn!("sd_notify(READY=1) failed: {}", e);
+            }
+        }
+    }
+
     // 2. Event Loop
     let mut state = State::Idle;
     let mut audio_buffer: Vec<f32> = Vec::with_capacity(16000 * 30); // Linear buffer for recording

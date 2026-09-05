@@ -5,7 +5,7 @@ Wants=pipewire.service
 Requires=telora-daemon.socket
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/telora-daemon
 Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
 Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
