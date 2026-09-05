@@ -15,10 +15,12 @@ Shared library crate for the telora workspace.
   - `ensure_dir_0700()` — recursive `mkdir` plus a defensive
     post-create `mode & 0o077 != 0` re-check.
 - **`socket_bind`** — the Unix-socket bind helper shared by the daemon and
-  GUI. It pins the Linux parent directory with `O_PATH | O_NOFOLLOW`, removes
-  only current-user stale sockets, rejects non-socket entries, and applies
-  `chmod 0o600` through the pinned directory without changing the process
-  umask.
+  GUI. In the daemon it adopts a validated systemd listener when
+  `LISTEN_PID`/`LISTEN_FDS` are present; otherwise it uses the manual path.
+  The manual path pins the Linux parent directory with `O_PATH | O_NOFOLLOW`,
+  removes only current-user stale sockets, rejects non-socket entries, and
+  applies `chmod 0o600` through the pinned directory without changing the
+  process umask.
 - **`cache`** — Voxora model-cache resolution shared by `telora-daemon` and
   the legacy `telora-models` wrapper. It preserves the
   `voxora/models/huggingface` layout and rejects traversal and absolute paths

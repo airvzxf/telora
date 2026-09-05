@@ -12,6 +12,8 @@ post_install() {
     echo "::     telora-models download ggerganov/whisper.cpp/ggml-base.bin"
     echo ":: "
     echo ":: You can also list available models with 'telora-models list'."
+    echo ":: To enable socket activation, run:"
+    echo "::     systemctl --user enable --now telora-daemon.socket"
 }
 
 pre_upgrade() {
@@ -31,6 +33,7 @@ post_upgrade() {
 }
 
 pre_remove() {
+    systemctl --user disable --now telora-daemon.socket >/dev/null 2>&1 || true
     if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
         systemctl --user stop telora-daemon.service || true
         systemctl --user disable telora-daemon.service || true

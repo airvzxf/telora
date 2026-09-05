@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use telora_common::paths;
-use telora_common::socket_bind::bind_unix_socket;
+use telora_common::socket_bind::{bind_unix_socket, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -42,8 +42,12 @@ impl ControlServer {
     /// EADDRINUSE remediation hint points at a previous GUI session
     /// (the daemon's `systemctl --user status telora-daemon` hint
     /// would be wrong here).
-    pub fn bind(path: &Path) -> Result<Self> {
-        let listener = bind_unix_socket(path, "telora-gui")?;
+    pub fn bind(path: &Path, foreground: bool) -> Result<Self> {
+        let listener = if foreground {
+            bind_unix_socket_manual(path, "telora-gui")?
+        } else {
+            bind_unix_socket(path, "telora-gui")?
+        };
         Ok(Self { listener })
     }
 

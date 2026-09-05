@@ -57,9 +57,11 @@ max_recording_seconds = 300
 # If $XDG_RUNTIME_DIR is unset or not writable, falls back to
 #   /run/user/<uid>/telora  →  /tmp/telora-<uid>/  (last resort)
 #
-# Any non-empty field wins over the default.
-#
-# Env-var overrides (any source, precedence: env > file > built-in default):
+# Any non-empty field wins over the default. In a systemd user service,
+# the flat canonical variables below take precedence over these legacy fields:
+#   TELORA_DAEMON_SOCKET
+#   TELORA_CONTROL_SOCKET
+# For config-file/env cascading outside systemd, use:
 #   TELORA_PATHS__SOCKET_DIR
 #   TELORA_PATHS__DAEMON_SOCKET
 #   TELORA_PATHS__CONTROL_SOCKET

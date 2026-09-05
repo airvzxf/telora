@@ -83,6 +83,7 @@ enum DaemonCommand {
 }
 
 fn main() {
+    let foreground = std::env::args().any(|a| a == "--foreground");
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         // Print the resolved socket paths so the help text reflects
         // whatever the runtime would actually bind/connect to (XDG
@@ -157,11 +158,12 @@ fn main() {
         // This happens AFTER GTK confirms we're the primary instance
         let tx_clone = tx.clone();
         let cfg_for_tokio = gui_config.clone();
+        let foreground_for_tokio = foreground;
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async {
                 tokio::select! {
-                    result = run_control_server(tx_clone.clone()) => {
+                    result = run_control_server(tx_clone.clone(), foreground_for_tokio) => {
                         if let Err(e) = result {
                             log::error!("Control server failed: {}", e);
                         }
@@ -335,8 +337,8 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
     }
 }
 
-async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
-    let server = ControlServer::bind(&control_socket_path())?;
+async fn run_control_server(tx: Sender<AppAction>, foreground: bool) -> anyhow::Result<()> {
+    let server = ControlServer::bind(&control_socket_path(), foreground)?;
     info!("Control server listening...");
 
     loop {

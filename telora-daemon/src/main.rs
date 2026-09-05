@@ -48,6 +48,10 @@ struct Args {
     #[arg(long)]
     max_recording_seconds: Option<u32>,
 
+    /// Force the manual filesystem bind path, ignoring inherited systemd FDs.
+    #[arg(long)]
+    foreground: bool,
+
     /// Hugging Face cache directory (overrides config).
     #[arg(long, value_name = "DIR")]
     voxora_cache: Option<PathBuf>,
@@ -472,8 +476,8 @@ async fn main() -> Result<()> {
         control_socket: paths_config.control_socket.clone(),
     };
     let resolved_paths = paths::resolve(&paths_cfg)?;
-    let socket_server =
-        SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx).context("Failed to bind socket")?;
+    let socket_server = SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, args.foreground)
+        .context("Failed to bind socket")?;
 
     tokio::spawn(async move {
         socket_server.run().await;

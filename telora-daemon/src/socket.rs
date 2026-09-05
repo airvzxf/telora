@@ -2,7 +2,7 @@ use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use telora_common::socket_bind::bind_unix_socket;
+use telora_common::socket_bind::{bind_unix_socket, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -149,8 +149,12 @@ impl SocketServer {
     /// EADDRINUSE remediation hint points the operator at
     /// `systemctl --user status telora-daemon` instead of the GUI's
     /// "previous session" hint.
-    pub fn bind(path: &Path, cmd_tx: mpsc::Sender<Command>) -> Result<Self> {
-        let listener = bind_unix_socket(path, "telora-daemon")?;
+    pub fn bind(path: &Path, cmd_tx: mpsc::Sender<Command>, foreground: bool) -> Result<Self> {
+        let listener = if foreground {
+            bind_unix_socket_manual(path, "telora-daemon")?
+        } else {
+            bind_unix_socket(path, "telora-daemon")?
+        };
         Ok(Self { listener, cmd_tx })
     }
 

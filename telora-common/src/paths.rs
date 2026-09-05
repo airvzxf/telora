@@ -96,23 +96,31 @@ fn last_resort_control_sock() -> PathBuf {
     PathBuf::from(format!("/tmp/telora-{}", current_uid())).join("control.sock")
 }
 
-/// Resolve socket directory according to the four-step cascade and
-/// ensure it exists with mode `0o700`.
+/// Resolve socket paths according to explicit systemd environment values,
+/// config overrides, and the runtime-directory cascade. Flat
+/// `TELORA_DAEMON_SOCKET` / `TELORA_CONTROL_SOCKET` values are the canonical
+/// service-unit surface and take precedence over legacy `[paths]` fields.
 pub fn resolve(cfg: &PathsConfig) -> Result<ResolvedPaths> {
-    let socket_dir = pick_socket_dir(cfg)?;
+    let env_daemon = env_socket_path("TELORA_DAEMON_SOCKET");
+    let env_control = env_socket_path("TELORA_CONTROL_SOCKET");
+    let socket_dir = pick_socket_dir(cfg, env_daemon.as_deref(), env_control.as_deref())?;
     ensure_dir_0700(&socket_dir)
         .with_context(|| format!("creating socket directory {}", socket_dir.display()))?;
-    let daemon_sock = cfg
-        .daemon_socket
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    let daemon_sock = env_daemon
+        .or_else(|| {
+            cfg.daemon_socket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| socket_dir.join("daemon.sock"));
-    let control_sock = cfg
-        .control_socket
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    let control_sock = env_control
+        .or_else(|| {
+            cfg.control_socket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| socket_dir.join("control.sock"));
     Ok(ResolvedPaths {
         socket_dir,
@@ -121,7 +129,22 @@ pub fn resolve(cfg: &PathsConfig) -> Result<ResolvedPaths> {
     })
 }
 
-fn pick_socket_dir(cfg: &PathsConfig) -> Result<PathBuf> {
+fn env_socket_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn pick_socket_dir(
+    cfg: &PathsConfig,
+    env_daemon: Option<&Path>,
+    env_control: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = env_daemon.or(env_control) {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            return Ok(parent.to_path_buf());
+        }
+    }
     if let Some(s) = cfg.socket_dir.as_deref().filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(s));
     }
@@ -238,6 +261,38 @@ pub(crate) mod tests {
 
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_prefers_flat_systemd_socket_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile_like();
+        let daemon = tmp.join("daemon.sock");
+        let control = tmp.join("control.sock");
+        let previous_daemon = std::env::var_os("TELORA_DAEMON_SOCKET");
+        let previous_control = std::env::var_os("TELORA_CONTROL_SOCKET");
+        // SAFETY: this test holds `ENV_LOCK` and restores both variables below.
+        unsafe {
+            std::env::set_var("TELORA_DAEMON_SOCKET", &daemon);
+            std::env::set_var("TELORA_CONTROL_SOCKET", &control);
+        }
+
+        let resolved = resolve(&PathsConfig::default()).expect("resolve should succeed");
+        assert_eq!(resolved.daemon_sock, daemon);
+        assert_eq!(resolved.control_sock, control);
+        assert_eq!(resolved.socket_dir, tmp);
+
+        unsafe {
+            match previous_daemon {
+                Some(value) => std::env::set_var("TELORA_DAEMON_SOCKET", value),
+                None => std::env::remove_var("TELORA_DAEMON_SOCKET"),
+            }
+            match previous_control {
+                Some(value) => std::env::set_var("TELORA_CONTROL_SOCKET", value),
+                None => std::env::remove_var("TELORA_CONTROL_SOCKET"),
+            }
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -59,6 +59,7 @@ voxora-hf        = "0.4"
 voxora-bridge    = "0.4"
 voxora-registry  = "0.4"
 voxora-traits    = "0.4"
+libsystemd      = "0.7"
 telora-common    = { path = "telora-common" }
 
 [workspace.lints.clippy]

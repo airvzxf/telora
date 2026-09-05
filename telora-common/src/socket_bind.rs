@@ -14,7 +14,7 @@
 //! bind-time permission mask.
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,60 @@ use log::info;
 use tokio::net::UnixListener;
 
 use crate::paths;
+
+#[cfg(target_os = "linux")]
+fn adopt_stream_listener(raw_fd: RawFd) -> Result<UnixListener> {
+    use nix::sys::socket::{SockType, getsockopt, sockopt};
+
+    // SAFETY: the caller transfers ownership of `raw_fd` to this function;
+    // every error path drops `OwnedFd` and therefore closes the descriptor.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let socket_type = getsockopt(&owned_fd, sockopt::SockType)
+        .map_err(|error| anyhow::anyhow!("checking inherited socket type: {error}"))?;
+    let accepting = getsockopt(&owned_fd, sockopt::AcceptConn)
+        .map_err(|error| anyhow::anyhow!("checking inherited listener state: {error}"))?;
+    if socket_type != SockType::Stream || !accepting {
+        anyhow::bail!("inherited descriptor is not a listening Unix stream");
+    }
+
+    let std_listener: std::os::unix::net::UnixListener = owned_fd.into();
+    std_listener.set_nonblocking(true)?;
+    Ok(UnixListener::from_std(std_listener)?)
+}
+
+#[cfg(target_os = "linux")]
+fn try_inherited_listener(instance_name: &str) -> Result<Option<UnixListener>> {
+    if instance_name != "telora-daemon" {
+        return Ok(None);
+    }
+
+    use libsystemd::activation::{IsType, receive_descriptors};
+
+    let descriptors = receive_descriptors(false)
+        .map_err(|error| anyhow::anyhow!("reading systemd activation descriptors: {error}"))?;
+    if descriptors.is_empty() {
+        return Ok(None);
+    }
+
+    let descriptor_count = descriptors.len();
+    for descriptor in descriptors {
+        if !descriptor.is_unix() {
+            let raw_fd = descriptor.into_raw_fd();
+            // SAFETY: `receive_descriptors` transferred this descriptor to us;
+            // dropping the wrapper closes rejected non-Unix descriptors.
+            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            continue;
+        }
+        let raw_fd = descriptor.into_raw_fd();
+        if let Ok(listener) = adopt_stream_listener(raw_fd) {
+            return Ok(Some(listener));
+        }
+    }
+
+    anyhow::bail!(
+        "systemd passed us {descriptor_count} descriptor(s), but none is a listening Unix stream"
+    )
+}
 
 /// Bind a Unix stream listener at `path` with the same security
 /// guarantees the daemon's and GUI's pre-extraction bind routines
@@ -34,10 +88,33 @@ use crate::paths;
 /// from the daemon and `"telora-gui"` from the GUI so each side keeps
 /// its distinct remediation hint.
 pub fn bind_unix_socket(path: &Path, instance_name: &str) -> Result<UnixListener> {
-    bind_unix_socket_impl(path, instance_name)
+    bind_unix_socket_impl(path, instance_name, true)
 }
 
-fn bind_unix_socket_impl(path: &Path, instance_name: &str) -> Result<UnixListener> {
+/// Bind without consulting systemd's inherited listener environment.
+///
+/// This is the explicit foreground/development path; it preserves the manual
+/// filesystem bind even when a parent process exported `LISTEN_FDS`.
+pub fn bind_unix_socket_manual(path: &Path, instance_name: &str) -> Result<UnixListener> {
+    bind_unix_socket_impl(path, instance_name, false)
+}
+
+fn bind_unix_socket_impl(
+    path: &Path,
+    instance_name: &str,
+    allow_activation: bool,
+) -> Result<UnixListener> {
+    #[cfg(target_os = "linux")]
+    if allow_activation {
+        if let Some(listener) = try_inherited_listener(instance_name)? {
+            info!(
+                "Using inherited systemd listener for {instance_name}; configured path is {}",
+                path.display()
+            );
+            return Ok(listener);
+        }
+    }
+
     ensure_parent_dir(path)?;
 
     // Pin the resolved parent directory before inspecting or binding the
@@ -335,6 +412,36 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&tmp);
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopt_inherited_systemd_listener_without_touching_path() {
+        use std::os::fd::IntoRawFd;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_path = tmp.path().join("source.sock");
+        let source =
+            std::os::unix::net::UnixListener::bind(&source_path).expect("create source listener");
+        source
+            .set_nonblocking(true)
+            .expect("set source nonblocking");
+        let raw_fd = source.into_raw_fd();
+        let configured_path = tmp.path().join("must-not-be-created/daemon.sock");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let inherited = runtime
+            .block_on(async { adopt_stream_listener(raw_fd) })
+            .expect("inherited listener should be adopted");
+        assert!(
+            !configured_path
+                .parent()
+                .expect("configured parent")
+                .exists()
+        );
+        drop(inherited);
     }
 
     #[cfg(unix)]

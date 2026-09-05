@@ -33,4 +33,4 @@ pub use paths::{
     PathsConfig, ResolvedPaths, control_socket_path, daemon_socket_path, default_paths_config,
     resolve,
 };
-pub use socket_bind::bind_unix_socket;
+pub use socket_bind::{bind_unix_socket, bind_unix_socket_manual};
