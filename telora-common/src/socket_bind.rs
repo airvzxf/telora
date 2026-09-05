@@ -499,6 +499,109 @@ mod tests {
         drop(inherited);
     }
 
+    /// When `LISTEN_FDS` is set but the descriptors table is empty (e.g.
+    /// a parent shell exported the vars without actually passing FDs),
+    /// `try_inherited_listener` must clean the env vars via
+    /// `receive_descriptors(true)` and return `Ok(None)` so the caller
+    /// falls back to the manual bind path instead of hard-erroring.
+    ///
+    /// Exhaustive FD-inheritance testing requires fork+exec and is out of
+    /// scope for a unit test; this case pins the env-var hygiene half of
+    /// the contract.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_inherited_listener_clears_env_when_no_descriptors_passed() {
+        // Serialise on the env lock used by the paths tests; both modules
+        // touch process-global env state.
+        let _guard = paths::tests::ENV_LOCK.lock().unwrap();
+
+        // Snapshot previous values so the test is idempotent under
+        // repeated execution (and parallel test runs gated by the lock).
+        let prev_listen_pid = std::env::var_os("LISTEN_PID");
+        let prev_listen_fds = std::env::var_os("LISTEN_FDS");
+
+        // SAFETY: this test holds ENV_LOCK; restoration at the end is
+        // single-threaded under the same lock.
+        unsafe {
+            std::env::set_var("LISTEN_PID", std::process::id().to_string());
+            std::env::set_var("LISTEN_FDS", "0");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(async { try_inherited_listener("telora-daemon") });
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) fallback to manual bind, got {result:?}"
+        );
+
+        // receive_descriptors(true) must clear the env vars so a future
+        // child process can't accidentally re-adopt our descriptors.
+        assert!(
+            std::env::var_os("LISTEN_FDS").is_none(),
+            "LISTEN_FDS must be cleared after receive_descriptors(true)"
+        );
+        assert!(
+            std::env::var_os("LISTEN_PID").is_none(),
+            "LISTEN_PID must be cleared after receive_descriptors(true)"
+        );
+
+        // SAFETY: still under ENV_LOCK.
+        unsafe {
+            match prev_listen_pid {
+                Some(v) => std::env::set_var("LISTEN_PID", v),
+                None => std::env::remove_var("LISTEN_PID"),
+            }
+            match prev_listen_fds {
+                Some(v) => std::env::set_var("LISTEN_FDS", v),
+                None => std::env::remove_var("LISTEN_FDS"),
+            }
+        }
+    }
+
+    /// When `LISTEN_PID` does not match our PID (the usual case for
+    /// containers with PID 1, re-exec'd processes, or a parent shell
+    /// that exported the vars), libsystemd returns an empty Vec and we
+    /// fall back to the manual bind path without warning.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_inherited_listener_skips_when_listen_pid_mismatches() {
+        let _guard = paths::tests::ENV_LOCK.lock().unwrap();
+        let prev_pid = std::env::var_os("LISTEN_PID");
+        let prev_fds = std::env::var_os("LISTEN_FDS");
+
+        // SAFETY: this test holds ENV_LOCK.
+        unsafe {
+            // 0 is never the running PID; libsystemd rejects it.
+            std::env::set_var("LISTEN_PID", "0");
+            std::env::set_var("LISTEN_FDS", "3");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(async { try_inherited_listener("telora-daemon") });
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) when LISTEN_PID does not match our PID, got {result:?}"
+        );
+
+        // SAFETY: still under ENV_LOCK.
+        unsafe {
+            match prev_pid {
+                Some(v) => std::env::set_var("LISTEN_PID", v),
+                None => std::env::remove_var("LISTEN_PID"),
+            }
+            match prev_fds {
+                Some(v) => std::env::set_var("LISTEN_FDS", v),
+                None => std::env::remove_var("LISTEN_FDS"),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn bind_rejects_preexisting_symlink() {
