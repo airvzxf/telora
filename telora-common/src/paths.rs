@@ -31,11 +31,6 @@ use std::path::{Path, PathBuf};
 /// that do not have a `telora.toml` in hand.
 #[derive(Debug, Clone, Default)]
 pub struct PathsConfig {
-    /// Override for `XDG_RUNTIME_DIR`. Surfaced via `telora.toml`
-    /// `[paths] runtime_dir = "..."`; consumed by the systemd-aware
-    /// wiring that EPIC #34 landed.
-    #[allow(dead_code)]
-    pub runtime_dir: Option<String>,
     pub socket_dir: Option<String>,
     pub daemon_socket: Option<String>,
     pub control_socket: Option<String>,

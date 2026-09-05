@@ -57,14 +57,9 @@ pub struct SttConfig {
 /// `[paths]` section of `telora.toml`. All fields are optional; an
 /// empty section (or its absence) falls back to the resolver in
 /// [`crate::paths`].
-///
-/// Sub-issue #34 is the consumer of these fields; until that wiring
-/// lands the resolver is the only thing that touches them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
 pub struct PathsConfig {
-    #[serde(default)]
-    pub runtime_dir: Option<String>,
     #[serde(default)]
     pub socket_dir: Option<String>,
     #[serde(default)]

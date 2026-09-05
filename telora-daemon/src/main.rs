@@ -356,7 +356,6 @@ async fn main() -> Result<()> {
         // Both errors are surfaced on stderr.
         let paths_cfg = match load_config(&args) {
             Ok(c) => paths::PathsConfig {
-                runtime_dir: c.paths.runtime_dir.clone(),
                 socket_dir: c.paths.socket_dir.clone(),
                 daemon_socket: c.paths.daemon_socket.clone(),
                 control_socket: c.paths.control_socket.clone(),
@@ -392,7 +391,6 @@ async fn main() -> Result<()> {
             }
         };
         let paths_cfg = paths::PathsConfig {
-            runtime_dir: cfg.paths.runtime_dir.clone(),
             socket_dir: cfg.paths.socket_dir.clone(),
             daemon_socket: cfg.paths.daemon_socket.clone(),
             control_socket: cfg.paths.control_socket.clone(),
@@ -476,7 +474,6 @@ async fn main() -> Result<()> {
     // `telora_common::paths` so the daemon, GUI, and CLI all share
     // the same cascade.
     let paths_cfg = paths::PathsConfig {
-        runtime_dir: paths_config.runtime_dir.clone(),
         socket_dir: paths_config.socket_dir.clone(),
         daemon_socket: paths_config.daemon_socket.clone(),
         control_socket: paths_config.control_socket.clone(),
