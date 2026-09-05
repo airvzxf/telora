@@ -10,7 +10,7 @@
 //!
 //!   * `lib.rs` (this file) re-exports the modules and items needed
 //!     by external callers (integration tests and the binary). The
-//!     internal modules (`audio`, `transcriber`, `vad`) stay private
+//!     internal modules (`audio`, `transcriber`) stay private
 //!     to the crate; only the specific types the binary and tests need
 //!     are re-exported.
 //!   * `main.rs` becomes a thin wrapper that imports from the crate
@@ -25,7 +25,6 @@ pub mod socket;
 mod audio;
 mod cache_paths;
 mod transcriber;
-mod vad;
 
 // Re-export the deserialisable config types from `socket` so external
 // callers (and `main.rs`) do not need to know about the internal
