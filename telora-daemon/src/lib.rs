@@ -49,12 +49,19 @@ pub use telora_common::paths;
 // production behaviour in one place.
 pub use cache_paths::telora_env_source;
 
-// Re-export the Voxora cache resolver from `telora-common` so the binary
-// keeps its historical import path while `telora-models` can consume the
-// same sanitised implementation.
-pub use telora_common::cache::{
-    default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override,
-};
+// Keep the original string-based daemon library API while the binary and
+// `telora-models` use the Path-based shared resolver directly.
+pub use telora_common::cache::{default_voxora_cache_dir, sanitize_voxora_cache_override};
+
+pub fn resolve_voxora_cache(
+    args_override: Option<&str>,
+    env_override: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    telora_common::cache::resolve_voxora_cache(
+        args_override.map(std::path::Path::new),
+        env_override.map(std::path::Path::new),
+    )
+}
 
 // Re-export the items `main.rs` (the binary) needs from the
 // otherwise-private `audio` and `transcriber` modules. Tests do not

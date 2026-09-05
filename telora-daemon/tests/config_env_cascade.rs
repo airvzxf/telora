@@ -10,8 +10,9 @@
 //!
 //! The fix lives in [`telora_daemon::telora_env_source`] (originally
 //! at `telora_daemon::paths::telora_env_source` before the EPIC #28
-//! `telora-common` extraction moved the runtime path helpers out and
-//! the voxora-cache helpers into `cache_paths`),
+//! `telora-common` extraction moved the runtime path helpers out; the
+//! Voxora cache helpers were subsequently shared through
+//! `telora_common::cache` by issue #103),
 //! which `telora-daemon/src/main.rs::load_config` calls into. The
 //! helper sets both `.prefix_separator("_")` (to keep the `TELORA_`
 //! prefix matching) and `.separator("__")` (so the rest of the name

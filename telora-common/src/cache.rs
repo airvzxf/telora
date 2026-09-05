@@ -18,10 +18,10 @@ use anyhow::Result;
 pub fn default_voxora_cache_dir() -> Result<PathBuf> {
     if let Some(custom) = std::env::var_os("VOXORA_CACHE_DIR") {
         let custom = PathBuf::from(custom);
-        if !is_blank(&custom)
-            && let Some(accepted) = sanitize_voxora_cache_override(&custom)
-        {
-            return Ok(accepted);
+        if !is_blank(&custom) {
+            if let Some(accepted) = sanitize_with_source(&custom, "VOXORA_CACHE_DIR") {
+                return Ok(accepted);
+            }
         }
     }
 
@@ -32,20 +32,24 @@ pub fn default_voxora_cache_dir() -> Result<PathBuf> {
 ///
 /// The CLI override has precedence over the environment override. Both values
 /// are represented as paths so non-UTF-8 command-line and environment values
-/// are not silently discarded before validation.
+/// are not silently discarded before validation. If an explicit override is
+/// rejected, resolution falls through to the XDG default rather than silently
+/// selecting a lower-priority source.
 pub fn resolve_voxora_cache(
     args_override: Option<&Path>,
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(args_override) = args_override.filter(|path| !is_blank(path))
-        && let Some(accepted) = sanitize_voxora_cache_override(args_override)
-    {
-        return Ok(accepted);
+    if let Some(args_override) = args_override.filter(|path| !is_blank(path)) {
+        if let Some(accepted) = sanitize_with_source(args_override, "--voxora-cache") {
+            return Ok(accepted);
+        }
+        return xdg_default_cache_dir();
     }
-    if let Some(env_override) = env_override.filter(|path| !is_blank(path))
-        && let Some(accepted) = sanitize_voxora_cache_override(env_override)
-    {
-        return Ok(accepted);
+
+    if let Some(env_override) = env_override.filter(|path| !is_blank(path)) {
+        if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
+            return Ok(accepted);
+        }
     }
 
     xdg_default_cache_dir()
@@ -63,14 +67,30 @@ fn xdg_default_cache_dir() -> Result<PathBuf> {
 
 /// Validate a cache override and return its accepted path.
 ///
-/// The validator rejects empty values, any `..` component, absolute paths
-/// outside the canonical XDG cache root, symlinked prefixes that resolve
-/// outside that root, and existing non-directory targets. Relative paths that
-/// contain no parent traversal remain supported for backwards compatibility;
-/// their location is controlled by the operator's working directory.
+/// The validator rejects empty values, any `..` component, whitespace-padded
+/// values, absolute paths outside the canonical XDG cache root, symlinked
+/// prefixes that resolve outside that root, and existing non-directory
+/// targets. Relative paths that contain no parent traversal remain supported
+/// for backwards compatibility; their location is controlled by the
+/// operator's working directory.
 pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
+    sanitize_with_source(candidate, "cache override")
+}
+
+fn sanitize_with_source(candidate: &Path, source: &str) -> Option<PathBuf> {
     if is_blank(candidate) {
-        log::warn!("VOXORA_CACHE_DIR is empty; falling back to the XDG default");
+        log::warn!("{source} is empty; falling back to the XDG default");
+        return None;
+    }
+
+    if candidate
+        .to_str()
+        .is_some_and(|value| value != value.trim())
+    {
+        log::warn!(
+            "{source}={candidate:?} has leading or trailing whitespace; \
+             ignoring and falling back to the XDG default"
+        );
         return None;
     }
 
@@ -79,7 +99,7 @@ pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         log::warn!(
-            "VOXORA_CACHE_DIR={candidate:?} contains a `..` component; \
+            "{source}={candidate:?} contains a `..` component; \
              ignoring and falling back to the XDG default"
         );
         return None;
@@ -87,7 +107,7 @@ pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
 
     if candidate.exists() && !candidate.is_dir() {
         log::warn!(
-            "VOXORA_CACHE_DIR={candidate:?} exists but is not a directory; \
+            "{source}={candidate:?} exists but is not a directory; \
              ignoring and falling back to the XDG default"
         );
         return None;
@@ -95,6 +115,14 @@ pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
 
     if !candidate.is_absolute() {
         return Some(candidate.to_path_buf());
+    }
+
+    if has_dangling_symlink_prefix(candidate) {
+        log::warn!(
+            "{source}={candidate:?} contains a symlink with an unresolved target; \
+             ignoring and falling back to the XDG default"
+        );
+        return None;
     }
 
     let xdg = dirs::cache_dir()?;
@@ -121,8 +149,8 @@ pub fn sanitize_voxora_cache_override(candidate: &Path) -> Option<PathBuf> {
 
     if !canonical_candidate.starts_with(&canonical_xdg) {
         log::warn!(
-            "VOXORA_CACHE_DIR={candidate:?} does not live under the XDG cache \
-             directory {canonical_xdg:?}; ignoring and falling back to the XDG default"
+            "{source}={candidate:?} does not live under the XDG cache directory \
+             {canonical_xdg:?}; ignoring and falling back to the XDG default"
         );
         return None;
     }
@@ -142,6 +170,24 @@ fn is_blank(path: &Path) -> bool {
     }
 
     path.to_str().is_some_and(|value| value.trim().is_empty())
+}
+
+fn has_dangling_symlink_prefix(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if std::fs::canonicalize(&current).is_err() {
+                    return true;
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => break,
+        }
+    }
+    false
 }
 
 /// Canonicalize the longest existing prefix and append the missing suffix.
@@ -199,6 +245,8 @@ mod tests {
                 home: std::env::var_os("HOME"),
                 voxora_cache_dir: std::env::var_os("VOXORA_CACHE_DIR"),
             };
+            // SAFETY: cache tests serialize process-wide environment changes
+            // with `ENV_LOCK` and restore each previous value on drop.
             unsafe {
                 std::env::set_var("XDG_CACHE_HOME", root);
                 std::env::set_var("HOME", root);
@@ -217,6 +265,8 @@ mod tests {
     }
 
     fn restore_env(name: &str, value: Option<OsString>) {
+        // SAFETY: the caller holds `ENV_LOCK`; restoration cannot race another
+        // cache test's environment mutation.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(name, value),
@@ -234,9 +284,10 @@ mod tests {
     #[test]
     fn default_cache_uses_legacy_suffix() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let (_root, _env) = test_cache_root();
+        let (root, _env) = test_cache_root();
 
         let resolved = default_voxora_cache_dir().expect("cache path should resolve");
+        assert!(resolved.starts_with(root.path()));
         assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
     }
 
@@ -245,6 +296,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (root, _env) = test_cache_root();
         let override_path = root.path().join("custom-cache");
+        // SAFETY: the test holds `ENV_LOCK` and `CacheEnv` restores the value.
         unsafe {
             std::env::set_var("VOXORA_CACHE_DIR", &override_path);
         }
@@ -282,6 +334,22 @@ mod tests {
         assert!(
             sanitize_voxora_cache_override(&link.join("new-cache")).is_none(),
             "a missing child below an escaping symlink must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_symlinked_prefix() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (root, _env) = test_cache_root();
+        let outside = tempfile::tempdir().expect("create outside root");
+        let missing_target = outside.path().join("not-created");
+        let link = root.path().join("dangling");
+        std::os::unix::fs::symlink(&missing_target, &link).expect("create dangling symlink");
+
+        assert!(
+            sanitize_voxora_cache_override(&link.join("new-cache")).is_none(),
+            "a dangling symlink prefix must not be treated as an ordinary missing directory"
         );
     }
 
@@ -328,19 +396,28 @@ mod tests {
     #[test]
     fn rejects_unsafe_cli_and_environment_overrides() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let (root, _env) = test_cache_root();
+        let (_root, _env) = test_cache_root();
         let bad_cli = Path::new("/tmp/another-cli-test/cache/../elsewhere");
         let bad_env = Path::new("/tmp/this-is-a-test/cache-root/../../etc");
-        let safe_env = root.path().join("env-cache");
         let expected = Path::new("voxora/models/huggingface");
 
         let cli_result = resolve_voxora_cache(Some(bad_cli), None).expect("default resolves");
         assert!(cli_result.ends_with(expected));
         let env_result = resolve_voxora_cache(None, Some(bad_env)).expect("default resolves");
         assert!(env_result.ends_with(expected));
-        let safe_env_result =
-            resolve_voxora_cache(Some(bad_cli), Some(&safe_env)).expect("env resolves");
-        assert_eq!(safe_env_result, safe_env);
+    }
+
+    #[test]
+    fn invalid_cli_does_not_fall_through_to_environment_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (root, _env) = test_cache_root();
+        let bad_cli = Path::new("/tmp/another-cli-test/cache/../elsewhere");
+        let safe_env = root.path().join("env-cache");
+
+        let resolved =
+            resolve_voxora_cache(Some(bad_cli), Some(&safe_env)).expect("default resolves");
+        assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
+        assert_ne!(resolved, safe_env);
     }
 
     #[test]
@@ -354,5 +431,14 @@ mod tests {
         let resolved =
             resolve_voxora_cache(Some(empty), Some(whitespace)).expect("default resolves");
         assert!(resolved.ends_with(expected));
+    }
+
+    #[test]
+    fn rejects_whitespace_padded_and_relative_traversal_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        assert!(sanitize_voxora_cache_override(Path::new(" /tmp/escape")).is_none());
+        assert!(sanitize_voxora_cache_override(Path::new("/tmp/escape ")).is_none());
+        assert!(sanitize_voxora_cache_override(Path::new("relative/../escape")).is_none());
     }
 }

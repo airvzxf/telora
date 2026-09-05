@@ -3,9 +3,11 @@ use clap::{Parser, Subcommand};
 use config::{Config, File};
 use log::{error, info, warn};
 use ringbuf::HeapRb;
+use std::path::PathBuf;
+use telora_common::cache::resolve_voxora_cache;
 use telora_daemon::{
     AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
-    Transcriber, paths, resolve_voxora_cache, telora_env_source,
+    Transcriber, paths, telora_env_source,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -48,7 +50,7 @@ struct Args {
 
     /// Hugging Face cache directory (overrides config).
     #[arg(long)]
-    voxora_cache: Option<String>,
+    voxora_cache: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -91,8 +93,8 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     }
 
     // 4. Environment variables - Highest priority. The source
-    // construction is centralised in [`telora_env_source`] (the
-    // daemon's voxora-cache helper module) because `config` 0.13's
+    // construction is centralised in [`telora_env_source`] (the daemon's
+    // `TELORA_*` environment-source helper) because `config` 0.13's
     // defaults silently drop `TELORA_PATHS__SOCKET_DIR`; see that
     // helper's rustdoc for the why. The integration test
     // `telora-daemon/tests/config_env_cascade.rs` calls the same
@@ -427,12 +429,10 @@ async fn main() -> Result<()> {
     // accepted verbatim and the F2 commit's claim that the
     // sanitiser gates the override was false. Going through the
     // helper closes that gap.
-    let env_cache_override = std::env::var_os("VOXORA_CACHE_DIR").map(std::path::PathBuf::from);
-    let voxora_cache = resolve_voxora_cache(
-        args.voxora_cache.as_deref().map(std::path::Path::new),
-        env_cache_override.as_deref(),
-    )
-    .context("resolving voxora cache directory")?;
+    let env_cache_override = std::env::var_os("VOXORA_CACHE_DIR").map(PathBuf::from);
+    let voxora_cache =
+        resolve_voxora_cache(args.voxora_cache.as_deref(), env_cache_override.as_deref())
+            .context("resolving voxora cache directory")?;
 
     // Tighten the cache directory's mode so other local users cannot
     // read model weights or plant a symlink that whisper.cpp's mmap
