@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use telora_common::socket_bind::{bind_unix_socket, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -132,6 +132,14 @@ pub enum Command {
 pub struct SocketServer {
     listener: UnixListener,
     cmd_tx: mpsc::Sender<Command>,
+    /// Best-effort cleanup target. Captured at `bind` time so a
+    /// `Drop` impl can `unlink` the socket file even when the daemon
+    /// process is killed outside systemd (e.g. `Ctrl-C` in a
+    /// development shell or a crash). When systemd adopts the FD
+    /// via `libsystemd::activation`, the unit's `RemoveOnStop=yes`
+    /// already cleans up; the `Drop` impl tolerates the resulting
+    /// `NotFound` so the double-cleanup is harmless.
+    socket_path: PathBuf,
 }
 
 impl SocketServer {
@@ -154,7 +162,17 @@ impl SocketServer {
         } else {
             bind_unix_socket_manual(path, "telora-daemon")?
         };
-        Ok(Self { listener, cmd_tx })
+        Ok(Self {
+            listener,
+            cmd_tx,
+            socket_path: path.to_path_buf(),
+        })
+    }
+
+    /// Returns the path the daemon bound the control socket at.
+    /// Used by tests to assert on the `Drop`-cleanup behaviour.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub async fn run(&self) {
@@ -308,6 +326,34 @@ impl SocketServer {
     }
 }
 
+impl Drop for SocketServer {
+    /// Best-effort unlink on drop so a `Ctrl-C` in a development
+    /// shell, a panic, or any other non-systemd shutdown path does
+    /// not leave a stale socket file behind. The next start will
+    /// usually succeed anyway (the bind helper's
+    /// `remove_stale_socket` cleans up same-UID leftovers), but a
+    /// debris-free `/run/user/<uid>/telora/` is the operator-facing
+    /// hygiene goal.
+    ///
+    /// Field drop order matters: `listener` drops before
+    /// `socket_path` (fields are dropped top-to-bottom), so the FD
+    /// is closed and the kernel stops holding the inode before we
+    /// attempt the unlink. The systemd-managed path (`Accept=no`)
+    /// has already cleaned the file via `RemoveOnStop=yes`, so a
+    /// `NotFound` here is expected and not logged as a warning.
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "failed to unlink {} on drop: {}",
+                self.socket_path.display(),
+                e
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +412,37 @@ mod tests {
                 "activation-mode bind produced a non-connectable socket"
             );
             drop(activation);
+        });
+    }
+
+    /// `Drop` must unlink the socket file. Without this, a `Ctrl-C`
+    /// in a development shell leaves debris under
+    /// `$XDG_RUNTIME_DIR/telora/`.
+    #[test]
+    fn drop_unlinks_socket_file() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let sock_path = tmp.path().join("telora-daemon-drop.sock");
+            let cmd_tx: mpsc::Sender<Command> = mpsc::channel(1).0;
+
+            {
+                let server =
+                    SocketServer::bind(&sock_path, cmd_tx, false).expect("bind should succeed");
+                assert_eq!(server.socket_path(), sock_path.as_path());
+                assert!(sock_path.exists(), "socket file should exist after bind");
+                drop(server);
+            }
+
+            assert!(
+                !sock_path.exists(),
+                "socket file should be unlinked after drop (found at {})",
+                sock_path.display()
+            );
         });
     }
 }
