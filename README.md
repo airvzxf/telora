@@ -291,13 +291,13 @@ the socket that the daemon never starts.
 ### Development / ad-hoc runs
 
 Outside systemd (dev shells, CI, ad-hoc debugging) start the binaries
-directly. The daemon exposes `--no-activation` to skip the systemd
+directly. The daemon needs `--no-activation` to skip the systemd
 `LISTEN_FDS` lookup and bind `daemon.sock` manually under
 `$XDG_RUNTIME_DIR/telora/`. The GUI does not need any flag — its
 `bind_unix_socket` path is already filesystem-only.
 
 ```bash
-RUST_LOG=info ./bin/telora-daemon
+RUST_LOG=info ./bin/telora-daemon --no-activation
 RUST_LOG=info ./bin/telora-gui
 ```
 

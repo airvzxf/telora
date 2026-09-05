@@ -42,14 +42,22 @@ the GUI's persistent process model.
 manual-bind flag because its bind path is always filesystem-only.
 - `control.sock` cleanup remains the GUI's responsibility; the daemon service
 must not unlink it in `ExecStopPost`.
-- Both services publish the canonical socket paths explicitly:
-  - `[paths] socket_dir = "..."` in `telora.toml` (operator config).
-  - `TELORA_PATHS__SOCKET_DIR` env var (highest priority).
-  - `$XDG_RUNTIME_DIR/telora/` resolved by `telora-common::paths`.
-  The systemd units inject the resolved paths via direct `Environment=`
-  lines; `PassEnvironment=` alone is not used as sibling-service
-  inheritance because user-manager environment is not populated by the
-  units.
+- The canonical socket-path surface is the `telora-common::paths` resolver
+  (`telora-common/src/paths.rs:99-130`). The resolver evaluates four
+  sources in this order; the first one that yields a non-empty path wins:
+  1. **`TELORA_DAEMON_SOCKET`** / **`TELORA_CONTROL_SOCKET`** env vars
+     (flat, recognised by all three binaries; injected by the systemd
+     units via direct `Environment=` lines so the GUI inherits the
+     daemon's choice at startup).
+  2. `[paths] daemon_socket` / `[paths] control_socket` in `telora.toml`
+     (operator-supplied per-instance override).
+  3. `[paths] socket_dir` + the canonical filenames
+     (`daemon.sock` / `control.sock`).
+  4. `$XDG_RUNTIME_DIR/telora/` (or `/run/user/<uid>/telora/`,
+     `/tmp/telora-<uid>/` as a last-resort fallback).
+  `PassEnvironment=` alone is not used as sibling-service inheritance
+  because user-manager environment is not populated by the units; the
+  direct `Environment=` assignments are the actual source of truth.
 
 ## References
 

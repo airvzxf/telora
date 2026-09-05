@@ -482,8 +482,9 @@ async fn main() -> Result<()> {
         control_socket: paths_config.control_socket.clone(),
     };
     let resolved_paths = paths::resolve(&paths_cfg)?;
-    let socket_server = SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, args.no_activation)
-        .context("Failed to bind socket")?;
+    let socket_server =
+        SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, !args.no_activation)
+            .context("Failed to bind socket")?;
 
     tokio::spawn(async move {
         socket_server.run().await;

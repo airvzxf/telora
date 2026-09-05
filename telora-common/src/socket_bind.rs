@@ -162,12 +162,14 @@ fn bind_unix_socket_impl(
     #[cfg(target_os = "linux")]
     if allow_activation {
         if let Some(listener) = try_inherited_listener(instance_name)? {
-            info!(
-                "Using inherited systemd listener for {instance_name}; configured path is {}",
-                path.display()
-            );
+            // Telemetry on the adoption itself is logged inside
+            // `try_inherited_listener` (descriptor count, fallback reason).
             return Ok(listener);
         }
+        info!(
+            "Skipping systemd socket activation for {instance_name}; binding {path} manually",
+            path = path.display(),
+        );
     }
 
     ensure_parent_dir(path)?;
