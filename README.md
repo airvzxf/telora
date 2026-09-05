@@ -29,6 +29,27 @@ makepkg -si
 ```
 *Dependencies from official Arch repos (`gtk4`, `gtk4-layer-shell`, `cuda`, etc.) will be installed automatically.*
 
+### Note on AUR package checksums
+
+The `telora-bin-<version>-<rel>-x86_64.pkg.tar.zst` artefact attached
+to each GitHub Release is **not byte-reproducible** between builds:
+`makepkg` embeds `BUILDINFO.builddate` (the epoch at the moment of
+build) and `packager` (the in-container build user), and the
+matching `.PKGINFO` line records `builddate` as well. Two builds of
+the same `pkgver` / `pkgrel` from the same source commit will produce
+two different `.pkg.tar.zst` blobs with two different SHA-256 hashes.
+This is why `SHA256SUMS` (which covers the four raw binaries and the
+SBOM) deliberately omits the AUR package.
+
+The canonical "this is the same source" check is **`makepkg -g`**
+(or `updpkgsums`), which regenerates the `sha256sums=()` for the
+`source=()` array against the source tree. The `PKGBUILD` itself is
+committed verbatim at `pkg/PKGBUILD`, so operators can verify the
+build inputs byte-for-byte against `origin/main`. Verification of
+the four upstream binaries (`telora`, `telora-daemon`, `telora-gui`,
+`telora-models`) is unaffected — their checksums in `SHA256SUMS` are
+byte-stable per release.
+
 ## Configuration
 
 You can configure the daemon using a TOML file. Configuration files are
@@ -461,7 +482,7 @@ Each `vX.Y.Z` release attaches the following assets to the GitHub Release page:
 | `telora-models` | Model download/management CLI (10.7 MB) | One-shot, for first-time setup and model rotation |
 | `SHA256SUMS`, `SHA512SUMS` | Checksums for the 4 binaries | Verification |
 | `telora.sbom.cdx.json` | CycloneDX SBOM (auto-generated from Cargo.lock by `anchore/sbom-action`) | Audit, license compliance, vulnerability scanning |
-| `telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` | Arch Linux AUR binary package, built by the `build-aur-package` job running `makepkg` in an `archlinux:latest` container | `pacman -U telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` for Arch users who want the package instead of the four raw binaries |
+| `telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` | Arch Linux AUR binary package, built by the `build-aur-package` job running `makepkg` in an `archlinux:latest` container; checksum **not** provided (see "Note on AUR package checksums" above) | `pacman -U telora-bin-X.Y.Z-1-x86_64.pkg.tar.zst` for Arch users who want the package instead of the four raw binaries |
 
 ## Project Documents
 

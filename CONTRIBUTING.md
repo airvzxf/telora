@@ -106,5 +106,59 @@ README troubleshooting section). The daemon does expose
 inherited from a parent shell, which is useful for isolating
 filesystem-only behaviour during debugging.
 
+## REFRESH memory behavior
+
+The `telora-daemon refresh` command (or `telora-daemon reload` followed
+by a model-bearing REFRESH) replaces the active model without
+restarting the daemon. Because the new `BridgeTranscriber` is awaited
+to completion *before* the old one is dropped
+(`telora-daemon/src/main.rs:585-632`), RSS briefly peaks at roughly
+the sum of the old and new model weights.
+
+Approximate resident-set peaks during REFRESH:
+
+| model           | single load | REFRESH peak |
+|-----------------|------------:|-------------:|
+| ggml-tiny       |   ~150 MB   |    ~300 MB   |
+| ggml-base       |   ~290 MB   |    ~580 MB   |
+| ggml-small      |   ~970 MB   |    ~1.9 GB   |
+| ggml-medium     |   ~1.5 GB   |    ~3.0 GB   |
+| ggml-large-v3   |   ~3.1 GB   |    ~6.2 GB   |
+
+Recommendation: keep at least **2× the larger model's footprint** of
+free RAM available when running `telora-daemon refresh`, and run
+`ggml-large-v3` only on hosts with **≥16 GB RAM**. After issue #94
+ships, the daemon drops the old engine before building the new one,
+so the REFRESH peak collapses to ~1× the new model's size.
+
+## Release workflow trust model
+
+Anyone with `repo: write` on `airvzxf/telora` can dispatch
+`.github/workflows/release.yml:9-19` on any tag matching the regex
+`^v[0-9]+\.[0-9]+\.[0-9]+$`. The workflow relies on three structural
+defenses to refuse tags that were not created by the operator's GPG
+or SSH-signed `git tag -s`:
+
+1. **`validate-tag-input`** (`.github/workflows/release.yml:47-65`) —
+   the regex gate; rejects malformed tag names.
+2. **`verify-tag-reachability`**
+   (`.github/workflows/release.yml:72-139`) — the tag's commit must
+   be an ancestor of `origin/main`; catches the "tag the branch tip
+   then squash-merge" bug class and prevents a force-push from
+   moving the tag onto an unrelated commit.
+3. **`verify-tag-signature`**
+   (`.github/workflows/release.yml:147-244`) — the tag must be
+   signed by a key listed in `.github/trusted-signers`. The
+   allow-list is fetched from `origin/main` (not the tagged tree),
+   so revoking a key on main takes effect on the next release.
+
+The three gates are defense in depth, not a substitute for the
+release procedure in `README.md` (which is the load-bearing manual
+control while the repo remains single-maintainer). Do not loosen the
+regex, the ancestor check, or the signer allow-list expectation
+without a security review. The full signer add/remove procedure is
+documented in `README.md` under "Adding a new trusted signer" and
+"Removing a signer".
+
 ## Questions?
 Feel free to open an issue or a discussion on GitHub.
