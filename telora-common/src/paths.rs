@@ -63,8 +63,8 @@ pub fn default_paths_config() -> PathsConfig {
 /// Convenience helper that returns the canonical daemon socket path
 /// using the same resolution cascade as [`resolve`]. Logs the error
 /// and falls back to the resolver's last-resort `/tmp/telora-<uid>/daemon.sock`
-/// rather than the historical `/tmp/telora-sock` literal — the shared
-/// cascade is the single source of truth.
+/// rather than the pre-XDG global socket name — the shared cascade is the
+/// single source of truth.
 pub fn daemon_socket_path() -> PathBuf {
     match resolve(&PathsConfig::default()) {
         Ok(r) => r.daemon_sock,

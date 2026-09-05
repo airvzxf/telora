@@ -20,7 +20,9 @@ Shared library crate for the telora workspace.
 - **`cache`** — Voxora model-cache resolution shared by `telora-daemon` and
   the legacy `telora-models` wrapper. It preserves the
   `voxora/models/huggingface` layout and rejects traversal and absolute paths
-  outside the XDG cache tree.
+  outside the XDG cache tree. Relative overrides remain supported for
+  backwards compatibility and are resolved relative to the process working
+  directory.
 
 ## Consumers
 

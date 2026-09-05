@@ -9,7 +9,7 @@ post_install() {
     echo ":: IMPORTANT: You need to download a speech model before using Telora."
     echo ":: Please run the following command to download the base model:"
     echo ":: "
-    echo "::     telora-models download base"
+    echo "::     telora-models download ggerganov/whisper.cpp/ggml-base.bin"
     echo ":: "
     echo ":: You can also list available models with 'telora-models list'."
 }
@@ -31,8 +31,6 @@ post_upgrade() {
 }
 
 pre_remove() {
-    # Remove sockets still living in /tmp (legacy locations from before the XDG migration).
-    rm -f /tmp/telora-sock /tmp/telora-control.sock
     if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
         systemctl --user stop telora-daemon.service || true
         systemctl --user disable telora-daemon.service || true

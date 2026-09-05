@@ -4,7 +4,7 @@ Thank you for your interest in improving Telora!
 
 ## Project Structure
 
-- `telora-common`: Shared library crate. Owns the socket-path resolver (`paths::resolve`, `paths::daemon_socket_path`, `paths::control_socket_path`) and the atomic `umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`). Consumed by `telora-daemon`, `telora-gui`, and `telora-ctl`.
+- `telora-common`: Shared library crate. Owns the socket-path resolver (`paths::resolve`, `paths::daemon_socket_path`, `paths::control_socket_path`), the atomic `umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`), and the shared Voxora cache resolver (`cache::{default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override}`). Consumed by `telora-daemon`, `telora-gui`, `telora-ctl`, and the legacy `telora-models` wrapper.
 - `telora-daemon`: Rust daemon handling audio input and speech-to-text. Loads Whisper (whisper.cpp) or Qwen3-ASR (candle) through `voxora-bridge`.
 - `telora-gui`: GTK4 client for Wayland OSD overlay, visual feedback and control.
 - `telora-ctl`: CLI control client (binary name: `telora`) for sending commands to the GUI via Unix socket.
@@ -36,13 +36,26 @@ The daemon resolves the id through `voxora-hf` (which downloads, caches and veri
 - CUDA Toolkit (for GPU acceleration)
 - voxora 0.4.x, pinned via the workspace `[workspace.dependencies]` block in the top-level `Cargo.toml` (`voxora-bridge`, `voxora-registry`, `voxora-hf`, `voxora-traits` — all `"0.4"`). voxora 0.4 dropped the `voxora-core` deprecation shim that 0.3 shipped; the traits it used to re-export now live in `voxora-traits`. No sibling checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) is required: the daemon resolves everything through registry crates since commit `b4a252b` (`fix: consume voxora 0.2.0`).
 
-### 2. Building
+### 2. Cargo.lock and dependency changes
+
+`Cargo.lock` is committed and must stay synchronized with every workspace
+manifest. When adding a workspace crate or changing a dependency, run
+`cargo update --workspace`, review the lockfile diff, and commit `Cargo.lock`
+in the same pull request. Before review, run the locked workspace checks:
+
+```bash
+cargo build --locked --workspace --all-targets
+cargo test --locked --workspace --no-fail-fast
+```
+
+### 3. Building
+
 The recommended way to build is using the provided script, which ensures a consistent environment:
 ```bash
 ./scripts/build
 ```
 
-### 3. Local Testing
+### 4. Local Testing
 You can run the binaries directly from the `bin/` directory after building:
 ```bash
 # Start the daemon (loads the model referenced by telora.toml)
@@ -79,6 +92,11 @@ You can also override the model for testing:
 ```bash
 TELORA_MODEL_ID=Qwen/Qwen3-ASR-0.6B TELORA_MODEL_KIND=qwen3-asr ./bin/telora-daemon
 ```
+
+The model cache can be overridden for testing with `--voxora-cache DIR`
+or `VOXORA_CACHE_DIR=DIR`. The CLI value wins over the environment value;
+invalid absolute paths, traversal components, whitespace padding, and
+escaping symlink prefixes fall back to the XDG cache directory.
 
 ## Questions?
 Feel free to open an issue or a discussion on GitHub.

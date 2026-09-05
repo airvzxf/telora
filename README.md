@@ -251,6 +251,15 @@ Both tools print the same view; `telora-models` exists only for
 backwards compatibility with the pre-voxora packaging recipes and
 will be retired (see `TODO.md`).
 
+To use a different cache location, pass `--voxora-cache DIR` to the
+`telora-daemon` or `telora-models` command, or set `VOXORA_CACHE_DIR`.
+The CLI value takes precedence over the environment value. Absolute
+paths must remain under `$XDG_CACHE_HOME`; traversal components,
+whitespace-padded values, and escaping or dangling symlink prefixes are
+rejected and fall back to the XDG default. Relative paths are retained
+for backwards compatibility and are resolved relative to the process
+working directory.
+
 ### Model Resolution (Precedence)
 
 When the daemon resolves `model_id`, it goes through voxora-hf's
@@ -291,25 +300,25 @@ ss -lx | grep telora
 ls -la /run/user/$(id -u)/telora/
 ```
 
-**Legacy `/tmp/telora-sock` from before the XDG migration**:
-removing it manually is a one-liner:
+**Last-resort `/tmp/telora-<uid>/` fallback**: if `XDG_RUNTIME_DIR`
+is unset and `/run/user/<uid>` is not writable, the resolver logs the
+fallback and uses per-user `daemon.sock` and `control.sock` files there.
+Inspect the directory with:
 
 ```sh
-sudo rm -f /tmp/telora-sock /tmp/telora-control.sock
+ls -la /tmp/telora-$(id -u)/
 ```
 
-or with the AUR package's `pre_remove` hook:
+Remove an obsolete per-user fallback after stopping Telora with:
 
 ```sh
-sudo pacman -Rns telora-bin
+rm -rf /tmp/telora-$(id -u)
 ```
 
-**EPERM on bind (historical)**: this was the original symptom of
-a stale `/tmp/telora-sock` owned by another UID. After the XDG
-migration it can no longer happen — the runtime dir is owned by
-the current user and torn down by systemd. If you still see it,
-your `[paths] socket_dir` is pointing at `/tmp` and a stale file
-is blocking the bind; remove it as above.
+**EPERM on bind (historical)**: current systemd installations create a
+private runtime directory and enforce ownership and mode `0600`. If you
+still see a bind error, inspect `[paths] socket_dir` and remove only a
+stale socket owned by your user.
 
 ### Known limitation: `bind(2)` does not set `O_NOFOLLOW`
 
@@ -331,7 +340,7 @@ tracked as a mid-term follow-up.
 ### Workspace layout
 
 ```
-telora-common/    Shared library: socket-path resolver + atomic bind helper
+telora-common/    Shared paths, Unix-socket bind, and Voxora cache policy
 telora-daemon/    Audio capture + STT engine + IPC socket server
 telora-gui/       GTK4 Wayland OSD overlay + GUI control socket
 telora-ctl/       CLI control client (binary `telora`)
@@ -339,9 +348,11 @@ telora-models/    Thin voxora-hf wrapper (legacy, see TODO.md)
 ```
 
 `telora-common` owns the socket-path resolver (`paths::resolve`,
-`paths::daemon_socket_path`, `paths::control_socket_path`) and the
-`umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`). All
-three binaries consume that surface; new shared types belong there.
+`paths::daemon_socket_path`, `paths::control_socket_path`), the
+`umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`), and the
+Voxora cache policy (`cache::resolve_voxora_cache`). The daemon, GUI, CLI,
+and legacy model wrapper consume the relevant parts of that shared surface;
+new shared types belong there only when they preserve the leaf-crate boundary.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full structure and
 license notes.
 
@@ -377,6 +388,14 @@ git reset --hard origin/main
 ```bash
 git log --oneline -1   # expect: <sha> chore(release): vX.Y.Z — ...
 grep '^version' Cargo.toml   # expect: version = "X.Y.Z"
+```
+
+Before tagging, validate the committed lockfile with the same release command
+used by GitHub Actions. If this changes `Cargo.lock`, stop, commit the change,
+and repeat the verification from the resulting merge commit:
+
+```bash
+cargo build --release --locked --workspace --bins
 ```
 
 ③ **Tag with `-s` (GPG-signed), pointing at the merge SHA.** Never tag a local-only commit before it reaches `main`, and never tag a branch tip that will be squashed.

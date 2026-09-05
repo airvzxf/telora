@@ -23,10 +23,11 @@ model_kind = "whisper"
 #   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR (20 languages)
 #   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR (larger, 20 languages)
 #
-# To use a model that lives outside Hugging Face, point
-# `voxora_cache` (or the `--voxora-cache` CLI flag) at the
-# directory that already contains the weights — voxora-hf will pick
-# them up.
+# To use a model cache outside the default XDG location, pass
+# `--voxora-cache DIR` to the daemon or set `VOXORA_CACHE_DIR=DIR`.
+# The CLI value takes precedence over the environment value. Absolute
+# overrides must be under `$XDG_CACHE_HOME`; invalid overrides fall back
+# to `$XDG_CACHE_HOME/voxora/models/huggingface`.
 model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 
 # Legacy field: kept so old telora.toml files keep working.

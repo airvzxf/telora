@@ -52,7 +52,7 @@ RUN mkdir -p telora-common/src telora-daemon/src telora-gui/src telora-ctl/src t
     echo "fn main() {}" > telora-gui/src/main.rs && \
     echo "fn main() {}" > telora-ctl/src/main.rs && \
     echo "fn main() {}" > telora-models/src/main.rs && \
-    cargo build --release --workspace && \
+    cargo build --release --locked --workspace && \
     rm -rf telora-common/src telora-daemon/src telora-gui/src telora-ctl/src telora-models/src
 
 # 4. SOURCE: Copy entire project context
@@ -60,8 +60,8 @@ COPY . .
 
 # 5. BUILD: Final compilation
 RUN touch telora-common/src/lib.rs telora-daemon/src/main.rs telora-gui/src/main.rs telora-ctl/src/main.rs telora-models/src/main.rs && \
-    cargo clippy --release --workspace -- -D warnings && \
-    cargo build --release --workspace
+    cargo clippy --release --workspace --locked -- -D warnings && \
+    cargo build --release --workspace --locked
 
 # --- Stage 2: Runtime ---
 FROM docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
