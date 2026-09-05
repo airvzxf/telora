@@ -2,30 +2,21 @@
 //!
 //! The two callers used to open-code a near-identical routine (the
 //! daemon's lived in `socket.rs::SocketServer::bind`, the GUI's in
-//! `connection.rs::ControlServer::bind`). They diverged in two places
-//! that mattered:
-//!
-//!   * The daemon tightened the parent directory's mode after
-//!     `DirBuilder::create` and refused to continue if the resulting
-//!     mode leaked to group/other; the GUI skipped that re-check and
-//!     could therefore land the parent dir at e.g. `0o755` if the
-//!     kernel or umask ignored the chmod.
-//!   * The umask tightening that makes the `bind(2)` create the
-//!     socket atomically with mode `0o600` was a manual
-//!     `nix::sys::stat::umask(prev_umask)` call after the bind. A
-//!     panic in the bind path would leave the process running with
-//!     umask `0o177` and silently strip group/other bits from
-//!     unrelated file creation (logs, model cache) until the next
-//!     manual reset.
-//!
+//! `connection.rs::ControlServer::bind`). The shared helper now creates the
+//! parent directory with strict permissions, pins the Linux parent directory
+//! with `O_PATH | O_NOFOLLOW`, and applies `0600` relative to the pinned
+//! directory without changing the process-global umask.
 //! This module reconciles both: the parent-dir creation routes
-//! through [`paths::ensure_dir_0700`] (the daemon's stricter
-//! behaviour), and the umask dance is wrapped in an RAII type
-//! (`UmaskGuard`, kept private to the module) so the previous umask
-//! is restored even if the bind panics.
+//! through [`paths::ensure_dir_0700`] (the daemon's stricter behaviour),
+//! and the bound socket is changed to mode `0o600` through its owned file
+//! descriptor. It deliberately avoids mutating the process-global umask, so
+//! concurrent audio, model-cache, and log file creation cannot inherit a
+//! bind-time permission mask.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use log::info;
@@ -43,26 +34,36 @@ use crate::paths;
 /// from the daemon and `"telora-gui"` from the GUI so each side keeps
 /// its distinct remediation hint.
 pub fn bind_unix_socket(path: &Path, instance_name: &str) -> Result<UnixListener> {
+    bind_unix_socket_impl(path, instance_name)
+}
+
+fn bind_unix_socket_impl(path: &Path, instance_name: &str) -> Result<UnixListener> {
     ensure_parent_dir(path)?;
+
+    // Pin the resolved parent directory before inspecting or binding the
+    // target. On Linux this rejects a symlinked parent and lets the bind use
+    // `/proc/self/fd/<dirfd>/name`, so later path swaps cannot redirect it.
+    #[cfg(target_os = "linux")]
+    let parent_fd = open_secure_parent(path)
+        .map_err(anyhow::Error::from)
+        .context("opening the socket parent without following symlinks")?;
+
     remove_stale_socket(path, instance_name)?;
 
-    // Atomically create the socket with mode 0o600 by tightening
-    // umask for the duration of the bind. The `UmaskGuard` restores
-    // the previous umask on drop, including on panic, so an unrelated
-    // file-creation call downstream of `bind_unix_socket` cannot be
-    // affected by a bind-time panic.
-    let _umask_guard = UmaskGuard::restrict();
+    // Tighten permissions after bind through a directory FD on Linux. The
+    // parent directory is already mode 0700, so the short pre-chmod window is
+    // inaccessible to other UIDs and does not require a process-global umask.
+    #[cfg(target_os = "linux")]
+    let bind_result = bind_unix_listener_with_parent(path, &parent_fd);
+    #[cfg(not(target_os = "linux"))]
     let bind_result = bind_unix_listener(path);
 
     let listener = bind_result.map_err(|e| map_bind_error(e, path, instance_name))?;
 
-    // Defensive chmod: in case the kernel ignored umask for some
-    // reason, force the mode back to 0o600. Matches the daemon's
-    // belt-and-suspenders pattern; this is a second line of defence
-    // rather than the primary fix.
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms).context("Failed to set socket permissions to 0o600")?;
+    #[cfg(target_os = "linux")]
+    set_socket_permissions(path, &parent_fd)?;
+    #[cfg(not(target_os = "linux"))]
+    set_socket_permissions(path)?;
 
     info!(
         "Listening on unix socket: {} (restricted to 0600)",
@@ -72,42 +73,6 @@ pub fn bind_unix_socket(path: &Path, instance_name: &str) -> Result<UnixListener
     );
 
     Ok(listener)
-}
-
-/// RAII wrapper that tightens the process umask to `0o177` on
-/// construction and restores the previous value on drop.
-///
-/// The umask is captured BEFORE the new value is set so a panic
-/// inside `Drop` still restores the original. The `Drop` impl
-/// intentionally does not return the error from `umask(2)` — a
-/// failure to restore is not recoverable, but a `log::warn!` gives
-/// the operator a chance to spot it.
-struct UmaskGuard {
-    prev: nix::sys::stat::Mode,
-}
-
-impl UmaskGuard {
-    fn restrict() -> Self {
-        let prev = nix::sys::stat::umask(
-            nix::sys::stat::Mode::S_IROTH
-                | nix::sys::stat::Mode::S_IWOTH
-                | nix::sys::stat::Mode::S_IXOTH,
-        );
-        Self { prev }
-    }
-}
-
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        // Restore on every exit path so unrelated file creation in
-        // the caller (logs, model cache, …) is unaffected even if the
-        // bind panicked. The `mode` returned by `umask(2)` is the
-        // previous mask, not an errno indicator — `nix` surfaces
-        // errors through the result, but the restore call is
-        // infallible at the libc layer because umask always
-        // succeeds.
-        nix::sys::stat::umask(self.prev);
-    }
 }
 
 /// Create the parent directory of `path` with mode `0o700` via
@@ -131,8 +96,9 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// Remove a stale socket file at `path` if it is owned by the
-/// current UID. A socket owned by another UID triggers an actionable
-/// error so the operator can clean it up.
+/// current UID. Non-socket entries are never removed automatically, and a
+/// symlink is rejected so a bind cannot silently consume an attacker-planted
+/// path.
 fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -146,6 +112,29 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
             )));
         }
     };
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+
+    if meta.file_type().is_symlink() {
+        return Err(anyhow::anyhow!(
+            "refusing to bind: symlink at '{basename}'; remove it manually after verifying its owner"
+        ));
+    }
+    if !meta.file_type().is_socket() {
+        let kind = if meta.file_type().is_dir() {
+            "directory"
+        } else if meta.file_type().is_file() {
+            "regular file"
+        } else {
+            "non-socket entry"
+        };
+        return Err(anyhow::anyhow!(
+            "refusing to remove {kind} at '{basename}'; remove it manually before starting {instance}",
+            instance = instance_name,
+        ));
+    }
 
     let current_uid = nix::unistd::getuid().as_raw();
     if meta.uid() != current_uid {
@@ -153,10 +142,6 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
             "stale socket '{basename}' in the user-runtime telora directory is not owned by the current user; \
              another {instance} instance appears to be running (or its previous run did not clean up). \
              Use `ls -la <full-path>` to find the owner and `sudo rm <full-path>` to remove it.",
-            basename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("<unknown>"),
             instance = instance_name,
         ));
     }
@@ -165,28 +150,88 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
     // of a race with another process that just unlinked it.
     match std::fs::remove_file(path) {
         Ok(()) => {
-            info!(
-                "Removed stale socket file: {}",
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("<unknown>")
-            );
+            info!("Removed stale socket file: {basename}");
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!(
-            "removing stale socket {}",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("<unknown>")
-        ))),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("removing stale socket {basename}"))),
     }
 }
 
-/// Build a `socket2::Socket`, bind it as a Unix stream listener at
-/// `path`, and convert it to a Tokio `UnixListener`. Returns the raw
-/// I/O error so the caller can map it to an actionable message.
+#[cfg(target_os = "linux")]
+fn nix_to_io(error: nix::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error as i32)
+}
+
+#[cfg(target_os = "linux")]
+fn open_secure_parent(path: &Path) -> std::io::Result<OwnedFd> {
+    let parent = path
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no parent directory",
+            )
+        })?;
+    let raw_fd = nix::fcntl::open(
+        parent,
+        nix::fcntl::OFlag::O_PATH
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(nix_to_io)?;
+    // SAFETY: `open` returned a fresh owned descriptor; `OwnedFd` takes over
+    // its lifetime exactly once.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let stat = nix::sys::stat::fstat(fd.as_raw_fd()).map_err(nix_to_io)?;
+    let current_uid = nix::unistd::getuid().as_raw();
+    if stat.st_uid != current_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "socket parent directory is not owned by the current user",
+        ));
+    }
+    if stat.st_mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "socket parent directory is writable by group or other users",
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_unix_listener_with_parent(
+    path: &Path,
+    parent_fd: &OwnedFd,
+) -> std::io::Result<UnixListener> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path has no file name",
+        )
+    })?;
+    // `/proc/self/fd/<parent_fd>` pins the directory selected by
+    // `open_secure_parent`; intermediate path components cannot be swapped
+    // between the security check and bind(2).
+    let bind_path = PathBuf::from("/proc/self/fd")
+        .join(parent_fd.as_raw_fd().to_string())
+        .join(name);
+    bind_unix_listener_at(&bind_path)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn bind_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
+    bind_unix_listener_at(path)
+}
+
+/// Build a `socket2::Socket`, bind it as a Unix stream listener at
+/// `path`, and convert it to a Tokio `UnixListener`. Permission tightening is
+/// performed by the caller after the listener is bound.
+fn bind_unix_listener_at(path: &Path) -> std::io::Result<UnixListener> {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
     let addr = socket2::SockAddr::unix(path)?;
     sock.bind(&addr)?;
@@ -196,6 +241,31 @@ fn bind_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
     std_listener.set_nonblocking(true)?;
     let tokio_listener = UnixListener::from_std(std_listener)?;
     Ok(tokio_listener)
+}
+
+#[cfg(target_os = "linux")]
+fn set_socket_permissions(path: &Path, parent_fd: &OwnedFd) -> std::io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path has no file name",
+        )
+    })?;
+    nix::sys::stat::fchmodat(
+        Some(parent_fd.as_raw_fd()),
+        name,
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+        nix::sys::stat::FchmodatFlags::FollowSymlink,
+    )
+    .map_err(nix_to_io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_socket_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Translate a `bind(2)` failure into a user-actionable error. The
@@ -216,7 +286,10 @@ fn map_bind_error(err: std::io::Error, path: &Path, instance_name: &str) -> anyh
             instance = instance_name,
         ),
         ErrorKind::PermissionDenied => anyhow::anyhow!(
-            "permission denied binding socket at '{basename}' — parent directory not writable or sticky bit blocked removal of stale socket"
+            "permission denied binding socket at '{basename}' — check parent ownership, directory mode, and any MAC policy"
+        ),
+        ErrorKind::InvalidInput => anyhow::anyhow!(
+            "socket path '{basename}' is invalid or exceeds the Unix socket path limit"
         ),
         _ => {
             anyhow::Error::from(err).context(format!("Failed to bind unix socket at {}", basename))
@@ -228,14 +301,6 @@ fn map_bind_error(err: std::io::Error, path: &Path, instance_name: &str) -> anyh
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    /// Process-global lock for tests that exercise the bind helper
-    /// under a permissive umask. The lock is local to this module
-    /// because the bind tests do not need to serialise against the
-    /// `paths::tests` env-var dance (they always create a fresh
-    /// tempdir, so they do not need `XDG_RUNTIME_DIR`).
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bind_creates_0o700_parent_and_0o600_socket() {
@@ -262,6 +327,81 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&tmp);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_rejects_preexisting_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("telora");
+        std::fs::create_dir(&parent).expect("create parent");
+        let socket_path = parent.join("daemon.sock");
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(&target, &socket_path).expect("create symlink");
+
+        let error = bind_unix_socket(&socket_path, "telora-daemon")
+            .expect_err("a pre-existing symlink must be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("symlink"), "unexpected error: {message}");
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_rejects_symlinked_parent_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_parent = tmp.path().join("real");
+        let linked_parent = tmp.path().join("linked");
+        std::fs::create_dir(&real_parent).expect("create real parent");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).expect("create parent symlink");
+        let socket_path = linked_parent.join("daemon.sock");
+
+        let error = bind_unix_socket(&socket_path, "telora-daemon")
+            .expect_err("a symlinked parent must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("symlink") || message.contains("Too many levels"),
+            "unexpected error: {message}"
+        );
+        assert!(!real_parent.join("daemon.sock").exists());
+    }
+
+    #[test]
+    fn bind_rejects_preexisting_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("telora");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let socket_path = parent.join("daemon.sock");
+        std::fs::create_dir(&socket_path).expect("create target directory");
+
+        let error = bind_unix_socket(&socket_path, "telora-daemon")
+            .expect_err("a directory at the target must be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("directory"), "unexpected error: {message}");
+        assert!(socket_path.is_dir());
+    }
+
+    #[test]
+    fn bind_rejects_preexisting_regular_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("telora");
+        std::fs::create_dir_all(&parent).expect("create parent");
+        let socket_path = parent.join("daemon.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("create target file");
+
+        let error = bind_unix_socket(&socket_path, "telora-daemon")
+            .expect_err("a regular file at the target must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("regular file"),
+            "unexpected error: {message}"
+        );
+        assert!(socket_path.is_file());
     }
 
     #[test]
@@ -369,34 +509,22 @@ mod tests {
         });
     }
 
-    /// Regression test for F2 finding C: bind must end with mode
-    /// `0o600` even when the process umask is permissive
-    /// (`0o000`). The bind helper tightens umask itself
-    /// (`UmaskGuard::restrict`) so the `bind(2)` creates the socket
-    /// with mode `0o600` atomically. Without that, the `chmod(2)`
-    /// after `bind` would still leave a TOCTOU window where the
-    /// socket is briefly world-readable under a permissive umask.
+    /// The socket mode is enforced through the owned descriptor rather than
+    /// by mutating the process-global umask. This keeps concurrent file
+    /// creation in other runtime tasks independent of the bind operation.
     #[test]
-    fn bind_is_atomic_with_umask() {
-        let _guard = UMASK_LOCK.lock().unwrap();
+    fn bind_sets_socket_mode_through_owned_fd() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let prev_umask = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
             let tmp = tempfile::tempdir().expect("tempdir");
             let sock_path = tmp.path().join("telora/control.sock");
-            let result = bind_unix_socket(&sock_path, "telora-gui");
-            nix::sys::stat::umask(prev_umask);
-
-            let _listener = result.expect("bind should succeed");
+            let listener = bind_unix_socket(&sock_path, "telora-gui").expect("bind should succeed");
             let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
-            assert_eq!(
-                mode & 0o777,
-                0o600,
-                "control socket must be 0o600 even under umask 0o000"
-            );
+            assert_eq!(mode & 0o777, 0o600, "control socket must be 0o600");
+            drop(listener);
         });
     }
 

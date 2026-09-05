@@ -16,7 +16,7 @@
 //! `ensure_parent_dir_0700` did not perform.
 
 use anyhow::{Context, Result};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// User-supplied path overrides from `telora.toml` `[paths]`.
@@ -155,8 +155,10 @@ fn is_writable(p: &Path) -> bool {
 /// Create `p` (and any missing parents) with mode `0o700`. Refuses
 /// to continue if the resulting mode would leak to group or other.
 pub fn ensure_dir_0700(p: &Path) -> Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder
         .create(p)
         .with_context(|| format!("DirBuilder::create({})", p.display()))?;
     let mut perms = std::fs::metadata(p)?.permissions();

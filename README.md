@@ -207,7 +207,7 @@ Engine Kind:     whisper
 ## Security & Privacy
 
 - **Memory Protection**: The daemon enforces a memory limit on audio buffers (configurable via `max_recording_seconds`) to prevent OOM crashes.
-- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is created with mode `0600` using `umask 0o177`. A defensive `chmod 0600` follows the bind, and the remaining symlink-swap limitation is described in [Known limitation: `bind(2)` does not set `O_NOFOLLOW`](#known-limitation-bind2-does-not-set-onofollow). The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove sockets on stop. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID. The shared helper (`telora_common::socket_bind::bind_unix_socket`) wraps the umask tightening in an RAII guard so it is restored even if the bind panics.
+- **Socket Security**: IPC sockets live under `$XDG_RUNTIME_DIR/telora/` (fallback `/run/user/<uid>/telora/`); the parent directory is created with mode `0700` and the socket is tightened to `0600` through the pinned parent directory. The helper does not mutate the process-global umask. The remaining symlink-swap limitation is described in [Socket bind hardening](#socket-bind-hardening). The systemd user units enforce `RuntimeDirectory=telora` + `RuntimeDirectoryMode=0700`, and `telora-daemon.service` runs an `ExecStopPost` to remove sockets on stop. Override the daemon's location with `[paths] socket_dir = "..."` in `telora.toml`. A pre-existing socket file is removed only after a `symlink_metadata` check confirms it is owned by the current UID.
 - **Privacy**: Transcriptions are processed locally and never logged to disk or system logs. Temporary file communication has been replaced with secure direct memory transfer.
 
 ## Model Management
@@ -325,20 +325,21 @@ private runtime directory with mode `0700` and sockets with mode `0600`. If you
 still see a bind error, inspect `[paths] socket_dir` and remove only a
 stale socket owned by your user.
 
-### Known limitation: `bind(2)` does not set `O_NOFOLLOW`
+### Socket bind hardening
 
-The daemon and GUI sockets are created with `umask 0o177` so the
-mode is `0o600` atomically inside `bind(2)`, but the bind itself
-does **not** pass `O_NOFOLLOW`. A symlink swap race between the
-`symlink_metadata` ownership pre-check and the `bind(2)` syscall
-is therefore theoretically open for the duration of one scheduling
-slice. The current defence is the `symlink_metadata` pre-check
-plus umask enforcement — adequate for the EPIC's stated threat
-model (stale socket owned by another UID on the same machine) but
-not a full TOCTOU fix. Adding `O_NOFOLLOW` to the bind path
-(open the parent directory with `O_PATH`, then
-`linkat(AT_FDCWD, name, parent_fd, name, AT_EMPTY_PATH)`) is
-tracked as a mid-term follow-up.
+The shared bind helper creates the parent directory with mode `0700`. On Linux
+it opens the immediate parent with `O_PATH | O_NOFOLLOW | O_DIRECTORY`, keeps
+that directory descriptor alive through `bind(2)`, and applies `chmod 0600`
+relative to the pinned directory. Existing symlinks, directories, and regular
+files at the socket name are rejected instead of being removed automatically.
+
+Linux `bind(2)` does not accept an `O_NOFOLLOW` flag, and the final socket name
+is not followed as a symlink by the kernel. The parent-descriptor check closes
+the parent-path substitution case; a same-UID process can still race the final
+name and cause a denial of service before `bind(2)`, so this is not a complete
+atomic-publish solution. Systemd socket activation remains the strongest
+production mitigation because systemd owns the listening socket before the
+service starts.
 
 ## Development
 
