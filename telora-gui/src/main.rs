@@ -67,6 +67,11 @@ fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
 #[derive(Debug, Clone)]
 enum AppAction {
     ToggleRecording(String, bool), // mode, is_auto_stop
+    /// Idempotent STOP dispatched by the daemon when the recording
+    /// safety limit (`max_recording_seconds`) fires. Distinct from
+    /// `ToggleRecording` so the GUI never accidentally STARTS a new
+    /// recording in response to a duplicate `AUTO_STOP`.
+    AutoStop,
     CancelRecording,
     OsdUpdate(String, String), // Text, Color
     OsdHide,
@@ -197,6 +202,22 @@ fn main() {
                             } else {
                                 osd_clone.show("Procesando...", "orange");
                             }
+                            let _ = daemon_tx.send(DaemonCommand::Stop {
+                                mode: current_mode.clone(),
+                                response_tx: tx_back.clone(),
+                            });
+                        }
+                    }
+                    AppAction::AutoStop => {
+                        // Idempotent STOP. Only acts when the GUI is
+                        // currently recording — duplicate `AUTO_STOP`
+                        // deliveries (network blip, retry, double
+                        // buffer flush) are no-ops. The `mode` is
+                        // recovered from `current_mode` so the daemon
+                        // still knows whether to TYPE or COPY.
+                        if recording {
+                            recording = false;
+                            osd_clone.show("⏳ LÍMITE ALCANZADO", "orange");
                             let _ = daemon_tx.send(DaemonCommand::Stop {
                                 mode: current_mode.clone(),
                                 response_tx: tx_back.clone(),
@@ -358,9 +379,7 @@ async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
                         let _ = tx.send(AppAction::CancelRecording).await;
                     }
                     "AUTO_STOP" => {
-                        let _ = tx
-                            .send(AppAction::ToggleRecording("AUTO".to_string(), true))
-                            .await;
+                        let _ = tx.send(AppAction::AutoStop).await;
                     }
                     _ => {}
                 }
