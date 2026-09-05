@@ -3618,7 +3618,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telora"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3644,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "telora-daemon"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3669,7 +3669,7 @@ dependencies = [
 
 [[package]]
 name = "telora-gui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3688,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "telora-models"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
