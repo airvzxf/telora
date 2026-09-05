@@ -1,6 +1,10 @@
 //! End-to-end regression for `airvzxf/telora#79` against the
 //! registry introduced in voxora 0.2.0.
 //!
+//! The registry semantics it pins have been stable since the
+//! voxora 0.2.0 fix; the test currently runs against the voxora
+//! 0.4 line.
+//!
 //! Before the fix, `telora-daemon/src/transcriber.rs::from_id` would
 //! take the on-disk directory returned by `voxora_hf::resolve_single_file`,
 //! lex-sort every `*.bin` file inside it, and pick the first one.
@@ -84,9 +88,11 @@ fn build_cache_with_marker_but_missing_file() -> TempDir {
 }
 
 /// Build a `HuggingFaceSource` pinned at the test's cache root,
-/// plus a `Registry` that uses it. Returns both because every test
-/// here needs the source for `capabilities_for` sanity checks and
-/// the registry for the canonical resolve path.
+/// plus a `Registry` that uses it. Returns both because the
+/// cache-marker test (`resolve_rejects_cache_with_marker_but_missing_file`)
+/// needs `source.resolve(...)` directly to assert on the underlying
+/// `AsrError::ModelNotFound` without going through `RegistryError::Parse`,
+/// and both tests need the registry for the canonical resolve path.
 fn build_source_and_registry(cache_root: &std::path::Path) -> (Arc<HuggingFaceSource>, Registry) {
     let source = Arc::new(
         HuggingFaceSource::builder()

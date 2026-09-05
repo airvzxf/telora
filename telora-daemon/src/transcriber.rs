@@ -305,7 +305,6 @@ fn iso_to_qwen_name(iso: &str) -> Option<String> {
         "vi" => "vietnamese",
         "ja" => "japanese",
         "hi" => "hindi",
-        "bn" => "bengali",
         "ms" => "malay",
         "tr" => "turkish",
         "nl" => "dutch",
@@ -378,20 +377,39 @@ mod tests {
     #[test]
     fn iso_to_qwen_known_codes_round_trip() {
         for iso in [
-            "en", "zh", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi",
-            "ja", "hi",
+            "en", "zh", "zh-cn", "zh-hans", "yue", "zh-yue", "ar", "de", "fr", "es", "pt", "id",
+            "it", "ko", "ru", "th", "vi", "ja", "hi", "ms", "tr", "nl", "sv",
         ] {
             assert!(
                 iso_to_qwen_name(iso).is_some(),
                 "iso {iso:?} should map to a Qwen language name"
             );
         }
+        // `bn` is intentionally NOT mapped — voxora-qwen3asr's closed
+        // 20-entry list does not include `bengali`. A user who writes
+        // `language = "bn"` in `telora.toml` now hits the daemon's
+        // own "not supported" error path (which already names
+        // `voxora_bridge::known_languages` as the canonical list)
+        // instead of a misleading "looks OK" pass-through that
+        // voxora then rejects.
+        assert!(
+            iso_to_qwen_name("bn").is_none(),
+            "bn must not be mapped: voxora-qwen3asr does not accept 'bengali'"
+        );
     }
 
     #[test]
     fn iso_to_qwen_rejects_unknown() {
         assert!(iso_to_qwen_name("xx").is_none());
         assert!(iso_to_qwen_name("").is_none());
+        // `bn` is the canonical "looks-plausible-but-unmapped" code;
+        // pin it explicitly so a future re-addition of `bengali` to
+        // voxora-qwen3asr is a deliberate code change, not a silent
+        // regression.
+        assert!(
+            iso_to_qwen_name("bn").is_none(),
+            "bn must not be mapped to a Qwen language name"
+        );
     }
 
     #[test]
