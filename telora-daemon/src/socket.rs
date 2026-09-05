@@ -149,11 +149,15 @@ impl SocketServer {
     /// EADDRINUSE remediation hint points the operator at
     /// `systemctl --user status telora-daemon` instead of the GUI's
     /// "previous session" hint.
-    pub fn bind(path: &Path, cmd_tx: mpsc::Sender<Command>, foreground: bool) -> Result<Self> {
-        let listener = if foreground {
-            bind_unix_socket_manual(path, "telora-daemon")?
-        } else {
+    pub fn bind(
+        path: &Path,
+        cmd_tx: mpsc::Sender<Command>,
+        allow_activation: bool,
+    ) -> Result<Self> {
+        let listener = if allow_activation {
             bind_unix_socket(path, "telora-daemon")?
+        } else {
+            bind_unix_socket_manual(path, "telora-daemon")?
         };
         Ok(Self { listener, cmd_tx })
     }

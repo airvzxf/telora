@@ -19,7 +19,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use tokio::net::UnixListener;
 
 use crate::paths;
@@ -52,30 +52,85 @@ fn try_inherited_listener(instance_name: &str) -> Result<Option<UnixListener>> {
 
     use libsystemd::activation::{IsType, receive_descriptors};
 
-    let descriptors = receive_descriptors(false)
+    // `true` unexports `LISTEN_PID` / `LISTEN_FDS` after consumption, matching
+    // `sd_listen_fds`'s documented contract so a future child process can't
+    // accidentally re-adopt our descriptors.
+    let descriptors = receive_descriptors(true)
         .map_err(|error| anyhow::anyhow!("reading systemd activation descriptors: {error}"))?;
     if descriptors.is_empty() {
         return Ok(None);
     }
 
-    let descriptor_count = descriptors.len();
-    for descriptor in descriptors {
-        if !descriptor.is_unix() {
-            let raw_fd = descriptor.into_raw_fd();
-            // SAFETY: `receive_descriptors` transferred this descriptor to us;
-            // dropping the wrapper closes rejected non-Unix descriptors.
-            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-            continue;
-        }
-        let raw_fd = descriptor.into_raw_fd();
-        if let Ok(listener) = adopt_stream_listener(raw_fd) {
-            return Ok(Some(listener));
+    // Take ownership of every descriptor up front: `libsystemd::activation::
+    // FileDescriptor` does NOT implement `Drop`, so leaving unconsumed entries
+    // in a Vec would leak their FDs whenever the function returned early. The
+    // bug surfaced with two or more `ListenStream=` lines in the socket unit:
+    // the first successful adoption returned from the loop and the rest of
+    // the descriptors silently leaked.
+    let raw_fds: Vec<RawFd> = descriptors
+        .into_iter()
+        .filter_map(|d| {
+            if d.is_unix() {
+                Some(d.into_raw_fd())
+            } else {
+                let raw_fd = d.into_raw_fd();
+                // SAFETY: `receive_descriptors` transferred this descriptor
+                // to us; dropping the wrapper closes rejected non-Unix
+                // descriptors (e.g. FIFOs from `ListenFIFO=`).
+                drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                None
+            }
+        })
+        .collect();
+    let descriptor_count = raw_fds.len();
+    let mut adopted: Option<UnixListener> = None;
+    let mut last_skip: Option<String> = None;
+    let mut next_unconsumed = 0usize;
+
+    for (i, raw_fd) in raw_fds.iter().copied().enumerate() {
+        match adopt_stream_listener(raw_fd) {
+            Ok(listener) => {
+                adopted = Some(listener);
+                next_unconsumed = i + 1;
+                break;
+            }
+            Err(e) => {
+                last_skip = Some(e.to_string());
+                next_unconsumed = i + 1;
+                // adopt_stream_listener closed the FD via OwnedFd::drop on
+                // its error paths; nothing to do here.
+            }
         }
     }
 
-    anyhow::bail!(
-        "systemd passed us {descriptor_count} descriptor(s), but none is a listening Unix stream"
-    )
+    // Close any FDs we never passed to adopt_stream_listener (defense in
+    // depth — adopt_stream_listener already closes every FD it touches).
+    for raw_fd in &raw_fds[next_unconsumed..] {
+        drop(unsafe { OwnedFd::from_raw_fd(*raw_fd) });
+    }
+
+    match adopted {
+        Some(listener) => {
+            info!(
+                "Using inherited systemd listener for {instance_name}; \
+                 systemd handed us {descriptor_count} descriptor(s)"
+            );
+            Ok(Some(listener))
+        }
+        None => {
+            // Either `LISTEN_FDS` leaked into the env from a parent shell
+            // or the socket unit was misconfigured (e.g. `ListenFIFO=` by
+            // mistake). Warn and fall through to the manual bind path so a
+            // transient systemd hiccup never wedges the daemon.
+            warn!(
+                "systemd passed {descriptor_count} descriptor(s) via $LISTEN_FDS, \
+                 but none was a listening Unix stream (last error: {}); \
+                 falling back to manual bind",
+                last_skip.unwrap_or_else(|| "<unknown>".to_string())
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Bind a Unix stream listener at `path` with the same security

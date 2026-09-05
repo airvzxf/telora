@@ -4,6 +4,8 @@ use config::{Config, File};
 use log::{error, info, warn};
 use ringbuf::HeapRb;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use telora_common::cache::resolve_voxora_cache;
 use telora_daemon::{
     AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
@@ -11,6 +13,7 @@ use telora_daemon::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
@@ -48,9 +51,12 @@ struct Args {
     #[arg(long)]
     max_recording_seconds: Option<u32>,
 
-    /// Force the manual filesystem bind path, ignoring inherited systemd FDs.
+    /// Skip systemd socket activation and bind the daemon socket manually
+    /// in `$XDG_RUNTIME_DIR/telora/daemon.sock`. Use this when running the
+    /// daemon outside systemd (development, CI, ad-hoc debugging) without
+    /// inheriting `LISTEN_FDS` from a parent shell.
     #[arg(long)]
-    foreground: bool,
+    no_activation: bool,
 
     /// Hugging Face cache directory (overrides config).
     #[arg(long, value_name = "DIR")]
@@ -476,7 +482,7 @@ async fn main() -> Result<()> {
         control_socket: paths_config.control_socket.clone(),
     };
     let resolved_paths = paths::resolve(&paths_cfg)?;
-    let socket_server = SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, args.foreground)
+    let socket_server = SocketServer::bind(&resolved_paths.daemon_sock, cmd_tx, args.no_activation)
         .context("Failed to bind socket")?;
 
     tokio::spawn(async move {
@@ -496,7 +502,33 @@ async fn main() -> Result<()> {
         resolved_paths.daemon_sock.display()
     );
 
+    // Graceful shutdown: systemd sends SIGTERM on
+    // `systemctl --user stop telora-daemon.socket`; without a handler the
+    // loop dies abruptly with no log and no chance to drop the audio
+    // engine or socket server cleanly. SIGINT lets Ctrl-C in a dev shell
+    // do the same.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown_signal = Arc::clone(&shutdown);
+        let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => info!("Received SIGTERM; initiating graceful shutdown"),
+                _ = sigint.recv()  => info!("Received SIGINT; initiating graceful shutdown"),
+            }
+            shutdown_signal.store(true, Ordering::SeqCst);
+        });
+    }
+
     loop {
+        // Check shutdown flag at every tick (idle tick is 5 ms) so SIGTERM
+        // and SIGINT from systemd / Ctrl-C drain the loop promptly.
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown flag set; exiting event loop");
+            break;
+        }
+
         // Non-blocking check for commands
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -662,4 +694,7 @@ async fn main() -> Result<()> {
             audio_buffer.clear();
         }
     }
+
+    info!("Telora daemon stopped cleanly");
+    Ok(())
 }
