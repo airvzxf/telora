@@ -3532,6 +3532,7 @@ name = "telora-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "log",
  "nix",
  "socket2 0.5.10",
@@ -3548,7 +3549,6 @@ dependencies = [
  "clap",
  "config",
  "cpal",
- "dirs",
  "env_logger",
  "hound",
  "log",
@@ -3591,9 +3591,10 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
- "dirs",
  "env_logger",
  "log",
+ "telora-common",
+ "tempfile",
  "tokio",
  "voxora-hf",
  "voxora-traits",

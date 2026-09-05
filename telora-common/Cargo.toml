@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
+dirs = "5"
 log = "0.4"
 nix = { version = "0.27", features = ["fs", "user"] }
 tokio = { version = "1.36", features = ["net"] }

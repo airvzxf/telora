@@ -427,9 +427,10 @@ async fn main() -> Result<()> {
     // accepted verbatim and the F2 commit's claim that the
     // sanitiser gates the override was false. Going through the
     // helper closes that gap.
+    let env_cache_override = std::env::var_os("VOXORA_CACHE_DIR").map(std::path::PathBuf::from);
     let voxora_cache = resolve_voxora_cache(
-        args.voxora_cache.as_deref(),
-        std::env::var("VOXORA_CACHE_DIR").ok().as_deref(),
+        args.voxora_cache.as_deref().map(std::path::Path::new),
+        env_cache_override.as_deref(),
     )
     .context("resolving voxora cache directory")?;
 
