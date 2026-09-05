@@ -141,8 +141,8 @@ pub struct SocketServer {
 
 impl SocketServer {
     /// Bind the daemon's control Unix socket at `path`. Delegates
-    /// the parent-dir creation, stale-socket removal, umask dance,
-    /// and bind itself to
+    /// parent-directory creation, stale-socket ownership checks, Linux
+    /// parent-path pinning, and permission tightening to
     /// [`telora_common::socket_bind::bind_unix_socket`], which is the
     /// single source of truth shared with `telora-gui`. The
     /// `instance_name` tag is hard-coded to `"telora-daemon"` so the

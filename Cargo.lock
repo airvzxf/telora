@@ -3576,7 +3576,6 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "log",
- "nix",
  "serde",
  "telora-common",
  "tempfile",

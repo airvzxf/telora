@@ -355,7 +355,7 @@ telora-models/    Thin voxora-hf wrapper (legacy, see TODO.md)
 
 `telora-common` owns the socket-path resolver (`paths::resolve`,
 `paths::daemon_socket_path`, `paths::control_socket_path`), the
-`umask 0o177` Unix-bind helper (`socket_bind::bind_unix_socket`), and the
+Linux-hardened Unix-bind helper (`socket_bind::bind_unix_socket`), and the
 Voxora cache policy (`cache::resolve_voxora_cache`). The daemon, GUI, CLI,
 and legacy model wrapper consume the relevant parts of that shared surface;
 new shared types belong there only when they preserve the leaf-crate boundary.

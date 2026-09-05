@@ -91,6 +91,14 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
                     .unwrap_or("<unknown>")
             )
         })?;
+    if let Ok(metadata) = std::fs::symlink_metadata(parent) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "socket parent directory {} is a symlink; refusing to follow it",
+                parent.display()
+            );
+        }
+    }
     paths::ensure_dir_0700(parent)
         .with_context(|| format!("ensuring socket parent directory {}", parent.display()))
 }
@@ -570,7 +578,7 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o077, 0, "socket dir must not leak to group/other");
+        assert_eq!(mode & 0o777, 0o700, "socket dir must be exactly 0o700");
 
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
