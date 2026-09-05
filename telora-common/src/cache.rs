@@ -23,10 +23,8 @@ use anyhow::Result;
 pub fn default_voxora_cache_dir() -> Result<PathBuf> {
     if let Some(custom) = std::env::var_os("VOXORA_CACHE_DIR") {
         let custom = PathBuf::from(custom);
-        if !is_blank(&custom) {
-            if let Some(accepted) = sanitize_with_source(&custom, "VOXORA_CACHE_DIR") {
-                return Ok(accepted);
-            }
+        if let Some(accepted) = sanitize_with_source(&custom, "VOXORA_CACHE_DIR") {
+            return Ok(accepted);
         }
     }
 
@@ -50,9 +48,6 @@ pub fn resolve_voxora_cache(
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(args_override) = args_override {
-        if is_blank(args_override) {
-            return xdg_default_cache_dir();
-        }
         if let Some(accepted) = sanitize_with_source(args_override, "--voxora-cache") {
             return Ok(accepted);
         }
@@ -60,10 +55,8 @@ pub fn resolve_voxora_cache(
     }
 
     if let Some(env_override) = env_override {
-        if !is_blank(env_override) {
-            if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
-                return Ok(accepted);
-            }
+        if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
+            return Ok(accepted);
         }
     }
 
