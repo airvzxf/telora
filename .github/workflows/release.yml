@@ -453,7 +453,7 @@ jobs:
   # `make install` then packs everything into the AUR tree.
   build-aur-package:
     name: 'Build · AUR package (Arch)'
-    needs: [build-release, validate-tag-input]
+    needs: [build-release, validate-tag-input, verify-tag-reachability]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # contents: read is enough — the AUR build only downloads the
@@ -486,12 +486,21 @@ jobs:
         # so `pkg/` and friends are absent. Without this step the
         # PKGBUILD-update / makepkg / verify steps all fail with
         # `OCI runtime exec failed: chdir to cwd (.../pkg) ... no such
-        # file or directory`. Pin `ref` to the tag (not the branch tip)
-        # so the checkout matches the binaries we just downloaded from
-        # the build-release artefact.
+        # file or directory`.
+        #
+        # Pin `ref` to the resolved tag commit SHA (the same one
+        # `build-release` uses at line 266) instead of the raw tag /
+        # branch ref. The branch tip could move between tag-resolution
+        # and the checkout; a SHA pins the AUR build to the same commit
+        # the GitHub Release artefacts were produced from, so the
+        # published `.pkg.tar.zst`'s embedded `pkg/PKGBUILD` and
+        # `telora-bin.install` match the binaries it wraps. Without
+        # this, a force-push to `main` after the tag was created could
+        # silently produce an AUR package whose source tree disagrees
+        # with its binaries.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
       - name: Verify arch matches the release binaries
