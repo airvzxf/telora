@@ -180,12 +180,13 @@ impl SocketServer {
             match self.listener.accept().await {
                 Ok((mut stream, _addr)) => {
                     let cmd_tx = self.cmd_tx.clone();
-                    // Split the stream into independent read and
-                    // write halves so we can `take` the read side
-                    // (bounded to REFRESH_MAX_BYTES) without
-                    // consuming the write side.
-                    let (mut read_half, mut write_half) = stream.split();
                     tokio::spawn(async move {
+                        // Split the stream into independent read and
+                        // write halves inside the spawned task so the
+                        // halves satisfy `'static` (the split borrows
+                        // from `stream`, and the spawned future must
+                        // own all of its captured state).
+                        let (mut read_half, mut write_half) = stream.split();
                         // Read the full payload rather than a fixed
                         // 2 KiB slice. A REFRESH whose JSON is split
                         // across multiple read syscalls (common on
