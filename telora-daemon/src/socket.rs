@@ -201,10 +201,10 @@ impl SocketServer {
                         let mut buf = Vec::new();
                         let mut limited = (&mut read_half).take(REFRESH_MAX_BYTES);
                         match limited.read_to_end(&mut buf).await {
-                            Ok(()) if buf.is_empty() => {
+                            Ok(_) if buf.is_empty() => {
                                 let _ = write_half.write_all(b"ERROR: empty command").await;
                             }
-                            Ok(()) => {
+                            Ok(_) => {
                                 let command_str = String::from_utf8_lossy(&buf).trim().to_string();
                                 info!("Received command: {}", command_str);
 
