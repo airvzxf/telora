@@ -17,6 +17,18 @@ impl SocketClient {
             .await
             .context("Failed to send command")?;
 
+        // Half-close the write side so the server's `read_to_end`
+        // (telora-daemon/src/socket.rs:200-203) reaches EOF and
+        // proceeds to write the response. Without this the server
+        // hangs forever waiting for the client's EOF; introduced by
+        // PR #132 (ed326d2). Symptom: any `SocketClient::send_command`
+        // call blocks indefinitely after the write, and the user sees
+        // a frozen GUI / hotkey wrapper.
+        stream
+            .shutdown()
+            .await
+            .context("Failed to half-close write side of daemon socket")?;
+
         // Wait for response
         let mut buf = Vec::new();
         stream
