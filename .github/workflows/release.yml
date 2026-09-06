@@ -3,20 +3,24 @@ name: release
 on:
   push:
     # Conventional SemVer tag. The 'v' prefix is required because the
-    # release flow uses `git tag -s vX.Y.Z` locally.
+    # release flow uses `git tag -s vX.Y.Z` locally. The trailing
+    # `[-.0-9A-Za-z]*` allows SemVer 2.0.0 pre-release identifiers
+    # like `v0.5.0-rc.1` so release candidates can be cut without a
+    # fork of the workflow.
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+[-.0-9A-Za-z]*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.5.0). Must exist on the remote.'
+        description: 'Tag to release (e.g. v0.5.0 or v0.5.0-rc.1). Must exist on the remote.'
         required: true
         type: string
-        # Constrains the manual path to the same shape the `push` tag
-        # filter enforces; a malformed tag string fails fast in the
+        # Mirrors the push-trigger shape above. A SemVer 2.0.0
+        # pre-release suffix (`-rc.1`, `-alpha.2`, `-beta.3+build.7`)
+        # is accepted; non-SemVer suffixes fail fast in the
         # validate-tag-input job below instead of producing a
         # confusing `git rev-parse` error mid-build.
-        pattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+        pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
 
 # Releases need to write tags and create a GitHub Release page, but only the
 # `publish` job does — the `build-release` job only reads repo contents. Scoping
@@ -60,8 +64,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${RAW}"
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "ERROR: '$TAG' is not vX.Y.Z"; exit 1; }
+          # Mirrors the `workflow_dispatch.inputs.tag.pattern` exactly
+          # so both validators agree on the canonical SemVer 2.0.0 set
+          # (including pre-release suffixes like `-rc.1`).
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] \
+            || { echo "ERROR: '$TAG' is not vX.Y.Z[-prerelease]"; exit 1; }
           echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
 
   # Tag-reachability guard: enforces the "tag the trunk merge commit,
@@ -577,7 +584,21 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
+          # pacman `pkgver` rejects hyphens; rewrite the leading `-`
+          # of any SemVer pre-release suffix to `.` so `0.5.0-rc.1`
+          # becomes `0.5.0.rc.1` (matching the dot-separated
+          # pre-release form documented in `man pkgver`). The
+          # install-hook message intentionally keeps the original
+          # SemVer form (with `-`) so users see
+          # `Telora 0.5.0-rc.1 has been installed.` — the rewrite
+          # is only for pacman.
+          if [[ "${VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(.+)$ ]]; then
+            PKGVER="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          else
+            PKGVER="${VERSION}"
+          fi
+          echo "pacman pkgver=${PKGVER}"
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
           sed -i 's|^\([[:space:]]*\)echo ":: Telora [0-9].*|\1echo ":: Telora '"${VERSION}"' has been installed."|' telora-bin.install
           echo "After update:"
           grep -E '^(pkgver|pkgrel)=' PKGBUILD
