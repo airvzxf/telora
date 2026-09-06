@@ -419,9 +419,27 @@ jobs:
         # Fail-fast when the SBOM file isn't on disk. The downstream
         # `cp` would also fail (because of `set -euo pipefail`), but
         # a clearer error message lands earlier in the run log.
+        #
+        # Also validate the SBOM contents, not just existence: an
+        # empty file, a malformed JSON document, or a CycloneDX SBOM
+        # with zero components must all fail this step. The release
+        # consumers checksum SHA256SUMS to validate provenance; a
+        # zero-byte SBOM that passes only the `test -f` gate would
+        # ship silently.
         run: |
-          test -f "${{ github.workspace }}/telora.sbom.cdx.json" \
+          SBOM="${{ github.workspace }}/telora.sbom.cdx.json"
+          test -f "${SBOM}" \
             || { echo "ERROR: SBOM file missing after download"; exit 1; }
+          test -s "${SBOM}" \
+            || { echo "ERROR: SBOM is empty (zero bytes)"; exit 1; }
+          jq -e '
+            .bomFormat == "CycloneDX"
+            and (.specVersion | type == "string")
+            and (.metadata | type == "object")
+            and (.components | type == "array" and length > 0)
+          ' "${SBOM}" > /dev/null \
+            || { echo "ERROR: SBOM is not a valid CycloneDX JSON document with at least one component"; exit 1; }
+          echo "SBOM OK: $(jq '.components | length' "${SBOM}") components"
 
       - name: Stage SBOM with the binaries
         # v4's actions/upload-artifact strips the longest common
