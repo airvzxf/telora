@@ -180,6 +180,11 @@ impl SocketServer {
             match self.listener.accept().await {
                 Ok((mut stream, _addr)) => {
                     let cmd_tx = self.cmd_tx.clone();
+                    // Split the stream into independent read and
+                    // write halves so we can `take` the read side
+                    // (bounded to REFRESH_MAX_BYTES) without
+                    // consuming the write side.
+                    let (mut read_half, mut write_half) = stream.split();
                     tokio::spawn(async move {
                         // Read the full payload rather than a fixed
                         // 2 KiB slice. A REFRESH whose JSON is split
@@ -193,12 +198,12 @@ impl SocketServer {
                         // `SO_RCVBUF` ceiling.
                         const REFRESH_MAX_BYTES: u64 = 64 * 1024;
                         let mut buf = Vec::new();
-                        let mut limited = stream.take(REFRESH_MAX_BYTES);
+                        let mut limited = (&mut read_half).take(REFRESH_MAX_BYTES);
                         match limited.read_to_end(&mut buf).await {
                             Ok(_) if buf.is_empty() => {
-                                let _ = stream.write_all(b"ERROR: empty command").await;
+                                let _ = write_half.write_all(b"ERROR: empty command").await;
                             }
-                            Ok(_) => {
+                            Ok(_) if buf.is_empty() => {
                                 let command_str = String::from_utf8_lossy(&buf).trim().to_string();
                                 info!("Received command: {}", command_str);
 
@@ -234,7 +239,7 @@ impl SocketServer {
                                                             .await;
                                                     }
                                                     Err(_) => {
-                                                        let _ = stream.write_all(b"ERROR: Reload cancelled or failed").await;
+                                                        let _ = write_half.write_all(b"ERROR: Reload cancelled or failed").await;
                                                     }
                                                 }
                                             }
@@ -260,7 +265,8 @@ impl SocketServer {
                                                 .write_all(b"ERROR: Internal channel error")
                                                 .await;
                                         } else {
-                                            let _ = stream.write_all(b"STATUS: RECORDING").await;
+                                            let _ =
+                                                write_half.write_all(b"STATUS: RECORDING").await;
                                         }
                                     }
                                     "STOP" => {
@@ -276,17 +282,18 @@ impl SocketServer {
                                             // Wait for the transcription result from the main loop
                                             match rx.await {
                                                 Ok(text) => {
-                                                    let _ = stream.write_all(text.as_bytes()).await;
+                                                    let _ =
+                                                        write_half.write_all(text.as_bytes()).await;
                                                 }
                                                 Err(_) => {
-                                                    let _ = stream.write_all(b"ERROR: Transcription cancelled or failed").await;
+                                                    let _ = write_half.write_all(b"ERROR: Transcription cancelled or failed").await;
                                                 }
                                             }
                                         }
                                     }
                                     "CANCEL" => {
                                         let _ = cmd_tx.send(Command::Cancel).await;
-                                        let _ = stream.write_all(b"STATUS: CANCELLED").await;
+                                        let _ = write_half.write_all(b"STATUS: CANCELLED").await;
                                     }
                                     "STATUS" => {
                                         let (tx, rx) = oneshot::channel();
@@ -303,7 +310,8 @@ impl SocketServer {
                                                 Ok(status) => {
                                                     let json = serde_json::to_string(&status)
                                                         .unwrap_or_else(|_| "{}".to_string());
-                                                    let _ = stream.write_all(json.as_bytes()).await;
+                                                    let _ =
+                                                        write_half.write_all(json.as_bytes()).await;
                                                 }
                                                 Err(_) => {
                                                     let _ = stream
@@ -314,7 +322,8 @@ impl SocketServer {
                                         }
                                     }
                                     _ => {
-                                        let _ = stream.write_all(b"ERROR: Unknown command").await;
+                                        let _ =
+                                            write_half.write_all(b"ERROR: Unknown command").await;
                                     }
                                 };
 

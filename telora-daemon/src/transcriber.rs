@@ -86,21 +86,6 @@ impl Transcriber for NoopTranscriber {
     }
 }
 
-/// No-op transcriber used as a sentinel during REFRESH. While the
-/// daemon drops the old engine and waits for the new one, the
-/// `Processing` branch of the event loop can still fire (e.g. a
-/// STOP that arrived in the swap window); this stub returns an
-/// empty string so the daemon stays processable instead of
-/// panicking on a `None` engine.
-#[derive(Debug, Default)]
-pub struct NoopTranscriber;
-
-impl Transcriber for NoopTranscriber {
-    fn transcribe(&mut self, _audio_data: &[f32], _language: Option<&str>) -> Result<String> {
-        Ok(String::new())
-    }
-}
-
 /// voxora-backed transcriber.
 ///
 /// Holds `Arc<dyn AsrEngine>` so the same instance can be shared
