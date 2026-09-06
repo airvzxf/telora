@@ -3,12 +3,17 @@ name: release
 on:
   push:
     # Conventional SemVer tag. The 'v' prefix is required because the
-    # release flow uses `git tag -s vX.Y.Z` locally. The trailing
-    # `[-.0-9A-Za-z]*` allows SemVer 2.0.0 pre-release identifiers
-    # like `v0.5.0-rc.1` so release candidates can be cut without a
-    # fork of the workflow.
+    # release flow uses `git tag -s vX.Y.Z` locally. The wildcard
+    # accepts both stable (v0.4.1) and SemVer 2.0.0 pre-release
+    # identifiers (v0.5.0-rc.1) — the previous `v[0-9]+.[0-9]+.[0-9]+[-.0-9A-Za-z]*`
+    # pattern was syntactically invalid in GitHub Actions' tag-glob
+    # grammar (it rejected any tag push with HTTP 422 "push event
+    # contained invalid tags patterns"), so the release workflow
+    # has not fired on a tag push since PR #133 landed. The full
+    # SemVer shape is validated downstream by `validate-tag-input`
+    # (`pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'`).
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+[-.0-9A-Za-z]*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
