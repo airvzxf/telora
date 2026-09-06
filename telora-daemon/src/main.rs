@@ -182,6 +182,17 @@ async fn run_refresh_client(config: SttConfig, socket_path: &str) -> Result<()> 
         .await
         .context("Failed to send refresh command to daemon")?;
 
+    // Half-close the write side so the server's `read_to_end`
+    // (telora-daemon/src/socket.rs:200-203) reaches EOF and proceeds
+    // to write the response. Without this the daemon hangs forever
+    // waiting for our EOF; introduced by PR #132 (ed326d2). The
+    // `Refresh` subcommand would then block on `read_to_end` until
+    // the operator hit Ctrl-C, masking the reload as a hang.
+    stream
+        .shutdown()
+        .await
+        .context("Failed to half-close write side of daemon socket")?;
+
     // Cap the response at 64 KiB to avoid an unbounded read if the
     // daemon ever leaks a non-terminating stream.
     let mut buf = Vec::new();
@@ -220,6 +231,17 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
 
     if let Err(e) = stream.write_all(b"STATUS").await {
         eprintln!("Failed to send command to daemon: {}", e);
+        return Ok(());
+    }
+
+    // Half-close the write side so the server's `read_to_end`
+    // (telora-daemon/src/socket.rs:200-203) reaches EOF and proceeds
+    // to write the response. Without this the daemon hangs forever
+    // waiting for our EOF; introduced by PR #132 (ed326d2). The
+    // `Status` subcommand would then block on `read_to_end` and the
+    // operator would see `telora-daemon status` hang indefinitely.
+    if let Err(e) = stream.shutdown().await {
+        eprintln!("Failed to half-close write side of daemon socket: {}", e);
         return Ok(());
     }
 
