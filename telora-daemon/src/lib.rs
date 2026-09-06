@@ -23,7 +23,6 @@
 pub mod socket;
 
 mod audio;
-mod cache_paths;
 mod transcriber;
 
 // Re-export the deserialisable config types from `socket` so external
@@ -45,8 +44,13 @@ pub use telora_common::paths;
 
 // Re-export the env-var source helper for integration tests.
 // `main.rs::load_config` also calls this helper so the test pins the
-// production behaviour in one place.
-pub use cache_paths::telora_env_source;
+// production behaviour in one place. The function lifted out of the
+// now-removed `cache_paths.rs` shim when EPIC #134 / #64 extracted
+// it into `telora-common` so `telora-gui` could mirror the same
+// cascade; the `pub use` chain here keeps the historical
+// `telora_daemon::telora_env_source` import-path stable for existing
+// callers (notably `tests/config_env_cascade.rs`).
+pub use telora_common::env::telora_env_source;
 
 // Keep the original cache helper names available to downstream daemon
 // consumers while the binary and `telora-models` use the Path-based shared

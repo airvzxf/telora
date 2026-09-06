@@ -2,7 +2,8 @@ use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{Application, glib};
 use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
@@ -15,12 +16,13 @@ mod config;
 mod connection;
 mod focus;
 mod input;
+mod paths;
 mod text;
 mod ui;
 
 use config::GuiConfig;
 use connection::{ControlServer, SocketClient};
-use telora_common::paths::{control_socket_path, daemon_socket_path};
+use telora_common::paths::ResolvedPaths;
 use ui::Osd;
 
 fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
@@ -90,12 +92,22 @@ enum DaemonCommand {
 fn main() {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         // Print the resolved socket paths so the help text reflects
-        // whatever the runtime would actually bind/connect to (XDG
-        // cascade → /run/user/<uid>/ → /tmp fallback). Built with
-        // `format!` because the literal `println!("...")` form
-        // could not interpolate the dynamic paths.
-        let daemon_sock = daemon_socket_path();
-        let control_sock = control_socket_path();
+        // whatever the runtime would actually bind/connect to.
+        // Resolves through the same `PathsConfig` cascade
+        // `telora-gui/src/paths::load_paths_config` uses (issue #64):
+        // `/etc/telora.toml` → `~/.config/telora/config.toml` →
+        // `TELORA_PATHS__*` env vars, falling back to the XDG
+        // cascade that the helper used to default to. Built with
+        // `format!` because the literal `println!("...")` form could
+        // not interpolate the dynamic paths.
+        let paths_cfg = paths::load_paths_config();
+        let resolved_paths = match telora_common::paths::resolve(&paths_cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error resolving socket path: {}", e);
+                std::process::exit(1);
+            }
+        };
         let bin_name = std::env::args()
             .next()
             .unwrap_or_else(|| "telora-gui".to_string());
@@ -125,8 +137,8 @@ fn main() {
              \n\
              SEE ALSO:\n\
              telora(1), telora-daemon(1), telora.service(5)",
-            control_sock = control_sock.display(),
-            daemon_sock = daemon_sock.display(),
+            control_sock = resolved_paths.control_sock.display(),
+            daemon_sock = resolved_paths.daemon_sock.display(),
             version = env!("CARGO_PKG_VERSION"),
         );
         std::process::exit(0);
@@ -138,6 +150,24 @@ fn main() {
         log::error!("{}", e);
         std::process::exit(1);
     }
+
+    // Resolve the operator-supplied `[paths]` overrides once at
+    // startup. The resolved `PathBuf`s are cloned into the GTK
+    // activation closure and the tokio worker thread so both bind /
+    // connect against the same paths. `load_paths_config` never
+    // panics (missing files / malformed TOML / errored env source
+    // all fall back to `PathsConfig::default()`), so the resolver
+    // here can fail only when the XDG cascade itself is unwritable —
+    // which is exactly the same failure mode the pre-fix GUI hit on
+    // the `connect_activate` path. Issue #64.
+    let paths_cfg = paths::load_paths_config();
+    let resolved_paths = match telora_common::paths::resolve(&paths_cfg) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            log::error!("Error resolving socket path: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Initialize GTK Application
     let app = Application::builder()
@@ -158,6 +188,14 @@ fn main() {
         // Create mpsc channel for sending commands TO the Tokio runtime
         let (daemon_tx, daemon_rx) = mpsc::unbounded_channel::<DaemonCommand>();
 
+        // Hand each tokio task its own clone of the resolved paths
+        // (`PathBuf` is `Clone` and the `Arc` makes the inner
+        // `ResolvedPaths` trivially shareable). The control server
+        // bind path and the daemon-client connect path must agree,
+        // so both come from the same `Arc<ResolvedPaths>` captured
+        // before the threads are spawned.
+        let resolved_for_tokio = Arc::clone(&resolved_paths);
+
         // Start Tokio Runtime in a separate thread
         // This happens AFTER GTK confirms we're the primary instance
         let tx_clone = tx.clone();
@@ -165,13 +203,15 @@ fn main() {
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async {
+                let resolved_for_control = Arc::clone(&resolved_for_tokio);
+                let resolved_for_client = Arc::clone(&resolved_for_tokio);
                 tokio::select! {
-                    result = run_control_server(tx_clone.clone()) => {
+                    result = run_control_server(tx_clone.clone(), resolved_for_control) => {
                         if let Err(e) = result {
                             log::error!("Control server failed: {}", e);
                         }
                     }
-                    _ = handle_daemon_commands(daemon_rx, tx_clone, cfg_for_tokio) => {}
+                    _ = handle_daemon_commands(daemon_rx, tx_clone, cfg_for_tokio, resolved_for_client) => {}
                 }
             });
         });
@@ -259,15 +299,25 @@ async fn handle_daemon_commands(
     mut rx: mpsc::UnboundedReceiver<DaemonCommand>,
     _tx: Sender<AppAction>,
     gui_config: GuiConfig,
+    resolved_paths: Arc<ResolvedPaths>,
 ) {
+    // Snapshot the daemon socket path once: every command in this
+    // loop connects to the same address, and threading the path
+    // through `SocketClient::send_command` lets the GUI honour
+    // `[paths] socket_dir` / `TELORA_PATHS__SOCKET_DIR` for the
+    // first time (issue #64). `PathBuf::clone` is cheap (one
+    // `Arc`-style refcount bump), so doing it at the loop top
+    // would also work; here we do it once outside the loop for a
+    // tighter borrow on `resolved_paths`.
+    let daemon_sock: PathBuf = resolved_paths.daemon_sock.clone();
     while let Some(cmd) = rx.recv().await {
         match cmd {
             DaemonCommand::Start => {
-                let _ = SocketClient::send_command("START").await;
+                let _ = SocketClient::send_command("START", &daemon_sock).await;
             }
             DaemonCommand::Stop { mode, response_tx } => {
                 // The STOP command now returns the transcription result directly
-                match SocketClient::send_command("STOP").await {
+                match SocketClient::send_command("STOP", &daemon_sock).await {
                     Ok(raw_text)
                         if !raw_text.trim().is_empty() && !raw_text.starts_with("ERROR:") =>
                     {
@@ -312,7 +362,7 @@ async fn handle_daemon_commands(
                 }
             }
             DaemonCommand::Cancel => {
-                let _ = SocketClient::send_command("CANCEL").await;
+                let _ = SocketClient::send_command("CANCEL", &daemon_sock).await;
             }
         }
     }
@@ -356,9 +406,17 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
     }
 }
 
-async fn run_control_server(tx: Sender<AppAction>) -> anyhow::Result<()> {
-    let server = ControlServer::bind(&control_socket_path())?;
-    info!("Control server listening...");
+async fn run_control_server(
+    tx: Sender<AppAction>,
+    resolved_paths: Arc<ResolvedPaths>,
+) -> anyhow::Result<()> {
+    // Use the operator-supplied control-socket path resolved at
+    // startup from the `[paths]` cascade + `TELORA_PATHS__*` env
+    // vars (issue #64). Clone-once keeps the loop body free of
+    // borrow juggling on `resolved_paths`.
+    let control_sock: PathBuf = resolved_paths.control_sock.clone();
+    let server = ControlServer::bind(&control_sock)?;
+    info!("Control server listening on {}...", control_sock.display());
 
     loop {
         match server.next_command().await {

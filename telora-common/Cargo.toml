@@ -12,6 +12,23 @@ log = "0.4"
 nix = { version = "0.27", features = ["fs", "user", "socket"] }
 tokio = { version = "1.36", features = ["net"] }
 socket2 = "0.5"
+# `serde` lifts the `PathsConfig` derive from the daemon's TOML
+# mapper (`telora_daemon::socket::PathsConfig`) into the shared
+# crate (EPIC #134 / #64). The GUI's
+# `telora-gui/src/paths::load_paths_config` calls
+# `Config::try_deserialize::<PathsConfig>` to merge the env-var
+# cascade with the user's `telora.toml [paths]` table, so the
+# shared struct must implement `Deserialize` itself; the binary
+# keeps its own mapper only because that wrapper sits inside the
+# `#[serde(flatten)]`-shaped `DaemonConfig`.
+serde = { version = "1.0", features = ["derive"] }
+# `config` 0.13 is the same crate `telora-daemon` already pins, lifted
+# into the shared crate so `telora-gui` can mirror the daemon's
+# four-tier cascade (`/etc/telora.toml` → `~/.config/telora/config.toml`
+# → `--config` → `TELORA_*` env vars) without pulling in its own copy.
+# `toml` is the only feature we need — YAML / JSON / INI are
+# operator-facing config surface beyond what the workspace tracks.
+config = { version = "0.13", default-features = false, features = ["toml"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd = { workspace = true }

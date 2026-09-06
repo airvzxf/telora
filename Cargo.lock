@@ -3633,10 +3633,12 @@ name = "telora-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "config",
  "dirs",
  "libsystemd",
  "log",
  "nix 0.27.1",
+ "serde",
  "socket2 0.5.10",
  "tempfile",
  "tokio",
@@ -3675,6 +3677,7 @@ dependencies = [
  "anyhow",
  "assert_fs",
  "async-channel",
+ "config",
  "env_logger",
  "gtk4",
  "gtk4-layer-shell",

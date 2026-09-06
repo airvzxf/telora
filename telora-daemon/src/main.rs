@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use telora_common::cache::resolve_voxora_cache;
+use telora_common::env::telora_env_source;
 use telora_daemon::{
     AudioEngine, BridgeTranscriber, Command, DaemonConfig, NoopTranscriber, SocketServer,
-    StatusResponse, SttConfig, Transcriber, paths, telora_env_source,
+    StatusResponse, SttConfig, Transcriber, paths,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -118,12 +119,14 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     }
 
     // 4. Environment variables - Highest priority. The source
-    // construction is centralised in [`telora_env_source`] (the daemon's
-    // `TELORA_*` environment-source helper) because `config` 0.13's
-    // defaults silently drop `TELORA_PATHS__SOCKET_DIR`; see that
-    // helper's rustdoc for the why. The integration test
+    // construction is centralised in [`telora_common::env::telora_env_source`]
+    // (the daemon's `TELORA_*` environment-source helper) because
+    // `config` 0.13's defaults silently drop `TELORA_PATHS__SOCKET_DIR`;
+    // see that helper's rustdoc for the why. The integration test
     // `telora-daemon/tests/config_env_cascade.rs` calls the same
-    // helper to pin the behaviour.
+    // helper through `telora_daemon::telora_env_source` (a re-export
+    // of the `telora-common` helper that survives the move so the
+    // test does not have to change) to pin the behaviour.
     builder = builder.add_source(telora_env_source());
 
     let mut cfg: DaemonConfig = match builder.build() {

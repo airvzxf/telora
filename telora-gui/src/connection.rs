@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use telora_common::paths;
 use telora_common::socket_bind::bind_unix_socket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -8,8 +7,15 @@ use tokio::net::{UnixListener, UnixStream};
 pub struct SocketClient;
 
 impl SocketClient {
-    pub async fn send_command(cmd: &str) -> Result<String> {
-        let mut stream = UnixStream::connect(paths::daemon_socket_path())
+    /// Send `cmd` to the daemon over its Unix socket and read back
+    /// the full response. The daemon socket path is plumbed in by
+    /// the caller (issue #64): the GUI resolves it once at startup
+    /// from the `[paths]` cascade and reuses the same `PathBuf`
+    /// across every command in a session, so ad-hoc `./telora-gui`
+    /// invocations honour `telora.toml [paths]` / `TELORA_PATHS__*`
+    /// for the first time.
+    pub async fn send_command(cmd: &str, daemon_sock: &Path) -> Result<String> {
+        let mut stream = UnixStream::connect(daemon_sock)
             .await
             .context("Failed to connect to daemon")?;
         stream
