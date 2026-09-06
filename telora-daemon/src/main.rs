@@ -531,7 +531,9 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("NOTIFY_SOCKET").is_some() {
-            if let Err(e) = libsystemd::daemon::notify(true, &[libsystemd::daemon::STATE_READY]) {
+            if let Err(e) =
+                libsystemd::daemon::notify(true, &[libsystemd::daemon::NotifyState::Ready])
+            {
                 log::warn!("sd_notify(READY=1) failed: {}", e);
             }
         }
