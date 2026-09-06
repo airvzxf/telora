@@ -16,23 +16,33 @@
 //! `ensure_parent_dir_0700` did not perform.
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// User-supplied path overrides from `telora.toml` `[paths]`.
 ///
-/// The daemon's TOML mapper lives at
+/// The daemon's TOML mapper at
 /// `telora_daemon::socket::PathsConfig` (re-exported as
-/// `PathsConfigToml`) — a separate struct with the same fields but
-/// `#[derive(Deserialize)]` so the binary can read the `[paths]`
-/// section directly. The plain shape below is intentionally decoupled
-/// from the deserialiser so the resolver can be called from contexts
-/// (e.g. `telora-ctl`, which does not load the daemon's full config)
-/// that do not have a `telora.toml` in hand.
-#[derive(Debug, Clone, Default)]
+/// `PathsConfigToml`) mirrors the same field set so the
+/// `[paths]` section round-trips through both representations
+/// without a translation step — the daemon-side copy exists mainly
+/// because it sits inside the
+/// `#[serde(flatten)]`-wrapped `DaemonConfig` and the GUI's
+/// `load_paths_config` (issue #64) reads the same shape
+/// directly. `Deserialize` lets the GUI's
+/// `telora-gui/src/paths::load_paths_config` call
+/// `Config::try_deserialize::<PathsConfig>` and hit every field the
+/// daemon already populates; `Serialize` is provided for symmetry so
+/// future reflective paths (e.g. `telora-gui status`) can round-trip
+/// the resolved shape.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PathsConfig {
+    #[serde(default)]
     pub socket_dir: Option<String>,
+    #[serde(default)]
     pub daemon_socket: Option<String>,
+    #[serde(default)]
     pub control_socket: Option<String>,
 }
 
