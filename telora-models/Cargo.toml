@@ -10,7 +10,7 @@ rust-version.workspace = true
 # (`voxora list / download`) is the recommended interface going
 # forward and telora-models exists only for backwards compatibility.
 #
-# `voxora-traits` is the new (0.4) home of the traits voxora-core
+# `voxora-traits` is the new (0.4+) home of the traits voxora-core
 # used to re-export. telora-models only needs `ModelSource` /
 # `ResolveOptions`, so we pull the traits crate directly instead
 # of `voxora-bridge` (which would drag in the whisper / qwen3asr

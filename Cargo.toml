@@ -55,10 +55,10 @@ rust-version = "1.86"
 # needs the trait surface (`ModelSource`, `ResolveOptions`) and
 # not the engine adapters.
 [workspace.dependencies]
-voxora-hf        = "0.4"
-voxora-bridge    = "0.4"
-voxora-registry  = "0.4"
-voxora-traits    = "0.4"
+voxora-hf        = "0.5"
+voxora-bridge    = "0.5"
+voxora-registry  = "0.5"
+voxora-traits    = "0.5"
 libsystemd      = "0.7"
 telora-common    = { path = "telora-common" }
 
