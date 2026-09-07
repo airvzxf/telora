@@ -36,7 +36,7 @@ The daemon resolves the id through `voxora-hf` (which downloads, caches and veri
 - Podman (for containerized builds)
 - GTK4 and Layer Shell libraries (if building locally)
 - CUDA Toolkit (for GPU acceleration)
-- voxora 0.4.x, pinned via the workspace `[workspace.dependencies]` block in the top-level `Cargo.toml` (`voxora-bridge`, `voxora-registry`, `voxora-hf`, `voxora-traits` — all `"0.4"`). voxora 0.4 dropped the `voxora-core` deprecation shim that 0.3 shipped; the traits it used to re-export now live in `voxora-traits`. No sibling checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) is required: the daemon resolves everything through registry crates since commit `b4a252b` (`fix: consume voxora 0.2.0`).
+- voxora 0.5.x, pinned via the workspace `[workspace.dependencies]` block in the top-level `Cargo.toml` (`voxora-bridge`, `voxora-registry`, `voxora-hf`, `voxora-traits` — all `"0.5"`). voxora 0.4 dropped the `voxora-core` deprecation shim that 0.3 shipped; the traits it used to re-export now live in `voxora-traits`. No sibling checkout of [airvzxf/voxora](https://github.com/airvzxf/voxora) is required: the daemon resolves everything through registry crates since commit `b4a252b` (`fix: consume voxora 0.2.0`).
 
 ### 2. Cargo.lock and dependency changes
 
