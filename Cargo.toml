@@ -16,7 +16,19 @@ edition = "2024"
 # on an older GH-hosted apt rustc.
 rust-version = "1.88"
 
-# voxora 0.4 is a breaking release that closes voxora issue #42:
+# voxora 0.5 is a coordinated minor release (closes
+# airvzxf/voxora#117, #124, #133, #145, #148). Every workspace
+# crate that participates in the release ships at 0.5.x per
+# voxora's `AGENTS.md` → Version coordination policy. The
+# `voxora-bridge` umbrella picked up a `local` Cargo feature
+# (re-export of `voxora-local`), the canonical `registry`
+# Cargo feature (re-export of `voxora-registry`'s
+# `Registry` / `RegistryHfExt` / `builtin_local_descriptor`,
+# closes voxora#145), and the cross-engine `parity` test feature
+# (closes voxora#59 / EPIC #133). No breaking change for
+# consumers: the trait surface is unchanged from 0.4.x.
+#
+# voxora 0.4 was a breaking release that closed voxora issue #42:
 # the `voxora-core` deprecation shim that shipped in 0.3 has been
 # removed entirely, and the traits it used to re-export
 # (`AsrEngine`, `ModelSource`, `ResolveOptions`, `AsrError`,
@@ -27,12 +39,35 @@ rust-version = "1.88"
 # `voxora_bridge::ModelSource`, etc. without seeing the deprecation
 # warning that bit them on the 0.3 line.
 #
+# voxora 0.4.2 / EPIC #100 raised the MSRV from 1.86 → 1.88
+# (driven by `whisper-rs-sys 0.15.0`); 0.4.3 / EPIC #109 hardened
+# `voxora-hf::split_three_segment_id` (path-traversal in
+# `ModelId::parse`, airvzxf/voxora#102) and gave `HfClient::get_to_file`
+# unique tmp suffixes for concurrent downloads (#103). The
+# daemon's resolve path inherits both — the operator's cache
+# layout is unchanged but the underlying parser / writer is now
+# defensive against the hostile-id and concurrent-shard classes
+# of bug.
+#
+# voxora 0.5.3 / EPIC #148 (closes airvzxf/voxora#143, #144)
+# added `ResolveOptions::max_bytes` and `ResolveOptions::max_id_length`
+# (`#[non_exhaustive]` on `ResolveOptions`; defaults `None`). The
+# daemon wires `max_bytes = 8 GiB` at the production resolve call
+# sites (see `telora-daemon/src/transcriber.rs`); the cap clears
+# the largest legitimate artifact (Qwen3-ASR-1.7B ~3.4 GB) with
+# ~2.4x headroom. HONEST GAP: `voxora-hf` 0.5.1 does not yet
+# honour `max_bytes` despite the voxora-traits CHANGELOG claiming
+# it does — the field exists but is not plumbed through
+# `HfClient::get_to_file`. The cap is therefore inert on the
+# daemon's HF resolve path today; it activates the moment
+# voxora-hf enforces it (tracked upstream).
+#
 # voxora 0.2.x carried the structural fix for airvzxf/telora#79:
 # `voxora-hf::resolve_single_file` rejects a cache whose
 # `.complete` marker is set but the requested file is missing
 # (`AsrError::ModelNotFound`), and `ModelDir::entry` names the
 # exact file for `org/repo/file` resolves so the daemon never has
-# to lex-sort `*.bin` files. voxora 0.3 / 0.4 keep those
+# to lex-sort `*.bin` files. voxora 0.3 → 0.5 keep those
 # semantics — the registry test (`voxora_020_resolution`) still
 # pins the same shape against the current line.
 #
@@ -44,18 +79,31 @@ rust-version = "1.88"
 # We DO NOT use `hf_registry()` because it constructs its own
 # `HuggingFaceSource` internally and bypasses the `cache_dir`
 # override the operator needs to keep their existing
-# `~/.cache/voxora/models/huggingface/…` cache.
+# `~/.cache/voxora/models/huggingface/…` cache. voxora 0.5.4
+# hardened `ModelId::parse`'s local arm against `..` components,
+# control characters, and embedded NULs (closes voxora#143);
+# the daemon's HF id path inherits the upstream HF 3-segment
+# hardening from voxora 0.4.3 / #102.
 #
-# telora-daemon pulls voxora-bridge 0.4 with the `cuda-whisper`
+# telora-daemon pulls voxora-bridge 0.5 with the `cuda-whisper`
 # feature (see telora-daemon/Cargo.toml) to enable GPU-accelerated
 # whisper.cpp on Pascal sm_61+ hardware; qwen3-asr stays on CPU
-# because candle's WMMA kernels require sm_70+.
+# because candle's WMMA kernels require sm_70+. voxora-bridge
+# also exposes `cuda-qwen3asr` (sm_70+ only), `metal`, `vulkan`,
+# `local`, `registry`, and `parity` features; telora deliberately
+# sticks to `cuda-whisper` only — the per-engine hardware split
+# exists so operators on Pascal hardware keep the qwen3-asr path
+# on CPU. The cross-engine hardware matrix (CUDA / Metal / Vulkan
+# per engine) is documented at
+# https://github.com/airvzxf/voxora/blob/main/docs/GPU_SUPPORT.md
+# (airvzxf/voxora#55 / EPIC #117).
 #
 # telora-models now depends on `voxora-traits` directly (instead
 # of pulling `voxora-bridge` with its whisper / qwen3asr feature
 # baggage). telora-models is a model-management CLI — it only
 # needs the trait surface (`ModelSource`, `ResolveOptions`) and
-# not the engine adapters.
+# not the engine adapters. The same 8 GiB cap the daemon wires
+# is also wired here (see `telora-models/src/main.rs`).
 [workspace.dependencies]
 voxora-hf        = "0.5"
 voxora-bridge    = "0.5"

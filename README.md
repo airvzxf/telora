@@ -276,6 +276,26 @@ Both tools print the same view; `telora-models` exists only for
 backwards compatibility with the pre-voxora packaging recipes and
 will be retired (see `TODO.md`).
 
+**Hardware backends.** voxora 0.5.1+ (airvzxf/voxora#121 / EPIC #124)
+exposes a `--hardware <cpu|cuda|metal|vulkan>` flag on `voxora run`
+that validates the binary was built with the matching Cargo feature
+at compile time (informational — the runtime GPU backend is picked by
+whisper-rs from the compiled features). `--hardware vulkan` is
+whisper-only (qwen3-asr has no Vulkan backend upstream). The
+canonical cross-engine matrix lives at
+[airvzxf/voxora/docs/GPU_SUPPORT.md](https://github.com/airvzxf/voxora/blob/main/docs/GPU_SUPPORT.md);
+telora-daemon mirrors the per-engine split by enabling
+`voxora-bridge/cuda-whisper` only and leaving qwen3-asr on CPU.
+
+**Security hardening.** voxora-hf 0.4.3+ (EPIC #109, closes
+airvzxf/voxora#102 + #103) hardens `ModelId::parse` against
+path-traversal in 3-segment HF ids and gives `HfClient::get_to_file`
+unique tmp-file suffixes for concurrent-download shards, so two
+concurrent downloads no longer race the same tmp file. telora
+inherits both transparently; the operator's experience is unchanged
+but the underlying parser / writer is now defensive against the
+hostile-id and concurrent-shard classes of bug.
+
 To use a different cache location, pass `--voxora-cache DIR` to the
 `telora-daemon` or `telora-models` command, or set `VOXORA_CACHE_DIR`.
 The CLI value takes precedence over the environment value. Absolute

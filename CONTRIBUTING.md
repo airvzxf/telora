@@ -27,6 +27,8 @@ model_id   = "Qwen/Qwen3-ASR-0.6B"
 
 The daemon resolves the id through `voxora-hf` (which downloads, caches and verifies) and loads the engine adapter that matches `model_kind`. To add a brand-new engine (e.g. Parakeet), implement `voxora_traits::AsrEngine` in a new `voxora-*` adapter crate and re-export it from `voxora-bridge` behind a feature flag (the umbrella crate re-exports the whole `voxora_traits` surface, so consumers stay on `voxora_bridge::AsrEngine` without seeing the deprecation warning that the old `voxora-core` shim used to emit). No changes in `telora-daemon` are required for the engine itself; only a new variant on `voxora_engine::EngineFamily` (re-exported as `voxora_bridge::EngineFamily`). The enum is `#[non_exhaustive]`, so existing match arms remain source-compatible — but every consumer that exhaustively matches today must add a wildcard arm before the new variant will compile.
 
+**Per-engine hardware split.** voxora-bridge exposes a separate Cargo feature per (engine, hardware) pair: `cuda-whisper`, `cuda-qwen3asr`, `metal`, `vulkan`, plus the umbrella `cuda`. The split exists because the candle-backed qwen3-asr CUDA path needs WMMA kernels (sm_70+ / Volta), whereas whisper.cpp's ggml-cuda works back to sm_50 (Pascal-friendly). Any new voxora-* engine adapter added to telora's dep tree should follow the same pattern so consumers on older hardware keep the slower engines on CPU without rebuilding the whole binary.
+
 ## Development Workflow
 
 ### 1. Prerequisites
