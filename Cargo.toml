@@ -3,7 +3,20 @@ resolver = "2"
 members = ["telora-common", "telora-daemon", "telora-gui", "telora-ctl", "telora-models"]
 
 [workspace.package]
-version = "0.4.1"
+# Minor bump 0.4.1 → 0.5.0 (Part of #142). Mirrors the voxora
+# 0.4 → 0.5 coordinated minor release: telora follows the same
+# major.minor line so a user reading the telora GitHub Release
+# page sees a consistent version narrative with the underlying
+# voxora-* crates it consumes. Triggers:
+#   - voxora MSRV re-bump 1.86 → 1.88 (inherited from voxora
+#     0.4.2 / EPIC #100; telora's workspace `rust-version` had
+#     been lying since then);
+#   - new additive capability: `ResolveOptions::max_bytes` is
+#     wired at every production resolve call site in
+#     telora-daemon / telora-models (closes #145, EPIC #148
+#     adopted from voxora 0.5.3).
+# No breaking API change for operators; no config-key churn.
+version = "0.5.0"
 edition = "2024"
 # Pinned to voxora-bridge 0.4.2+ / 0.5.x's MSRV as published on
 # crates.io (voxora-bridge 0.3+ bumped the MSRV to 1.86; the 0.4.2
