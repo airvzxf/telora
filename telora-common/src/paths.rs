@@ -191,10 +191,10 @@ fn pick_socket_dir(
     env_daemon: Option<&Path>,
     env_control: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(path) = env_daemon.or(env_control) {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            return Ok(parent.to_path_buf());
-        }
+    if let Some(path) = env_daemon.or(env_control)
+        && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+    {
+        return Ok(parent.to_path_buf());
     }
     if let Some(s) = cfg.socket_dir.as_deref().filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(s));

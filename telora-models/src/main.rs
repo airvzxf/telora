@@ -125,7 +125,13 @@ fn list_cmd(cache_root: &Path) -> Result<()> {
 }
 
 async fn download_cmd(source: &voxora_hf::HuggingFaceSource, model_id: &str) -> Result<()> {
-    let opts = ResolveOptions::default();
+    // 8 GiB cap, adopted from voxora EPIC #148 (voxora 0.5.3+).
+    // Mirrors the daemon's resolve cap (`telora-daemon/src/transcriber.rs`)
+    // so telora-models and telora-daemon reject the same set of
+    // pathological model files. See the daemon-side comment for
+    // the honest framing of the voxora-hf gap (the cap is inert on
+    // the HF resolve path today; tracked in airvzxf/telora#148).
+    let opts = ResolveOptions::with_max_bytes(8 * 1024 * 1024 * 1024);
     let dir = source
         .resolve(model_id, &opts)
         .await
@@ -252,5 +258,27 @@ mod tests {
         let resolved = resolve_cache_root(Some(bad)).expect("default cache should resolve");
         assert!(resolved.ends_with(Path::new("voxora/models/huggingface")));
         assert_ne!(resolved, PathBuf::from("/tmp/bar"));
+    }
+
+    /// Closes #145: `ResolveOptions::with_max_bytes` is the
+    /// caller-imposed cap adopted from voxora EPIC #148
+    /// (voxora-traits 0.5.3+). Round-trip the builder so the
+    /// telora-models download path stays wired against future
+    /// voxora-traits changes.
+    #[test]
+    fn resolve_options_with_max_bytes_round_trips() {
+        const EIGHT_GIB: u64 = 8 * 1024 * 1024 * 1024;
+        let opts = ResolveOptions::with_max_bytes(EIGHT_GIB);
+        assert_eq!(opts.max_bytes, Some(EIGHT_GIB));
+        // `max_id_length` stays at its default — HF ids never
+        // approach the intrinsic 4 KiB cap and the HF parser
+        // enforces its own length limit upstream.
+        assert_eq!(opts.max_id_length, None);
+
+        // And `Default::default()` still produces an uncapped
+        // opts (matches the voxora-traits documented contract).
+        let defaults = ResolveOptions::default();
+        assert_eq!(defaults.max_bytes, None);
+        assert_eq!(defaults.max_id_length, None);
     }
 }

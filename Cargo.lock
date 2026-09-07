@@ -3618,7 +3618,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telora"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3646,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "telora-daemon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "telora-gui"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "telora-models"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4178,9 +4178,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxora-bridge"
-version = "0.4.0"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "176a696170c6d1b8e421b1d7e28172908111ec9aa1c9ade19354039edcc0f710"
+checksum = "c9dac37ee73bc1064077fb6524c296295519057ebc3b0ed0af1178a0c5fc8947"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-engine",
@@ -4192,9 +4192,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-config"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a80c69fe0d0c6bd425b85d0694408b03c68ca3ddee13593804c82159546af54"
+checksum = "986c1a35c411003ba64c4931a1cca38e7d31d0b5841a11fe5f5b246d8c75f58e"
 dependencies = [
  "dirs",
  "serde",
@@ -4204,9 +4204,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-engine"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd6fb83d572f8a03a1d79bb69f151ba5a5f0e07efd2bb8ef296f2dea5b6d19e6"
+checksum = "6b8271c80b0e05fe7f1d9611f44f70bc00642acb2a7a39557c1b294134ce11f7"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-traits",
@@ -4214,9 +4214,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-hf"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cbbc0f0531eff8c69fede682aca3ae7e03d515c3f08b4d2f8bfd40853ff740b"
+checksum = "80ca57fdb6ae657c01450427cfef94e53bbf0418a6cff2d2a0b1725ab5e3800f"
 dependencies = [
  "async-trait",
  "dirs",
@@ -4233,9 +4233,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-qwen3asr"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55b8f57fcbb5f097250f199e0c28a42194f5bbb14b1da4449526c7c01a5e7c78"
+checksum = "3f3f7dd97016188c579776865a48c5267e4cb2a289429ff9c6affdb0457a7c35"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4248,9 +4248,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-registry"
-version = "0.4.0"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b791470084f5d0826b3cd74c2d5cee67f8287a95de3c75604f7097db5336aa"
+checksum = "f2506dbe3c29dddfa03ac929ca95acfea6d64f5bda2150f0aab3ab5dcd5df3e3"
 dependencies = [
  "async-trait",
  "serde",
@@ -4263,9 +4263,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-traits"
-version = "0.4.0"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38704bb65be780c09359543cdeb98f6c8ff65ee840adc301bef1b4d6d09da4c4"
+checksum = "f6a16006e249af1b2c680bf3be608726e4110f4aaa3677fc5c3e3d89d797cdc2"
 dependencies = [
  "async-trait",
  "thiserror 2.0.20",
@@ -4273,9 +4273,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-whisper"
-version = "0.4.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06281afef1d5f2aa228eeadbef8b6c587f1ddaa774b09a5040786ae26d141328"
+checksum = "41f5df63126e5e528b2767c4d1f9dbcb9388a86708db487c40d212b023c1e316"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-hf",

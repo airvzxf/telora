@@ -160,19 +160,17 @@ fn bind_unix_socket_impl(
     allow_activation: bool,
 ) -> Result<UnixListener> {
     #[cfg(target_os = "linux")]
-    if allow_activation {
-        if let Some(listener) = try_inherited_listener(instance_name)? {
-            // Telemetry on the adoption itself is logged inside
-            // `try_inherited_listener` (descriptor count, fallback reason).
-            return Ok(listener);
-        }
-        // Fall through to manual bind: no `info!` here so the
-        // subsequent "Listening on unix socket" line is the only
-        // breadcrumb. Logging the path was redundant and was flagged
-        // by CodeQL's cleartext-logging rule on this branch (the
-        // path is already redacted on the bind-failure path; we
-        // avoid the false positive by not adding a second log).
+    if allow_activation && let Some(listener) = try_inherited_listener(instance_name)? {
+        // Telemetry on the adoption itself is logged inside
+        // `try_inherited_listener` (descriptor count, fallback reason).
+        return Ok(listener);
     }
+    // Fall through to manual bind: no `info!` here so the
+    // subsequent "Listening on unix socket" line is the only
+    // breadcrumb. Logging the path was redundant and was flagged
+    // by CodeQL's cleartext-logging rule on this branch (the
+    // path is already redacted on the bind-failure path; we
+    // avoid the false positive by not adding a second log).
 
     ensure_parent_dir(path)?;
 
@@ -227,13 +225,13 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
                     .unwrap_or("<unknown>")
             )
         })?;
-    if let Ok(metadata) = std::fs::symlink_metadata(parent) {
-        if metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "socket parent directory {} is a symlink; refusing to follow it",
-                parent.display()
-            );
-        }
+    if let Ok(metadata) = std::fs::symlink_metadata(parent)
+        && metadata.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "socket parent directory {} is a symlink; refusing to follow it",
+            parent.display()
+        );
     }
     paths::ensure_dir_0700(parent)
         .with_context(|| format!("ensuring socket parent directory {}", parent.display()))

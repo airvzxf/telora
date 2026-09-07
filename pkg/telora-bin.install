@@ -9,7 +9,7 @@ post_install() {
         echo ":: Tip: enable linger so telora-daemon survives logout:"
         echo "::      sudo loginctl enable-linger ${telora_user}"
     fi
-    echo ":: Telora 0.4.1 has been installed."
+    echo ":: Telora 0.5.0 has been installed."
     echo ":: IMPORTANT: You need to download a speech model before using Telora."
     echo ":: Please run the following command to download the base model:"
     echo ":: "

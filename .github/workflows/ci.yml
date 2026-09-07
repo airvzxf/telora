@@ -22,11 +22,12 @@ jobs:
     # Pin a rustc toolchain so a future dep bump that needs a newer
     # rustc fails the build loudly instead of silently slipping
     # through on the GH-hosted image's default rustc. Ubuntu 24.04
-    # (Noble) only ships apt rustc 1.81, below voxora-bridge 0.4.0's
-    # MSRV of 1.86 — without this step the build happens to compile
-    # today only because every dep we use happens to be MSRV-
-    # compatible with 1.81. `dtolnay/rust-toolchain` matches the
-    # action voxora uses in its own `.github/workflows/ci.yml`
+    # (Noble) only ships apt rustc 1.81, below voxora-bridge 0.5.x's
+    # MSRV of 1.88 (raised in voxora EPIC #100 / 0.4.2, driven by
+    # `whisper-rs-sys 0.15.0`) — without this step the build happens
+    # to compile today only because every dep we use happens to be
+    # MSRV-compatible with 1.81. `dtolnay/rust-toolchain` matches
+    # the action voxora uses in its own `.github/workflows/ci.yml`
     # (same SHA pin) so the two projects stay in lockstep.
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
