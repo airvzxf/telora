@@ -30,7 +30,7 @@ The daemon resolves the id through `voxora-hf` (which downloads, caches and veri
 ## Development Workflow
 
 ### 1. Prerequisites
-- Rust (Edition 2024, MSRV 1.86) installed via [rustup](https://rustup.rs/) (any stable toolchain `>= 1.86` works; the project's CI pins `stable` via `dtolnay/rust-toolchain`).
+- Rust (Edition 2024, MSRV 1.88) installed via [rustup](https://rustup.rs/) (any stable toolchain `>= 1.88` works; the project's CI pins `stable` via `dtolnay/rust-toolchain`).
 - Podman (for containerized builds)
 - GTK4 and Layer Shell libraries (if building locally)
 - CUDA Toolkit (for GPU acceleration)

@@ -5,14 +5,16 @@ members = ["telora-common", "telora-daemon", "telora-gui", "telora-ctl", "telora
 [workspace.package]
 version = "0.4.1"
 edition = "2024"
-# Pinned to voxora-bridge 0.4.x's MSRV as published on crates.io
-# (voxora-bridge 0.3+ bumped the MSRV to 1.86). The CI workflow
+# Pinned to voxora-bridge 0.4.2+ / 0.5.x's MSRV as published on
+# crates.io (voxora-bridge 0.3+ bumped the MSRV to 1.86; the 0.4.2
+# EPIC #100 cut raised it again to 1.88, driven by
+# `whisper-rs-sys 0.15.0`). The CI workflow
 # (`.github/workflows/ci.yml`) installs `stable` via
 # `dtolnay/rust-toolchain`, so a workspace member or transitive
-# dep that ever requires a feature newer than 1.86 will fail the
+# dep that ever requires a feature newer than 1.88 will fail the
 # build at the rustc stage instead of silently slipping through
 # on an older GH-hosted apt rustc.
-rust-version = "1.86"
+rust-version = "1.88"
 
 # voxora 0.4 is a breaking release that closes voxora issue #42:
 # the `voxora-core` deprecation shim that shipped in 0.3 has been
