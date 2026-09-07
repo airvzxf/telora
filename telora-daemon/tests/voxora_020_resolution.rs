@@ -3,13 +3,15 @@
 //!
 //! The registry semantics it pins have been stable since the
 //! voxora 0.2.0 fix; the test currently runs against the voxora
-//! 0.4 line.
+//! 0.5 line.
 //!
 //! Before the fix, `telora-daemon/src/transcriber.rs::from_id` would
-//! take the on-disk directory returned by `voxora_hf::resolve_single_file`,
-//! lex-sort every `*.bin` file inside it, and pick the first one.
-//! For `model_id = "ggerganov/whisper.cpp/ggml-large-v3.bin"` against
-//! a cache that already contained both `ggml-base.bin` and
+//! take the on-disk directory returned by `HuggingFaceSource::resolve`
+//! (which internally routes 3-segment ids through
+//! `voxora_hf::resolve_single_file`), lex-sort every `*.bin` file
+//! inside it, and pick the first one. For
+//! `model_id = "ggerganov/whisper.cpp/ggml-large-v3.bin"` against a
+//! cache that already contained both `ggml-base.bin` and
 //! `ggml-large-v3.bin`, the lex-sort picked `ggml-base.bin` and the
 //! daemon mmap'd the wrong weights (147 MB, 6 audio layers) instead
 //! of the requested 3 GB model.
@@ -25,12 +27,18 @@
 //!    daemon no longer has to scan the directory at all.
 //!
 //! These tests still pin both behaviours against a hand-rolled cache
-//! layout under the current voxora 0.4 line. The registry semantics
+//! layout under the current voxora 0.5 line. The registry semantics
 //! introduced in voxora 0.2.0 are stable across the 0.2 → 0.3 → 0.4
-//! bumps (voxora 0.4 removed the `voxora-core` deprecation shim and
-//! moved those traits into `voxora-traits`, but `voxora-bridge`
-//! re-exports `voxora_traits::*` so the imports below still resolve
-//! unchanged). They run by default (no `#[ignore]`) and use only a
+//! → 0.5 bumps (voxora 0.4 removed the `voxora-core` deprecation
+//! shim and moved those traits into `voxora-traits`, but
+//! `voxora-bridge` re-exports `voxora_traits::*` so the imports below
+//! still resolve unchanged). voxora 0.5 added
+//! `ResolveOptions::max_bytes` / `max_id_length` (EPIC #148,
+//! `#[non_exhaustive]`); the daemon now wires the 8 GiB cap at
+//! production call sites, but this regression intentionally keeps
+//! `ResolveOptions::default()` so the test continues to catch
+//! unannounced behaviour changes in the voxora-local / voxora-hf
+//! defaults. They run by default (no `#[ignore]`) and use only a
 //! few bytes per stub file — the file contents do not matter, only
 //! the names and the `.complete` marker shape.
 //!

@@ -54,10 +54,10 @@ pub fn resolve_voxora_cache(
         return xdg_default_cache_dir();
     }
 
-    if let Some(env_override) = env_override {
-        if let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR") {
-            return Ok(accepted);
-        }
+    if let Some(env_override) = env_override
+        && let Some(accepted) = sanitize_with_source(env_override, "VOXORA_CACHE_DIR")
+    {
+        return Ok(accepted);
     }
 
     xdg_default_cache_dir()
