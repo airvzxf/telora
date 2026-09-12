@@ -38,7 +38,14 @@ CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2
 # Prefer release artefacts over the container-extracted bin/ tree when
 # both are present, so a developer who ran `cargo build --release`
 # installs the freshly-built binaries instead of stale container ones.
-BIN_DIR := $(if $(wildcard target/release/telora-daemon),target/release,bin)
+# Require ALL $(BINARIES) to be present in target/release/; otherwise
+# fall back to bin/. We compare $(words ...) of the wildcard results
+# against $(words $(BINARIES)) — a plain $(if $(foreach ...)) would
+# treat four whitespace-separated empty strings as truthy and pick
+# target/release even on an empty tree. Counting guarantees a partial
+# release tree (e.g. only telora-daemon built) safely falls back to
+# bin/ instead of failing the install mid-way.
+BIN_DIR := $(if $(filter $(words $(BINARIES)),$(words $(foreach b,$(BINARIES),$(wildcard target/release/$(b))))),target/release,bin)
 
 .DEFAULT_GOAL := help
 
@@ -153,13 +160,13 @@ fmt-check: ## cargo fmt --all -- --check (CI mirror)
 lint: ## cargo clippy --locked --workspace --all-targets -- -D warnings (CI mirror)
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 
-audit: ## Audit dependencies for known security advisories
-	@if ! command -v cargo-audit >/dev/null 2>&1; then \
+audit: ## Audit dependencies for known security advisories (no-op if cargo-audit missing)
+	@if command -v cargo-audit >/dev/null 2>&1; then \
+		echo "--> Running cargo audit"; \
+		cargo audit --deny warnings; \
+	else \
 		echo "cargo-audit not installed; skipping. Install with: cargo install cargo-audit --locked"; \
-		exit 0; \
 	fi
-	@echo "--> Running cargo audit"
-	@cargo audit --deny warnings
 
 # Run the same gates as `.github/workflows/ci.yml`, in the same order,
 # with `--no-fail-fast` skipped intentionally to fail fast.
@@ -172,6 +179,7 @@ test: ## cargo test --locked --workspace --no-fail-fast (CI mirror)
 	cargo test --locked --workspace --no-fail-fast
 
 test-one: ## Run a single test: make test-one TEST=voxora_020_resolution
+	@test -n "$(TEST)" || { echo "Usage: make test-one TEST=<name>"; exit 1; }
 	cargo test --locked --workspace $(TEST)
 
 # Note: an explicit `test-integration` target is intentionally absent.
@@ -187,57 +195,64 @@ simulate: ## Run scripts/compatibility/simulate.sh (full stack: daemon + GUI)
 ## Packaging
 
 install: ## Install binaries, config, models dir, and (unless SKIP_SYSTEMD=1) systemd units
-	@test -f $(BIN_DIR)/telora-daemon || { echo "Run 'make build' first."; exit 1; }
+	@test -f $(BIN_DIR)/telora-daemon || { echo "Run 'make build', 'make build-native', or 'make build-release' first."; exit 1; }
 	@echo "--> Installing binaries to $(DESTDIR)$(BINDIR)"
-	$(foreach b,$(BINARIES),install -Dm755 $(BIN_DIR)/$(b) $(DESTDIR)$(BINDIR)/$(b)$(NEWLINE))
+	@$(foreach b,$(BINARIES),install -Dm755 $(BIN_DIR)/$(b) $(DESTDIR)$(BINDIR)/$(b)$(NEWLINE))
 	@echo "--> Installing default config"
-	install -Dm644 telora.toml $(DESTDIR)/etc/telora.toml
+	@install -Dm644 telora.toml $(DESTDIR)/etc/telora.toml
 	@echo "--> Creating models directory"
 	@mkdir -p $(DESTDIR)$(DATADIR)/telora/models
-ifndef SKIP_SYSTEMD
+ifneq ($(SKIP_SYSTEMD),1)
 	@echo "--> Installing systemd user units to $(DESTDIR)$(SYSTEMD_USER_DIR)"
-	$(foreach u,$(SYSTEMD_UNITS),install -Dm644 systemd/$(u) $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
+	@$(foreach u,$(SYSTEMD_UNITS),install -Dm644 systemd/$(u) $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
 endif
 
 # Sub-target: install ONLY the systemd user units. Honours SKIP_SYSTEMD
 # so a `make install-systemd-user SKIP_SYSTEMD=1` is a documented no-op.
-install-systemd-user: ## Install only the systemd user units (honour SKIP_SYSTEMD)
-ifndef SKIP_SYSTEMD
+install-systemd-user: ## Install only the systemd user units (honours SKIP_SYSTEMD=1)
+ifneq ($(SKIP_SYSTEMD),1)
 	@echo "--> Installing systemd user units to $(DESTDIR)$(SYSTEMD_USER_DIR)"
-	$(foreach u,$(SYSTEMD_UNITS),install -Dm644 systemd/$(u) $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
+	@$(foreach u,$(SYSTEMD_UNITS),install -Dm644 systemd/$(u) $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
 endif
 
-uninstall: ## Reverse `install` (idempotent; honour SKIP_SYSTEMD)
+uninstall: ## Reverse `install` (idempotent; honours SKIP_SYSTEMD=1)
 	@echo "--> Removing binaries from $(DESTDIR)$(BINDIR)"
-	$(foreach b,$(BINARIES),rm -f $(DESTDIR)$(BINDIR)/$(b)$(NEWLINE))
+	@$(foreach b,$(BINARIES),rm -f $(DESTDIR)$(BINDIR)/$(b)$(NEWLINE))
 	@echo "--> Removing default config"
-	rm -f $(DESTDIR)/etc/telora.toml
+	@rm -f $(DESTDIR)/etc/telora.toml
 	@echo "--> Removing models directory if empty"
 	@rmdir $(DESTDIR)$(DATADIR)/telora/models 2>/dev/null || true
-ifndef SKIP_SYSTEMD
+ifneq ($(SKIP_SYSTEMD),1)
 	@echo "--> Removing systemd user units from $(DESTDIR)$(SYSTEMD_USER_DIR)"
-	$(foreach u,$(SYSTEMD_UNITS),rm -f $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
+	@$(foreach u,$(SYSTEMD_UNITS),rm -f $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
 endif
 
-uninstall-systemd-user: ## Remove only the systemd user units (honour SKIP_SYSTEMD)
-ifndef SKIP_SYSTEMD
+uninstall-systemd-user: ## Remove only the systemd user units (honours SKIP_SYSTEMD=1)
+ifneq ($(SKIP_SYSTEMD),1)
 	@echo "--> Removing systemd user units from $(DESTDIR)$(SYSTEMD_USER_DIR)"
-	$(foreach u,$(SYSTEMD_UNITS),rm -f $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
+	@$(foreach u,$(SYSTEMD_UNITS),rm -f $(DESTDIR)$(SYSTEMD_USER_DIR)/$(u)$(NEWLINE))
 endif
 
-# reinstall = uninstall + stop running daemon + install. The daemon
-# stop mirrors pkg/telora-bin.install:23-28 (`pre_upgrade`) so a live
-# binary is never replaced under its own feet. Two separate $(MAKE)
-# calls so DESTDIR scoping is preserved end-to-end.
-reinstall: ## uninstall, stop the daemon (if running), then install
+reinstall: ## Stop the running daemon, uninstall, then install (mirrors pkg/telora-bin.install:pre_upgrade)
 	@echo "--> Reinstalling"
-	@$(MAKE) --no-print-directory uninstall DESTDIR="$(DESTDIR)"
 	@systemctl --user stop telora-daemon.service 2>/dev/null || true
+	@$(MAKE) --no-print-directory uninstall DESTDIR="$(DESTDIR)"
 	@$(MAKE) --no-print-directory install DESTDIR="$(DESTDIR)"
 
-# `-s` syncs makedepends; `-f` is intentionally omitted because it
-# would silently overwrite a pkgver/pkgrel drift instead of erroring.
-package: ## Build Arch package: cd pkg && makepkg -s
+# Build the Arch package. Refuses to run if Cargo.toml's workspace
+# version and PKGBUILD's pkgver drift, so a local `make package`
+# never silently produces a mis-versioned tarball. `-s` syncs
+# makedepends; `-f` is intentionally omitted so a pre-existing
+# *.pkg.tar* artefact triggers a makepkg error instead of being
+# silently overwritten.
+package: ## Build Arch package (refuses on Cargo.toml/PKGBUILD version drift)
+	@cargo_ver=$$(awk '/^version = /{gsub(/"/,""); print $$3; exit}' Cargo.toml); \
+	pkg_ver=$$(awk -F= '/^pkgver=/{gsub(/[ \t]+/,""); print $$2; exit}' pkg/PKGBUILD); \
+	if [ "$$cargo_ver" != "$$pkg_ver" ]; then \
+		echo "ERROR: Cargo.toml version=$$cargo_ver != PKGBUILD pkgver=$$pkg_ver"; \
+		echo "Hint: release.yml rewrites pkgver from the tag. Tag v$$cargo_ver or sync PKGBUILD manually."; \
+		exit 1; \
+	fi; \
 	cd pkg && makepkg -s
 
 # ─── Run ─────────────────────────────────────────────────────────────
