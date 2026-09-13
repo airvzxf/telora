@@ -1118,6 +1118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1987,7 +1997,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3070,7 +3080,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3109,7 +3119,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3909,7 +3919,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telora"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3938,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "telora-daemon"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3966,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "telora-gui"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3986,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "telora-models"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4560,9 +4570,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxora-bridge"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c828381169526f9ff92d69ed718f6c71df51eb87a9ce69613c8c24d2e953012"
+checksum = "8ac0c6669e718c0576636fb62fa03955297b7ec28fa581c8fc909586b4c53cf4"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-engine",
@@ -4575,9 +4585,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-config"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9048e2afcbc008e169cca029dd4308e326fdbf44f0276747eb68cc28de696a2a"
+checksum = "ad0f572709e89b53754cf06deaae31aeed889186443e73c137e4ce61061f5230"
 dependencies = [
  "dirs",
  "serde",
@@ -4587,9 +4597,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-engine"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14522c2db75a742e59e0473d5e1df06e4417ba1babfa705467a921de2fd4ce50"
+checksum = "8fc1f217ae42a49f81466dc2ae893419bf0216a97cd3f34bd39401a095fd6b4c"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-traits",
@@ -4597,12 +4607,13 @@ dependencies = [
 
 [[package]]
 name = "voxora-hf"
-version = "0.6.0"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a4b074841ff91a08b7ac462ef95470f8cd6828f70275874f0301e8ed34ce290"
+checksum = "7c7b82ee54196bebc337e1e27e8ef3d31b309851c67a7bb19031f25e8b168bba"
 dependencies = [
  "async-trait",
  "dirs",
+ "fs2",
  "futures-util",
  "reqwest",
  "serde",
@@ -4616,9 +4627,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-minimax"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be25bb51f6740d2fbfd699cf75ccb878e3c3e6fcc93b2433b133e9645165a1f8"
+checksum = "9e93f69dd854dc680c3ccb18c2297d4b04e8db28ec0818db2c2eaf9365ebc57c"
 dependencies = [
  "secrecy",
  "serde",
@@ -4632,9 +4643,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-qwen3asr"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44796e08f0858eea20c204a40d8e9a3a91d73f7a3d5fa1e0ffe569ccb68d2d9b"
+checksum = "7ac4f7cfd8ceff636292d989eb53eb4138c1fc31ff8f08bd20c5164829d98fc5"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4647,9 +4658,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-registry"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7f5dca3d583014c43d31daf72771dfc3be518c62dc60faeb24e0c513bb3e955"
+checksum = "c60564c23e0b91aaba491b334c5560267df80535f1cedbe0643451c15b768146"
 dependencies = [
  "async-trait",
  "serde",
@@ -4662,9 +4673,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-traits"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61804c5025c85e85836182938264f4aed05c806d2b1344322afbfacb863e989c"
+checksum = "70508c47dae29157aabf037cd2b1f6be86de3e902c29fa367b737ce0e396fb23"
 dependencies = [
  "async-trait",
  "thiserror 2.0.20",
@@ -4672,9 +4683,9 @@ dependencies = [
 
 [[package]]
 name = "voxora-whisper"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6479025e3715ff1f371889cabb9e65e037753835c0ae1588663ae50116e468"
+checksum = "fc10d5f4970ef23f151c79e6ff25d6e16d91268e6972204224d6984e87d2d0ab"
 dependencies = [
  "thiserror 2.0.20",
  "voxora-hf",
@@ -4915,6 +4926,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4922,6 +4949,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"

@@ -315,8 +315,9 @@ Both tools print the same view; `telora-models` exists only for
 backwards compatibility with the pre-voxora packaging recipes and
 will be retired (see `TODO.md`).
 
-**Hardware backends.** voxora 0.5.1+ (airvzxf/voxora#121 / EPIC #124)
-exposes a `--hardware <cpu|cuda|metal|vulkan>` flag on `voxora run`
+**Hardware backends.** voxora 0.5.1+ (still present in 0.6.x;
+airvzxf/voxora#121 / EPIC #124) exposes a `--hardware <cpu|cuda|metal|vulkan>`
+flag on `voxora run`
 that validates the binary was built with the matching Cargo feature
 at compile time (informational — the runtime GPU backend is picked by
 whisper-rs from the compiled features). `--hardware vulkan` is

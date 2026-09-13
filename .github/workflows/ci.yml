@@ -32,7 +32,7 @@ jobs:
     # Pin a rustc toolchain so a future dep bump that needs a newer
     # rustc fails the build loudly instead of silently slipping
     # through on the GH-hosted image's default rustc. Ubuntu 24.04
-    # (Noble) only ships apt rustc 1.81, below voxora-bridge 0.5.x's
+    # (Noble) only ships apt rustc 1.81, below voxora-bridge 0.6.x's
     # MSRV of 1.88 (raised in voxora EPIC #100 / 0.4.2, driven by
     # `whisper-rs-sys 0.15.0`) — without this step the build happens
     # to compile today only because every dep we use happens to be

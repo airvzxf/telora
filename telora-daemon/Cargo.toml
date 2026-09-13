@@ -21,7 +21,7 @@ rust-version.workspace = true
 # backends compiled in so Volta+ users get GPU acceleration out of the
 # box without editing the manifest.
 #
-# `minimax` (closes #163) re-exports `voxora-minimax 0.6.0`, the
+# `minimax` (closes #163) re-exports `voxora-minimax 0.6.1`, the
 # first hosted-API engine adapter in the voxora workspace (closes
 # airvzxf/voxora#157 / EPIC #153). With this feature enabled the
 # daemon's `BridgeTranscriber::from_id` arm for `EngineFamily::MiniMax`
@@ -47,7 +47,7 @@ voxora-bridge = { workspace = true, features = ["cuda-whisper", "cuda-qwen3asr",
 # pinned to whatever candle-core 0.9.2 currently uses; bump
 # alongside candle-core in the voxora-bump PR.
 cudarc = "0.19"
-# voxora-registry 0.5 owns the canonical resolution path
+# voxora-registry 0.6.x owns the canonical resolution path
 # (`Registry::resolve(&ModelId::parse(id), &opts) -> ResolvedModel`)
 # the daemon goes through so it never has to lex-sort `*.bin`
 # files in a cache directory. Direct dep (not pulled transitively
