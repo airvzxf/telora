@@ -10,16 +10,23 @@ use tokio::sync::{mpsc, oneshot};
 /// Status payload returned to clients over the unix socket.
 ///
 /// `model_kind` is the voxora engine family (`whisper`,
-/// `qwen3-asr`, or `minimax`). `model_id` is the Hugging Face
-/// identifier the daemon loaded for local engines (e.g.
-/// `ggerganov/whisper.cpp/ggml-base.bin`); for the MiniMax hosted
-/// engine it carries the operator-supplied label (default
-/// `asr-1.0`). `model_path` is the resolved local
-/// file/directory the engine loaded from for the on-disk engines,
-/// and for MiniMax the API endpoint URL
-/// (`hosted://https://api.minimax.io/v1/speech_to_text (model:
-/// asr-1.0)`) so the status display does not imply a misleading
-/// local path.
+/// `qwen3-asr`, or `minimax`). `model_id` is the engine's
+/// authoritative label after build — the Hugging Face id for
+/// Whisper / Qwen3-ASR, or voxora's `DEFAULT_MODEL = "asr-1.0"`
+/// (or the operator's TOML override) for MiniMax.
+///
+/// `model_path` is the resolved local file or directory the
+/// on-disk engines loaded from (e.g.
+/// `/home/wolf/.cache/voxora/models/huggingface/.../ggml-base.bin`).
+/// `endpoint` is the API endpoint URL the hosted engine posts
+/// audio to (e.g. `https://api.minimax.io/v1/speech_to_text`).
+/// Exactly one of the two is non-empty for any given engine
+/// (closes #167), and the display logic in `run_status_client`
+/// picks the matching label — `Resolved Path:` for on-disk,
+/// `Endpoint:` for hosted. The two-field split replaced the
+/// previous single `model_path` field that overloaded both
+/// meanings and surfaced `hosted://…` URLs under a
+/// filesystem-path-shaped heading.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub active: bool,
@@ -27,6 +34,7 @@ pub struct StatusResponse {
     pub model_id: String,
     pub model_kind: String,
     pub model_path: String,
+    pub endpoint: String,
     pub language: String,
     pub max_recording_seconds: u32,
     pub state: String,
@@ -39,18 +47,12 @@ pub struct StatusResponse {
 /// pass it verbatim over the socket; the daemon validates it via
 /// [`voxora_bridge::EngineFamily::from_config`].
 ///
-/// `minimax_api_key` (closes #163) is the optional explicit
-/// override for the MiniMax hosted STT engine's bearer token. When
-/// the operator sets `model_kind = "minimax"`, this field is
-/// consulted first; if empty, the daemon falls back to the
-/// voxora-config cascade (`VOXORA_MINIMAX_API_KEY` then
-/// `MINIMAX_API_KEY`). The cascade itself lives in
-/// `voxora-config/src/minimax.rs:42-59`; the daemon re-implements
-/// the same precedence inline so the env vars are honoured even
-/// when the operator has not opted into voxora-config as a direct
-/// dependency. `#[serde(default)]` keeps existing partial TOML
-/// files loading — operators who set `minimax_api_key` get the
-/// new behaviour, everyone else sees no change.
+/// **No secrets live here.** The MiniMax bearer token (or any
+/// other operator secret) belongs in a `mode 0600` `.env` file
+/// at `$XDG_CONFIG_HOME/telora/.env` (default
+/// `~/.config/telora/.env`) or `/etc/telora/.env`, never in this
+/// TOML. The daemon reads the file via
+/// [`telora_common::resolve_minimax_api_key`] (closes #166).
 ///
 /// `Default` is derived so a flattened top-level field can supply
 /// an empty `SttConfig` when the user's `telora.toml` omits every
@@ -67,16 +69,16 @@ pub struct SttConfig {
     pub model_kind: String,
     #[serde(default)]
     pub model_path: String,
+    /// Resolved API endpoint URL for hosted engines (closes #167).
+    /// Empty for the on-disk engines (Whisper / Qwen3-ASR).
+    /// The status display branches on this being non-empty to
+    /// pick `Endpoint:` over `Resolved Path:`.
+    #[serde(default)]
+    pub endpoint: String,
     #[serde(default)]
     pub language: String,
     #[serde(default)]
     pub max_recording_seconds: u32,
-    /// Optional explicit override for the MiniMax API key. When
-    /// `None`/empty, the daemon resolves via
-    /// `VOXORA_MINIMAX_API_KEY` then `MINIMAX_API_KEY`. Only
-    /// consulted when `model_kind == "minimax"`.
-    #[serde(default)]
-    pub minimax_api_key: Option<String>,
 }
 
 /// `[paths]` section of `telora.toml`. All fields are optional; an
@@ -128,13 +130,9 @@ pub fn default_stt_config() -> SttConfig {
         model_id: "ggerganov/whisper.cpp/ggml-base.bin".to_string(),
         model_kind: "whisper".to_string(),
         model_path: String::new(),
+        endpoint: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
-        // `None` → resolve via `VOXORA_MINIMAX_API_KEY` /
-        // `MINIMAX_API_KEY`. The default Whisper install never
-        // consults this field, so leaving it `None` is the
-        // backwards-compatible choice.
-        minimax_api_key: None,
     }
 }
 

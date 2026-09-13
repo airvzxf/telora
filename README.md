@@ -79,9 +79,11 @@ model_kind = "whisper"
 #   ggerganov/whisper.cpp/ggml-large-v3.bin
 #   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR 0.6B (~1.7 GB)
 #   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR 1.7B
-#
-# Ignored when `model_kind = "minimax"`; the hosted engine reads
-# its model label from the upstream endpoint's default (`asr-1.0`).
+#   asr-1.0                               — MiniMax hosted model
+#                                          (closes #165; voxora's
+#                                          default; set this when
+#                                          voxora-minimax ships a
+#                                          newer model)
 model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 
 # Legacy field; kept so older configs keep working. New configs
@@ -89,12 +91,11 @@ model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 # `model_path` is set, the daemon treats `model_path` as the model id.
 model_path = ""
 
-# MiniMax bearer token. Only consulted when `model_kind = "minimax"`.
-# Leave empty (the default) to defer to the env cascade
-# (`VOXORA_MINIMAX_API_KEY` then `MINIMAX_API_KEY`); most operators
-# want this. Set the field only when you need the token to live in
-# the config itself (CI runners, `--env-file` systems, etc.).
-minimax_api_key = ""
+# Bearer tokens for hosted engines NEVER live here (closes
+# #166). The MiniMax API key is read at startup from
+# `~/.config/telora/.env` (mode 0600), then `/etc/telora/.env`,
+# then `VOXORA_MINIMAX_API_KEY`, then `MINIMAX_API_KEY`.
+# Override the file path with `--minimax-env-file PATH` for CI.
 
 # Language code (ISO 639-1, e.g. "es", "en", "fr"). The daemon
 # translates this to the engine-specific vocabulary internally:
@@ -227,8 +228,8 @@ telora-daemon status
 
 **Example Output:**
 
-For the local Whisper / Qwen3-ASR engines the `Resolved Path:`
-points at the on-disk cache:
+For the local Whisper / Qwen3-ASR engines, `Resolved Path:`
+points at the on-disk cache (closes #167):
 
 ```text
 Telora Daemon Status
@@ -237,13 +238,14 @@ ACTIVE     PID        KIND       MODEL                          LANG       MAX_S
 YES        1234       whisper    ggerganov/whisper.cpp/ggml-b… es         300        Idle
 
 Full Model Id:   ggerganov/whisper.cpp/ggml-base.bin
-Resolved Path:   /home/user/.cache/voxora/models/huggingface/ggerganov/whisper.cpp/ggml-base.bin/main/ggml-base.bin
 Engine Kind:     whisper
+Resolved Path:   /home/user/.cache/voxora/models/huggingface/ggerganov/whisper.cpp/ggml-base.bin/main/ggml-base.bin
 ```
 
-For the hosted MiniMax engine (closes #163) the `Resolved Path:`
-carries the API endpoint URL (no on-disk model exists) and the
-`Full Model Id:` slot shows the upstream model label:
+For the hosted MiniMax engine (closes #163, #165, #167), there is
+no on-disk model; the display shows the API endpoint under a
+dedicated `Endpoint:` line and the resolved model label under
+`Full Model Id:`:
 
 ```text
 Telora Daemon Status
@@ -252,8 +254,8 @@ ACTIVE     PID        KIND       MODEL                          LANG       MAX_S
 YES        1234       minimax    asr-1.0                        es         300        Idle
 
 Full Model Id:   asr-1.0
-Resolved Path:   hosted://https://api.minimax.io/v1/speech_to_text (model: asr-1.0)
 Engine Kind:     minimax
+Endpoint:        https://api.minimax.io/v1/speech_to_text
 ```
 
 ## Security & Privacy
@@ -278,10 +280,10 @@ model_id   = "ggerganov/whisper.cpp/ggml-base.bin"
 # model_kind = "qwen3-asr"
 # model_id   = "Qwen/Qwen3-ASR-0.6B"
 
-# MiniMax hosted STT API (closes #163). No on-disk model;
-# `model_id` is ignored. The bearer token is resolved via
-# `minimax_api_key` (above) or the env cascade
-# `VOXORA_MINIMAX_API_KEY` → `MINIMAX_API_KEY`.
+# MiniMax hosted STT API (closes #163, #165, #166). No
+# on-disk model; the bearer token lives in
+# `~/.config/telora/.env` (mode 0600); `model_id` defaults to
+# voxora's `asr-1.0` and can be overridden here.
 # model_kind = "minimax"
 ```
 
@@ -342,24 +344,44 @@ rejected and fall back to the XDG default. Relative paths are retained
 for backwards compatibility and are resolved relative to the process
 working directory.
 
-### MiniMax hosted STT (closes #163)
+### MiniMax hosted STT (closes #163, #165, #166, #167)
 
 Setting `model_kind = "minimax"` in `telora.toml` routes every
 recording through the MiniMax `/v1/speech_to_text` endpoint
 (`https://platform.minimax.io/docs/api-reference/speech-to-text`).
 No on-disk model is downloaded and no GPU is required — compute
 happens server-side and only the audio bytes + a single
-`Authorization: Bearer …` header cross the network. The bearer
-token is resolved in this order (first non-empty wins):
+`Authorization: Bearer …` header cross the network.
 
-1. `minimax_api_key = "…"` in `telora.toml` (or
-   `TELORA_MINIMAX_API_KEY` env var to override it).
-2. `VOXORA_MINIMAX_API_KEY` env var.
-3. `MINIMAX_API_KEY` env var (canonical alias; most operators
-   just `export MINIMAX_API_KEY=sk-…` once).
+#### Bearer token (closes #166)
 
-For systemd, the cleanest pattern is a drop-in that injects the
-env var without leaking it into a committed file:
+**The token NEVER lives in `telora.toml`** — that was a
+disclosure hazard (`git init && git add .` would leak it). The
+daemon resolves it from, first non-empty wins:
+
+1. `--minimax-env-file PATH` CLI override (CI runners,
+   project-local `.env`).
+2. `/etc/telora/.env` (system-wide).
+3. `$XDG_CONFIG_HOME/telora/.env` — default
+   `~/.config/telora/.env`, mode 0600 expected.
+4. `VOXORA_MINIMAX_API_KEY` env var.
+5. `MINIMAX_API_KEY` env var (canonical alias).
+
+Steps 2 and 3 use `dotenvy`'s "set if currently unset" semantics,
+so an `Environment=MINIMAX_API_KEY=…` line in the systemd unit
+always wins over the `.env` value (the file is the *default*,
+not a hard override). Set up the canonical user file once:
+
+```sh
+mkdir -p ~/.config/telora
+echo 'MINIMAX_API_KEY=sk-cp-…' > ~/.config/telora/.env
+chmod 0600 ~/.config/telora/.env
+```
+
+The daemon picks it up at next REFRESH or restart.
+
+For systemd, the alternative pattern is a drop-in that injects
+the env var directly (skips the file):
 
 ```bash
 systemctl --user edit telora-daemon.service
@@ -371,13 +393,24 @@ Environment=MINIMAX_API_KEY=sk-…
 ```
 
 Reload and restart with `systemctl --user daemon-reload &&
-systemctl --user restart telora-daemon.service`. The same drop-in
-applies to `telora.service` if the GUI needs to know which engine
-is active (the status command surfaces `KIND = minimax`).
+systemctl --user restart telora-daemon.service`.
+
+#### Model label (closes #165)
+
+`model_id` in `telora.toml` is honoured for MiniMax too. The
+default is voxora's `DEFAULT_MODEL = "asr-1.0"`; the daemon
+logs `using voxora default MiniMax model \`asr-1.0\` because
+telora.toml is silent` and surfaces it as `Full Model Id:` in
+the status output, so you can see what was used without reading
+the daemon's source. To override, set `model_id = "asr-2.0"`
+(or whatever voxora-minimax ships next) and the daemon forwards
+it via `MiniMaxConfig::with_model(...)`. Anything voxora-minimax
+does not recognise will surface as a `400 bad_request_error`
+from upstream.
 
 Switch engines back to local Whisper / Qwen3-ASR by editing
-`model_kind` and reloading — no other change is needed; the token
-is silently ignored when the family is not `minimax`.
+`model_kind` and reloading — no other change is needed; the
+token is silently ignored when the family is not `minimax`.
 
 ### Model Resolution (Precedence)
 
