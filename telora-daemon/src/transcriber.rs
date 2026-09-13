@@ -241,8 +241,8 @@ impl BridgeTranscriber {
         // for future Qwen releases while staying well below any
         // "pathological 100 GB+" size.
         //
-        // HONEST GAP (closes #148): voxora-hf 0.5.1 does not yet
-        // honour `ResolveOptions::max_bytes` despite the
+        // HONEST GAP (closes #148): voxora-hf 0.6.2 (and 0.5.1+)
+        // does not yet honour `ResolveOptions::max_bytes` despite the
         // voxora-traits CHANGELOG claiming it does — zero references
         // to the field exist anywhere under voxora-hf/src/. The cap
         // therefore does NOT activate on the daemon's HF resolve

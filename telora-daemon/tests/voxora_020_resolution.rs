@@ -3,7 +3,7 @@
 //!
 //! The registry semantics it pins have been stable since the
 //! voxora 0.2.0 fix; the test currently runs against the voxora
-//! 0.5 line.
+//! 0.6 line.
 //!
 //! Before the fix, `telora-daemon/src/transcriber.rs::from_id` would
 //! take the on-disk directory returned by `HuggingFaceSource::resolve`
@@ -27,9 +27,9 @@
 //!    daemon no longer has to scan the directory at all.
 //!
 //! These tests still pin both behaviours against a hand-rolled cache
-//! layout under the current voxora 0.5 line. The registry semantics
+//! layout under the current voxora 0.6 line. The registry semantics
 //! introduced in voxora 0.2.0 are stable across the 0.2 → 0.3 → 0.4
-//! → 0.5 bumps (voxora 0.4 removed the `voxora-core` deprecation
+//! → 0.5 → 0.6 bumps (voxora 0.4 removed the `voxora-core` deprecation
 //! shim and moved those traits into `voxora-traits`, but
 //! `voxora-bridge` re-exports `voxora_traits::*` so the imports below
 //! still resolve unchanged). voxora 0.5 added
