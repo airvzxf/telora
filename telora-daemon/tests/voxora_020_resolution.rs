@@ -282,6 +282,7 @@ async fn from_id_cross_check_rejects_family_id_mismatch() {
         EngineFamily::Whisper,
         Some(tmp.path().to_path_buf()),
         None,
+        None,
     )
     .await;
     let err = match result {
@@ -311,6 +312,7 @@ async fn from_id_two_segment_whisper_rejects_with_actionable_error() {
         EngineFamily::Whisper,
         Some(tmp.path().to_path_buf()),
         None,
+        None,
     )
     .await;
     let err = match result {
@@ -331,6 +333,7 @@ async fn from_id_surfaces_resolved_path_matching_dir_entry_end_to_end() {
         "ggerganov/whisper.cpp/ggml-large-v3.bin",
         EngineFamily::Whisper,
         Some(tmp.path().to_path_buf()),
+        None,
         None,
     )
     .await;
@@ -372,6 +375,7 @@ async fn from_id_rejects_symlinked_model_file() {
         "ggerganov/whisper.cpp/ggml-large-v3.bin",
         EngineFamily::Whisper,
         Some(tmp.path().to_path_buf()),
+        None,
         None,
     )
     .await;

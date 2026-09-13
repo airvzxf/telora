@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# voxora-bridge 0.5 replaces the direct whisper-rs dependency.
+# voxora-bridge 0.6 replaces the direct whisper-rs dependency.
 # voxora-bridge defaults to `["whisper", "qwen3asr"]`, which is
 # exactly what the daemon needs so users can switch model_kind
-# without a rebuild. voxora-bridge 0.5 also re-exports
+# without a rebuild. voxora-bridge 0.6 also re-exports
 # `voxora_traits::*`, so the trait surface used by the daemon
 # (`AsrEngine`, `EngineFamily`, `ModelSource`, `ResolveOptions`,
 # `AsrError`, `ModelDir`) is reachable via `voxora_bridge::*`
@@ -20,7 +20,21 @@ rust-version.workspace = true
 # qwen3-asr engine falls back to CPU at runtime; the binary keeps both
 # backends compiled in so Volta+ users get GPU acceleration out of the
 # box without editing the manifest.
-voxora-bridge = { workspace = true, features = ["cuda-whisper", "cuda-qwen3asr"] }
+#
+# `minimax` (closes #163) re-exports `voxora-minimax 0.6.0`, the
+# first hosted-API engine adapter in the voxora workspace (closes
+# airvzxf/voxora#157 / EPIC #153). With this feature enabled the
+# daemon's `BridgeTranscriber::from_id` arm for `EngineFamily::MiniMax`
+# becomes reachable: an operator can set `model_kind = "minimax"` in
+# `telora.toml` and have the daemon POST captured audio to the
+# MiniMax `/v1/speech_to_text` endpoint using a bearer token
+# resolved via `MINIMAX_API_KEY` / `VOXORA_MINIMAX_API_KEY` /
+# `telora.toml`'s optional `minimax_api_key` field. There is no
+# GPU backend for MiniMax (compute happens server-side) and no
+# `cuda-minimax` forward — operators on low-end hardware that
+# cannot run Whisper / Qwen3-ASR locally now have an opt-in
+# hosted-API off-ramp.
+voxora-bridge = { workspace = true, features = ["cuda-whisper", "cuda-qwen3asr", "minimax"] }
 # `cudarc` is the CUDA driver binding candle-core uses under the
 # `cuda` feature. Pulled in transitively today; we re-list it here
 # directly so `transcriber::pick_qwen3asr_device` can call
@@ -77,3 +91,33 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 # test can import `RegistryHfExt` / `ModelId` without a private
 # re-export dance.
 voxora-registry = { workspace = true }
+# Closes #163 (MiniMax integration): the `minimax_live_jfk`
+# integration test below posts a JFK inaugural clip to the real
+# MiniMax `/v1/speech_to_text` endpoint and asserts the recognised
+# text. `voxora-minimax` is opt-in via the bridge's `minimax`
+# Cargo feature (re-exported as `voxora_bridge::MiniMaxEngine` for
+# production code); we list it as a direct dev-dependency so the
+# test compiles even when a slim consumer strips the bridge
+# features down to `whisper` only. The `[[test]]` entry below
+# re-gates compilation on the `minimax` feature so a slim build
+# does not pull `voxora-minimax` into the test target either.
+voxora-minimax = { workspace = true }
+
+# Closes #163: live end-to-end smoke for the MiniMax engine.
+# The single `#[test]` inside is `#[ignore]`-gated so it does not
+# run in `cargo test --workspace`; it requires `MINIMAX_API_KEY`
+# and posts a ~30 s JFK inaugural WAV to the real endpoint. Run
+# with:
+#
+#   MINIMAX_API_KEY=<key> \
+#     cargo test -p telora-daemon --test minimax_live_jfk \
+#       -- --ignored --nocapture
+#
+# We intentionally do NOT use `required-features = ["minimax"]`
+# (the voxora-bridge `cross_engine_parity` pattern) because the
+# daemon already enables `voxora-bridge/minimax` unconditionally
+# in the production `[dependencies]` line above; the `#[ignore]`
+# annotation is the real gate that keeps the live round-trip out
+# of `cargo test --workspace`.
+[[test]]
+name = "minimax_live_jfk"

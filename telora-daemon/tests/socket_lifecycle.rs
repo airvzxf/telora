@@ -313,6 +313,7 @@ async fn refresh_parses_json_and_dispatches_reload_config() {
         model_path: String::new(),
         language: "en".to_string(),
         max_recording_seconds: 300,
+        minimax_api_key: None,
     };
     let payload = format!("REFRESH {}", serde_json::to_string(&new_config).unwrap());
     let client_task = tokio::spawn(async move { round_trip(&sock_path, payload.as_bytes()).await });
@@ -354,6 +355,7 @@ async fn refresh_split_across_two_writes_is_reassembled() {
         model_path: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
+        minimax_api_key: None,
     };
     let json = serde_json::to_string(&new_config).unwrap();
     let client_task = tokio::spawn(async move {

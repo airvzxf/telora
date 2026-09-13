@@ -42,3 +42,6 @@ pkg/pkg/
 pkg/*.pkg.tar.zst
 pkg/*.pkg.tar.xz
 pkg/telora-*/
+
+# Env
+.env
