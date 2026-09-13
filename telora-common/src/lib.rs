@@ -26,13 +26,14 @@
 //!
 //! `telora-common` is a leaf crate — it does not depend on the
 //! binary crates and pulls only the dependencies strictly needed to
-//! implement the shared surface (`anyhow`, `dirs`, `log`, `nix` with
-//! the minimum feature set, `tokio::net`, `socket2`, `config` for the
-//! env-var cascade).
+//! implement the shared surface (`anyhow`, `dirs`, `dotenvy`, `log`,
+//! `nix` with the minimum feature set, `tokio::net`, `socket2`,
+//! `config` for the env-var cascade).
 
 pub mod cache;
 pub mod env;
 pub mod paths;
+pub mod secrets;
 pub mod socket_bind;
 
 pub use cache::{default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override};
@@ -41,4 +42,5 @@ pub use paths::{
     PathsConfig, ResolvedPaths, control_socket_path, daemon_socket_path, default_paths_config,
     resolve,
 };
+pub use secrets::{resolve_minimax_api_key, system_telora_dotenv_path, user_telora_dotenv_path};
 pub use socket_bind::{bind_unix_socket, bind_unix_socket_manual};

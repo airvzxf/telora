@@ -9,9 +9,8 @@
 #   "whisper"    — whisper.cpp via voxora-whisper (ggml-*.bin files)
 #   "qwen3-asr"  — Qwen3-ASR via voxora-qwen3asr (candle, multi-lingual)
 #   "minimax"    — MiniMax hosted STT API via voxora-minimax (closes
-#                  #163; compute is server-side; requires the bearer
-#                  token to be reachable via `minimax_api_key` below
-#                  or `VOXORA_MINIMAX_API_KEY` / `MINIMAX_API_KEY`).
+#                  #163; compute is server-side; the bearer token
+#                  lives in `~/.config/telora/.env`, NEVER here).
 model_kind = "whisper"
 
 # Hugging Face model identifier (or local path, see below).
@@ -26,9 +25,12 @@ model_kind = "whisper"
 #   ggerganov/whisper.cpp/ggml-large-v3.bin
 #   Qwen/Qwen3-ASR-0.6B                   — Qwen3-ASR (20 languages)
 #   Qwen/Qwen3-ASR-1.7B                   — Qwen3-ASR (larger, 20 languages)
-#
-# Ignored when `model_kind = "minimax"`: the hosted engine reads its
-# model label from the upstream endpoint's default (`asr-1.0`).
+#   asr-1.0                               — MiniMax hosted model
+#                                          (closes #165; voxora's
+#                                          default is `asr-1.0`,
+#                                          which the daemon logs
+#                                          and surfaces when you
+#                                          leave this field blank)
 #
 # To use a model cache outside the default XDG location, pass
 # `--voxora-cache DIR` to the daemon or set `VOXORA_CACHE_DIR=DIR`.
@@ -42,14 +44,14 @@ model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 # `model_id` is empty. New configs should set `model_id` directly.
 model_path = ""
 
-# MiniMax bearer token (closes #163). Only consulted when
-# `model_kind = "minimax"`. Leave empty to defer to the env
-# cascade (`VOXORA_MINIMAX_API_KEY` then `MINIMAX_API_KEY`),
-# which is what most operators want — the token never enters
-# `telora.toml` and the daemon picks it up at startup. Set this
-# field only when you need the token to live in the config file
-# itself (CI runners, multi-tenant hosts, `--env-file` systems).
-minimax_api_key = ""
+# Bearer tokens for hosted engines NEVER live here (closes
+# #166). The MiniMax API key is read at startup from
+# `~/.config/telora/.env` (mode 0600 expected), then
+# `/etc/telora/.env`, then `VOXORA_MINIMAX_API_KEY`, then
+# `MINIMAX_API_KEY`. Override the file path with the CLI flag
+# `--minimax-env-file PATH` for CI runners and one-off dev
+# shells. See the README "MiniMax hosted STT" section for the
+# systemd drop-in recipe.
 
 # Language code (ISO 639-1, e.g. "es", "en", "fr"). The daemon
 # translates this to the engine-specific vocabulary internally:
