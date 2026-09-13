@@ -48,8 +48,8 @@ use anyhow::{Context, Result, anyhow};
 use cudarc::driver::CudaContext;
 use log::{info, warn};
 use voxora_bridge::{
-    AsrEngine, Device, EngineFamily, HuggingFaceSource, ModelSource, ResolveOptions,
-    TranscribeOptions, WhisperEngine,
+    AsrEngine, Device, EngineFamily, HuggingFaceSource, MiniMaxConfig, MiniMaxEngine, ModelSource,
+    ResolveOptions, TranscribeOptions, WhisperEngine,
 };
 use voxora_registry::{ModelId, Registry, RegistryHfExt};
 
@@ -100,8 +100,12 @@ pub struct BridgeTranscriber {
     model_id: String,
     model_kind: EngineFamily,
     /// Resolved local path of the model on disk (filled in after
-    /// `from_id` succeeds). Surfaced through the status response so
-    /// the GUI can show the user where the model actually lives.
+    /// `from_id` succeeds). For the MiniMax hosted engine this is
+    /// the API endpoint URL (e.g.
+    /// `hosted://https://api.minimax.io/v1/speech_to_text (model: asr-1.0)`)
+    /// — there is no on-disk model, but the field is still useful
+    /// for the status display and is required by the
+    /// `StatusResponse` struct.
     resolved_path: String,
 }
 
@@ -121,12 +125,47 @@ impl BridgeTranscriber {
     /// the bump; voxora-hf 0.4 would otherwise default to a
     /// voxora-config-derived root that drops the `models/huggingface`
     /// suffix and orphans every cached model.
+    ///
+    /// `minimax_api_key` (closes #163) is the optional explicit
+    /// override for the MiniMax bearer token. When `None` or empty
+    /// the daemon falls back to the voxora-config cascade
+    /// (`VOXORA_MINIMAX_API_KEY` → `MINIMAX_API_KEY`,
+    /// `voxora-config/src/minimax.rs:42-59`). Only consulted when
+    /// `model_kind == EngineFamily::MiniMax`; ignored otherwise.
     pub async fn from_id(
         model_id: &str,
         model_kind: EngineFamily,
         cache_dir: Option<std::path::PathBuf>,
         hf_token: Option<String>,
+        minimax_api_key: Option<String>,
     ) -> Result<Self> {
+        // ── Hosted-API shortcut (closes #163, EPIC #153) ───────
+        // MiniMax does NOT use the voxora HF registry: there is no
+        // on-disk model, no cache_dir, no hf_token, no model_path,
+        // no symlink check, no GPU device picker. Just an API key
+        // (resolved from `minimax_api_key` → `VOXORA_MINIMAX_API_KEY`
+        // → `MINIMAX_API_KEY`) and a `voxora-minimax` engine that
+        // POSTs the WAV over HTTPS. We short-circuit before the
+        // HuggingFaceSource builder so the cache_dir / hf_token
+        // arguments stay on the function signature unchanged for
+        // every other engine family.
+        if model_kind == EngineFamily::MiniMax {
+            let api_key = resolve_minimax_api_key(minimax_api_key.as_deref())?;
+            let config = MiniMaxConfig::new(api_key).map_err(|e| anyhow!("voxora-minimax: {e}"))?;
+            let endpoint = config.endpoint().to_string();
+            let model = config.model().to_string();
+            let engine = MiniMaxEngine::new(config).map_err(|e| anyhow!("voxora: {e}"))?;
+            let resolved_path = format!("hosted://{endpoint}/v1/speech_to_text (model: {model})");
+            info!("loaded MiniMax hosted ASR engine (endpoint={endpoint}, model={model})");
+            return Ok(Self {
+                engine: Arc::new(engine) as Arc<dyn AsrEngine>,
+                model_id: model_id.to_string(),
+                model_kind,
+                resolved_path,
+            });
+        }
+        // ── End hosted-API shortcut ─────────────────────────────
+
         let mut builder = HuggingFaceSource::builder();
         if let Some(dir) = cache_dir {
             builder = builder.cache_dir(dir);
@@ -265,11 +304,13 @@ impl BridgeTranscriber {
             // without breaking this match. The registry cross-check
             // above guarantees we only see families we have a real
             // loader for; anything else is a config-mismatch bug we
-            // want to hear about loudly.
+            // want to hear about loudly. The MiniMax arm is handled
+            // by the pre-match shortcut above (closes #163) — the
+            // hosted engine never enters the registry path.
             other => {
                 return Err(anyhow!(
                     "model_kind {other:?} has no voxora engine adapter wired up in telora; \
-                     current set: Whisper, Qwen3Asr"
+                     current set: Whisper, Qwen3Asr, MiniMax"
                 ));
             }
         };
@@ -312,8 +353,16 @@ impl BridgeTranscriber {
         match self.model_kind {
             EngineFamily::Whisper => Some(iso.to_ascii_lowercase()),
             EngineFamily::Qwen3Asr => iso_to_qwen_name(iso),
+            // MiniMax (closes #163) accepts the same bare 2-letter
+            // BCP-47 tags as its whitelist (`voxora-minimax/src/
+            // language.rs:19-40`); the validator runs server-side.
+            // We reuse the Whisper passthrough rather than the
+            // Qwen full-name mapping because the latter would
+            // rewrite "en" → "english" and MiniMax's whitelist
+            // rejects the full English spelling with a 400.
+            EngineFamily::MiniMax => Some(iso.to_ascii_lowercase()),
             // `EngineFamily` is `#[non_exhaustive]`. We promise only
-            // the two variants above are wired up; anything else
+            // the three variants above are wired up; anything else
             // lands here as a user-visible error.
             _ => None,
         }
@@ -333,6 +382,15 @@ impl Transcriber for BridgeTranscriber {
             None => match self.model_kind {
                 EngineFamily::Whisper => "auto".to_string(),
                 EngineFamily::Qwen3Asr => "auto".to_string(),
+                // MiniMax (closes #163) treats `None` / `""` /
+                // whitespace as "auto-detect / mixed-language" and
+                // validates against the whitelist
+                // (`voxora-minimax/src/language.rs:60-76`); the
+                // literal `"auto"` would be rejected by the
+                // validator. We send an empty string and let the
+                // engine omit the `language` form field, which is
+                // exactly the upstream documented auto-detect mode.
+                EngineFamily::MiniMax => String::new(),
                 // `EngineFamily` is `#[non_exhaustive]`; anything
                 // else is a misconfigured engine and is unreachable
                 // because `from_id` already rejected it above.
@@ -385,6 +443,37 @@ fn iso_to_qwen_name(iso: &str) -> Option<String> {
         _ => return None,
     };
     Some(name.to_string())
+}
+
+/// Resolve the MiniMax bearer token using the documented cascade
+/// (closes #163, mirrors `voxora-config/src/minimax.rs:42-59`):
+///
+/// 1. `explicit` — the `minimax_api_key` value from `telora.toml`
+///    (preferred for CI runners, multi-tenant hosts, anywhere
+///    the operator wants the key out of the shell environment).
+/// 2. `VOXORA_MINIMAX_API_KEY` env var.
+/// 3. `MINIMAX_API_KEY` env var (canonical alias).
+///
+/// Whitespace-only values are treated as empty and skipped. The
+/// function is `fn` (not associated with `BridgeTranscriber`)
+/// because it runs before any engine state exists.
+fn resolve_minimax_api_key(explicit: Option<&str>) -> Result<String> {
+    if let Some(k) = explicit
+        && !k.trim().is_empty()
+    {
+        return Ok(k.to_string());
+    }
+    for var in ["VOXORA_MINIMAX_API_KEY", "MINIMAX_API_KEY"] {
+        if let Ok(k) = std::env::var(var)
+            && !k.trim().is_empty()
+        {
+            return Ok(k);
+        }
+    }
+    Err(anyhow!(
+        "MINIMAX_API_KEY not set; export VOXORA_MINIMAX_API_KEY or MINIMAX_API_KEY in the \
+         telora-daemon environment, or add `minimax_api_key = \"...\"` to telora.toml"
+    ))
 }
 
 /// Refuse to load a model from a path that is (or whose final
@@ -557,5 +646,123 @@ mod tests {
     fn iso_to_qwen_is_case_insensitive() {
         assert_eq!(iso_to_qwen_name("EN").unwrap(), "english");
         assert_eq!(iso_to_qwen_name("ZH").unwrap(), "chinese");
+    }
+
+    // ── Closes #163 (MiniMax) test pins ─────────────────────────
+
+    /// Process-global env-lock for the resolution tests below. Tests
+    /// mutate `MINIMAX_API_KEY` / `VOXORA_MINIMAX_API_KEY`; running
+    /// them in parallel would race. Mirrors the `ENV_LOCK` pattern
+    /// from `telora-daemon/tests/config_env_cascade.rs`.
+    static MINIMAX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that snapshots two env vars on construction and
+    /// restores them on drop. Lets each test run independently even
+    /// when one or both vars are pre-set in the developer's shell.
+    struct EnvRestore {
+        voxora_minimax_api_key: Option<String>,
+        minimax_api_key: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn new() -> Self {
+            Self {
+                voxora_minimax_api_key: std::env::var("VOXORA_MINIMAX_API_KEY").ok(),
+                minimax_api_key: std::env::var("MINIMAX_API_KEY").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // `set_var` / `remove_var` became `unsafe` in Rust
+            // 1.86 (the workspace `rust-version`). The tests below
+            // serialise through `MINIMAX_ENV_LOCK` so a set_var
+            // racing a `std::env::var` in another test is the only
+            // UB surface; the lock keeps that race impossible.
+            // SAFETY: tests hold `MINIMAX_ENV_LOCK` for their
+            // entire lifetime, so no other thread observes a
+            // half-modified environment.
+            match &self.voxora_minimax_api_key {
+                Some(v) => unsafe {
+                    std::env::set_var("VOXORA_MINIMAX_API_KEY", v);
+                },
+                None => unsafe {
+                    std::env::remove_var("VOXORA_MINIMAX_API_KEY");
+                },
+            }
+            match &self.minimax_api_key {
+                Some(v) => unsafe { std::env::set_var("MINIMAX_API_KEY", v) },
+                None => unsafe { std::env::remove_var("MINIMAX_API_KEY") },
+            }
+        }
+    }
+
+    #[test]
+    fn minimax_resolver_prefers_explicit_value() {
+        let _lock = MINIMAX_ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: see `EnvRestore::drop`.
+        unsafe {
+            std::env::set_var("VOXORA_MINIMAX_API_KEY", "from-env-prefix");
+            std::env::set_var("MINIMAX_API_KEY", "from-env-canonical");
+        }
+        let got = resolve_minimax_api_key(Some("from-toml")).unwrap();
+        assert_eq!(got, "from-toml");
+    }
+
+    #[test]
+    fn minimax_resolver_falls_through_to_env_prefix() {
+        let _lock = MINIMAX_ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: see `EnvRestore::drop`.
+        unsafe {
+            std::env::set_var("VOXORA_MINIMAX_API_KEY", "from-env-prefix");
+            std::env::remove_var("MINIMAX_API_KEY");
+        }
+        let got = resolve_minimax_api_key(None).unwrap();
+        assert_eq!(got, "from-env-prefix");
+    }
+
+    #[test]
+    fn minimax_resolver_falls_through_to_canonical_env() {
+        let _lock = MINIMAX_ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: see `EnvRestore::drop`.
+        unsafe {
+            std::env::remove_var("VOXORA_MINIMAX_API_KEY");
+            std::env::set_var("MINIMAX_API_KEY", "from-env-canonical");
+        }
+        let got = resolve_minimax_api_key(None).unwrap();
+        assert_eq!(got, "from-env-canonical");
+    }
+
+    #[test]
+    fn minimax_resolver_skips_whitespace_explicit() {
+        let _lock = MINIMAX_ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: see `EnvRestore::drop`.
+        unsafe {
+            std::env::set_var("MINIMAX_API_KEY", "from-env-canonical");
+        }
+        let got = resolve_minimax_api_key(Some("   ")).unwrap();
+        assert_eq!(got, "from-env-canonical");
+    }
+
+    #[test]
+    fn minimax_resolver_errors_when_no_source_present() {
+        let _lock = MINIMAX_ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: see `EnvRestore::drop`.
+        unsafe {
+            std::env::remove_var("VOXORA_MINIMAX_API_KEY");
+            std::env::remove_var("MINIMAX_API_KEY");
+        }
+        let err = resolve_minimax_api_key(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("MINIMAX_API_KEY"),
+            "error message must name the canonical env var, got: {msg}"
+        );
     }
 }

@@ -9,11 +9,17 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Status payload returned to clients over the unix socket.
 ///
-/// `model_kind` is the voxora engine family (`whisper` or
-/// `qwen3-asr`). `model_id` is the Hugging Face identifier the
-/// daemon loaded (e.g. `ggerganov/whisper.cpp/ggml-base.bin`).
-/// `model_path` is the resolved local file/directory the engine
-/// actually loaded from — kept for the GUI's status display.
+/// `model_kind` is the voxora engine family (`whisper`,
+/// `qwen3-asr`, or `minimax`). `model_id` is the Hugging Face
+/// identifier the daemon loaded for local engines (e.g.
+/// `ggerganov/whisper.cpp/ggml-base.bin`); for the MiniMax hosted
+/// engine it carries the operator-supplied label (default
+/// `asr-1.0`). `model_path` is the resolved local
+/// file/directory the engine loaded from for the on-disk engines,
+/// and for MiniMax the API endpoint URL
+/// (`hosted://https://api.minimax.io/v1/speech_to_text (model:
+/// asr-1.0)`) so the status display does not imply a misleading
+/// local path.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub active: bool,
@@ -32,6 +38,19 @@ pub struct StatusResponse {
 /// `model_kind` is a free-form string at the JSON layer so we can
 /// pass it verbatim over the socket; the daemon validates it via
 /// [`voxora_bridge::EngineFamily::from_config`].
+///
+/// `minimax_api_key` (closes #163) is the optional explicit
+/// override for the MiniMax hosted STT engine's bearer token. When
+/// the operator sets `model_kind = "minimax"`, this field is
+/// consulted first; if empty, the daemon falls back to the
+/// voxora-config cascade (`VOXORA_MINIMAX_API_KEY` then
+/// `MINIMAX_API_KEY`). The cascade itself lives in
+/// `voxora-config/src/minimax.rs:42-59`; the daemon re-implements
+/// the same precedence inline so the env vars are honoured even
+/// when the operator has not opted into voxora-config as a direct
+/// dependency. `#[serde(default)]` keeps existing partial TOML
+/// files loading — operators who set `minimax_api_key` get the
+/// new behaviour, everyone else sees no change.
 ///
 /// `Default` is derived so a flattened top-level field can supply
 /// an empty `SttConfig` when the user's `telora.toml` omits every
@@ -52,6 +71,12 @@ pub struct SttConfig {
     pub language: String,
     #[serde(default)]
     pub max_recording_seconds: u32,
+    /// Optional explicit override for the MiniMax API key. When
+    /// `None`/empty, the daemon resolves via
+    /// `VOXORA_MINIMAX_API_KEY` then `MINIMAX_API_KEY`. Only
+    /// consulted when `model_kind == "minimax"`.
+    #[serde(default)]
+    pub minimax_api_key: Option<String>,
 }
 
 /// `[paths]` section of `telora.toml`. All fields are optional; an
@@ -105,6 +130,11 @@ pub fn default_stt_config() -> SttConfig {
         model_path: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
+        // `None` → resolve via `VOXORA_MINIMAX_API_KEY` /
+        // `MINIMAX_API_KEY`. The default Whisper install never
+        // consults this field, so leaving it `None` is the
+        // backwards-compatible choice.
+        minimax_api_key: None,
     }
 }
 

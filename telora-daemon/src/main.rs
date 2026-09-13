@@ -36,13 +36,24 @@ struct Args {
 
     /// Hugging Face model id (overrides config).
     /// Example: `Qwen/Qwen3-ASR-0.6B` or
-    /// `ggerganov/whisper.cpp/ggml-base.bin`.
+    /// `ggerganov/whisper.cpp/ggml-base.bin`. Ignored when
+    /// `model_kind = "minimax"` (MiniMax is a hosted API; the
+    /// bearer token comes from the env).
     #[arg(long)]
     model_id: Option<String>,
 
-    /// Engine family (`whisper` or `qwen3-asr`); overrides config.
+    /// Engine family (`whisper`, `qwen3-asr`, or `minimax`);
+    /// overrides config. `minimax` requires `MINIMAX_API_KEY` (or
+    /// `VOXORA_MINIMAX_API_KEY`) in the daemon's environment.
     #[arg(long)]
     model_kind: Option<String>,
+
+    /// MiniMax API key, only used when `model_kind = "minimax"`
+    /// (overrides `MINIMAX_API_KEY` / `VOXORA_MINIMAX_API_KEY`).
+    /// Prefer the env vars; this flag exists for CI runners and
+    /// one-off dev shells.
+    #[arg(long, hide = true)]
+    minimax_api_key: Option<String>,
 
     /// Language (ISO 639-1, e.g. "es", "en"); overrides config.
     #[arg(short, long)]
@@ -151,6 +162,9 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     }
     if let Some(s) = args.max_recording_seconds {
         cfg.stt.max_recording_seconds = s;
+    }
+    if let Some(k) = &args.minimax_api_key {
+        cfg.stt.minimax_api_key = Some(k.clone());
     }
 
     // Legacy compatibility: if the user's telora.toml only supplies
@@ -323,7 +337,7 @@ async fn build_transcriber(
 ) -> Result<(Box<dyn Transcriber>, String)> {
     let kind = voxora_bridge::EngineFamily::from_config(&config.model_kind).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown model_kind {:?}; expected one of `whisper` or `qwen3-asr`",
+            "unknown model_kind {:?}; expected one of `whisper`, `qwen3-asr`, or `minimax`",
             config.model_kind
         )
     })?;
@@ -331,8 +345,14 @@ async fn build_transcriber(
         .ok()
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
 
-    let bridge =
-        BridgeTranscriber::from_id(&config.model_id, kind, Some(voxora_cache), token).await?;
+    let bridge = BridgeTranscriber::from_id(
+        &config.model_id,
+        kind,
+        Some(voxora_cache),
+        token,
+        config.minimax_api_key.clone(),
+    )
+    .await?;
     let resolved_path = bridge.resolved_path().to_string();
     Ok((Box::new(bridge), resolved_path))
 }
