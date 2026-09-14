@@ -37,10 +37,18 @@ impl AudioEngine {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Si el dispositivo NO soporta 16kHz o Mono directamente, usamos su config por defecto
-        // y el stream match manejará los canales.
+        // Only force 16 kHz mono when the device's reported sample-rate range
+        // is *exactly* 16 kHz (i.e. a fixed-rate native USB headset). The
+        // previous `<= 16k && >= 16k` check passed whenever the range
+        // *included* 16 kHz, but cpal/PipeWire often reports implausibly
+        // wide ranges (e.g. 1 Hz-384000 Hz for Fifine USB mics) where the
+        // actual node only accepts 44100/48000/192000 Hz. Forcing 16 kHz
+        // against a lying wide range made `build_input_stream` +
+        // `stream.play()` wait forever for PipeWire to honour an
+        // unsupported rate. Falling through to `default_input_config()`
+        // here gives the device's real native rate (typically 48000 Hz).
         let actual_config = if device.supported_input_configs()?.any(|c| {
-            c.channels() == 1 && c.min_sample_rate().0 <= 16000 && c.max_sample_rate().0 >= 16000
+            c.channels() == 1 && c.min_sample_rate().0 == 16000 && c.max_sample_rate().0 == 16000
         }) {
             info!("Forcing 16000Hz Mono...");
             config
