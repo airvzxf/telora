@@ -4,6 +4,50 @@ use log::{error, info};
 use ringbuf::{HeapRb, Producer};
 use std::sync::Arc;
 
+/// Sample rate the downstream ASR (voxora-bridge `AsrEngine::transcribe`)
+/// and the daemon's recording buffer are sized for. The capture stream
+/// may run at a different native rate (e.g. Fifine's 48 kHz via direct
+/// ALSA); the audio thread downsamples to this rate so the ring buffer
+/// always holds audio at the rate the rest of the pipeline expects.
+///
+/// Per `voxora-traits/src/engine.rs`: "Transcribe a buffer of mono PCM
+/// samples at the engine's expected sample rate (typically 16 kHz, f32
+/// in [-1.0, 1.0])". The daemon's recording cap (`16000 *
+/// max_recording_seconds`) and MiniMax's WAV header also assume this
+/// rate, so the buffer MUST hold samples at this rate regardless of
+/// capture rate.
+const WHISPER_RATE_HZ: u32 = 16000;
+
+/// Push one mono frame into the ring buffer, averaging every
+/// `decimation_factor` consecutive samples first when the capture rate
+/// exceeds the target rate (i.e. `decimation_factor > 1`). The scratch
+/// buffer carries any unaligned leftovers across callbacks so a partial
+/// window at the end of one callback is completed by the next, instead
+/// of being silently dropped.
+///
+/// `decimation_factor <= 1` is a passthrough (capture already at 16 kHz
+/// or below).
+fn push_mono_decimated(
+    mono_frame: f32,
+    producer: &mut Producer<f32, Arc<HeapRb<f32>>>,
+    scratch: &mut Vec<f32>,
+    decimation_factor: usize,
+) {
+    if decimation_factor <= 1 {
+        let _ = producer.push(mono_frame);
+        return;
+    }
+    scratch.push(mono_frame);
+    if scratch.len() >= decimation_factor {
+        // Average exactly `decimation_factor` samples and reset the
+        // scratch. `drain(..)` consumes the elements; we divide by the
+        // configured factor (not `scratch.len()` post-drain, which is
+        // already 0).
+        let avg: f32 = scratch.drain(..).sum::<f32>() / decimation_factor as f32;
+        let _ = producer.push(avg);
+    }
+}
+
 pub struct AudioEngine {
     stream: Option<cpal::Stream>,
 }
@@ -130,80 +174,139 @@ impl AudioEngine {
 
         info!("Input config: {:?}", actual_config);
 
+        // How many capture frames collapse into one ring-buffer sample.
+        // 48 kHz capture → factor 3 → 16 kHz buffer. 16 kHz capture →
+        // factor 1 (passthrough). Below 16 kHz capture is degenerate
+        // (would force factor 0); the config preference list keeps that
+        // from happening, but defend against it explicitly.
+        let decimation_factor: usize = if sample_rate >= WHISPER_RATE_HZ {
+            (sample_rate / WHISPER_RATE_HZ) as usize
+        } else {
+            1
+        };
+        info!(
+            "Audio thread: capture {} Hz, downsampling to {} Hz (decimation factor {})",
+            sample_rate, WHISPER_RATE_HZ, decimation_factor
+        );
+
         let err_fn = |err| error!("an error occurred on stream: {}", err);
 
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &actual_config,
-                move |data: &[f32], _: &_| {
-                    // Downmix: si hay más de 1 canal, promediamos o solo tomamos el primero
-                    for frame in data.chunks(channels as usize) {
-                        let sum: f32 = frame.iter().sum();
-                        let mono = sum / channels as f32;
-                        let _ = producer.push(mono);
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &actual_config,
-                move |data: &[i16], _: &_| {
-                    for frame in data.chunks(channels as usize) {
-                        let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
-                        let mono = sum / channels as f32;
-                        let _ = producer.push(mono);
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &actual_config,
-                move |data: &[u16], _: &_| {
-                    for frame in data.chunks(channels as usize) {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
-                            .sum();
-                        let mono = sum / channels as f32;
-                        let _ = producer.push(mono);
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::U8 => device.build_input_stream(
-                &actual_config,
-                move |data: &[u8], _: &_| {
-                    for frame in data.chunks(channels as usize) {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| (s as f32 - u8::MAX as f32 / 2.0) / (u8::MAX as f32 / 2.0))
-                            .sum();
-                        let mono = sum / channels as f32;
-                        let _ = producer.push(mono);
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::I32 => device.build_input_stream(
-                &actual_config,
-                move |data: &[i32], _: &_| {
-                    // Fifine is s24le surfaced as I32 by cpal's ALSA
-                    // backend (24-bit audio stored in 32-bit
-                    // containers). Normalise against 2^31 to stay
-                    // inside f32's [-1.0, 1.0] range.
-                    for frame in data.chunks(channels as usize) {
-                        let sum: f32 = frame.iter().map(|&s| s as f32 / i32::MAX as f32).sum();
-                        let mono = sum / channels as f32;
-                        let _ = producer.push(mono);
-                    }
-                },
-                err_fn,
-                None,
-            )?,
+            cpal::SampleFormat::F32 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &actual_config,
+                    move |data: &[f32], _: &_| {
+                        // Downmix: si hay más de 1 canal, promediamos.
+                        for frame in data.chunks(channels as usize) {
+                            let sum: f32 = frame.iter().sum();
+                            let mono = sum / channels as f32;
+                            push_mono_decimated(
+                                mono,
+                                &mut producer,
+                                &mut scratch,
+                                decimation_factor,
+                            );
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::I16 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &actual_config,
+                    move |data: &[i16], _: &_| {
+                        for frame in data.chunks(channels as usize) {
+                            let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
+                            let mono = sum / channels as f32;
+                            push_mono_decimated(
+                                mono,
+                                &mut producer,
+                                &mut scratch,
+                                decimation_factor,
+                            );
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::U16 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &actual_config,
+                    move |data: &[u16], _: &_| {
+                        for frame in data.chunks(channels as usize) {
+                            let sum: f32 = frame
+                                .iter()
+                                .map(|&s| {
+                                    (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)
+                                })
+                                .sum();
+                            let mono = sum / channels as f32;
+                            push_mono_decimated(
+                                mono,
+                                &mut producer,
+                                &mut scratch,
+                                decimation_factor,
+                            );
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::U8 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &actual_config,
+                    move |data: &[u8], _: &_| {
+                        for frame in data.chunks(channels as usize) {
+                            let sum: f32 = frame
+                                .iter()
+                                .map(|&s| {
+                                    (s as f32 - u8::MAX as f32 / 2.0) / (u8::MAX as f32 / 2.0)
+                                })
+                                .sum();
+                            let mono = sum / channels as f32;
+                            push_mono_decimated(
+                                mono,
+                                &mut producer,
+                                &mut scratch,
+                                decimation_factor,
+                            );
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            cpal::SampleFormat::I32 => {
+                let mut scratch: Vec<f32> = Vec::new();
+                device.build_input_stream(
+                    &actual_config,
+                    move |data: &[i32], _: &_| {
+                        // Fifine is s24le surfaced as I32 by cpal's ALSA
+                        // backend (24-bit audio stored in 32-bit
+                        // containers). Normalise against 2^31 to stay
+                        // inside f32's [-1.0, 1.0] range.
+                        for frame in data.chunks(channels as usize) {
+                            let sum: f32 = frame.iter().map(|&s| s as f32 / i32::MAX as f32).sum();
+                            let mono = sum / channels as f32;
+                            push_mono_decimated(
+                                mono,
+                                &mut producer,
+                                &mut scratch,
+                                decimation_factor,
+                            );
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
             _ => return Err(anyhow!("Unsupported sample format")),
         };
 
