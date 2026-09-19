@@ -94,3 +94,66 @@ jobs:
     # Skipping full build for now as CUDA setup in GH Actions is complex/slow
     # - name: Build
     #   run: cargo build --verbose
+
+  # Validates the Containerfile end-to-end. The Rust-native `build` job
+  # above catches src/Cargo.toml regressions; this one catches
+  # Containerfile-specific regressions (chef recipe, gcc-14 install,
+  # runtime image copy, ENTRYPOINT). It runs only on pull_request
+  # because the squash-merge already validated the build when the PR
+  # was open. Cached via GitHub Actions cache (`type=gha`) so repeat
+  # PRs are ~5 min instead of ~25 min cold. Does NOT run on `push`
+  # to `main` (the squash-merge of the PR already validated this).
+  containerfile-build:
+    name: Containerfile · build + smoke
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Containerfile (cached)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Containerfile
+        tags: telora-daemon:ci-${{ github.event.pull_request.number }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        load: true
+
+    - name: Extract binaries from runtime image
+      # Mirrors `scripts/build`: cat each binary out of the runtime
+      # stage's /usr/bin. CLI binaries (telora, telora-models) are
+      # pure Rust with no special dynamic deps, so they run on the
+      # GH runner. telora-gui needs libgtk4-layer-shell from the
+      # runtime image and is smoke-tested inside a fresh container
+      # below; telora-daemon needs libcuda.so.1 which the runner
+      # does not have, so we skip its smoke test entirely.
+      run: |
+        mkdir -p bin
+        for b in telora telora-models; do
+          docker run --rm --entrypoint /bin/sh \
+            "telora-daemon:ci-${{ github.event.pull_request.number }}" \
+            -c "cat /usr/bin/$b" > "bin/$b"
+        done
+        chmod +x bin/telora bin/telora-models
+        ls -la bin/
+
+    - name: Smoke test (CLI binaries on host runner)
+      run: |
+        ./bin/telora --version
+        ./bin/telora-models --version
+
+    - name: Smoke test (telora-gui inside runtime image)
+      # telora-gui links against libgtk4-layer-shell.so.0 which lives
+      # inside the runtime image, so the smoke test must run there
+      # too. --help exits before any Wayland init, so this works
+      # even on a headless GH runner.
+      run: |
+        docker run --rm --entrypoint /usr/bin/telora-gui \
+          "telora-daemon:ci-${{ github.event.pull_request.number }}" \
+          --help | head -5
