@@ -430,9 +430,7 @@ fn map_bind_error(err: std::io::Error, path: &Path, instance_name: &str) -> anyh
         ErrorKind::InvalidInput => anyhow::anyhow!(
             "socket path '{basename}' is invalid or exceeds the Unix socket path limit"
         ),
-        _ => {
-            anyhow::Error::from(err).context(format!("Failed to bind unix socket at {basename}"))
-        }
+        _ => anyhow::Error::from(err).context(format!("Failed to bind unix socket at {basename}")),
     }
 }
 
