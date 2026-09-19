@@ -114,6 +114,17 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 ARG CMAKE_CUDA_ARCHITECTURES=61
+# candle-kernels (pulled in transitively via cuda-qwen3asr) calls
+# `nvidia-smi` to auto-detect the GPU compute capability and panics
+# if it isn't found. The local `.cargo/config.toml` propagates
+# `CUDA_COMPUTE_CAP` from cargo's `[env]`, but it is gitignored
+# and not present in CI or in fresh clones, so we hardcode the
+# arch here: sm_80 (Ampere) is the lowest arch candle's WMMA BF16
+# kernels compile against and is supported by the CUDA 12.9
+# toolkit the builder stage ships. The binary is not executed
+# during CI; only the compile path matters. Mirrors the same fix
+# in `.github/workflows/release.yml:281`.
+ENV CUDA_COMPUTE_CAP=80
 
 WORKDIR /app
 
