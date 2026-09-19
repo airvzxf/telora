@@ -6,6 +6,9 @@ pkg/
 # Models (large files) - Copied only if needed in Containerfile
 models/
 
+# Secrets — never bake into a container image
+.env
+
 # Git
 .git/
 .gitignore
