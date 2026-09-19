@@ -50,11 +50,11 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async {
         match send_control_command(cmd_str).await {
             Ok(()) => {
-                info!("Command '{}' sent successfully.", cmd_str);
+                info!("Command '{cmd_str}' sent successfully.");
                 Ok(())
             }
             Err(e) => {
-                log::error!("Failed to send command: {}", e);
+                log::error!("Failed to send command: {e}");
                 Err(e)
             }
         }

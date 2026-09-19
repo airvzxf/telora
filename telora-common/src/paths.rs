@@ -74,7 +74,7 @@ pub fn daemon_socket_path() -> PathBuf {
     match resolve(&PathsConfig::default()) {
         Ok(r) => r.daemon_sock,
         Err(e) => {
-            log::error!("daemon_socket_path resolver failed: {}", e);
+            log::error!("daemon_socket_path resolver failed: {e}");
             last_resort_daemon_sock()
         }
     }
@@ -87,7 +87,7 @@ pub fn control_socket_path() -> PathBuf {
     match resolve(&PathsConfig::default()) {
         Ok(r) => r.control_sock,
         Err(e) => {
-            log::error!("control_socket_path resolver failed: {}", e);
+            log::error!("control_socket_path resolver failed: {e}");
             last_resort_control_sock()
         }
     }
