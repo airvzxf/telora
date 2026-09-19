@@ -273,8 +273,7 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
             "non-socket entry"
         };
         return Err(anyhow::anyhow!(
-            "refusing to remove {kind} at '{basename}'; remove it manually before starting {instance}",
-            instance = instance_name,
+            "refusing to remove {kind} at '{basename}'; remove it manually before starting {instance_name}",
         ));
     }
 
@@ -282,9 +281,8 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
     if meta.uid() != current_uid {
         return Err(anyhow::anyhow!(
             "stale socket '{basename}' in the user-runtime telora directory is not owned by the current user; \
-             another {instance} instance appears to be running (or its previous run did not clean up). \
+             another {instance_name} instance appears to be running (or its previous run did not clean up). \
              Use `ls -la <full-path>` to find the owner and `sudo rm <full-path>` to remove it.",
-            instance = instance_name,
         ));
     }
 
@@ -423,9 +421,8 @@ fn map_bind_error(err: std::io::Error, path: &Path, instance_name: &str) -> anyh
         .unwrap_or("<unknown>");
     match err.kind() {
         ErrorKind::AddrInUse => anyhow::anyhow!(
-            "another {instance} instance already holds '{basename}' in the user-runtime telora directory; \
-             check whether a previous {instance} process is still running before retrying",
-            instance = instance_name,
+            "another {instance_name} instance already holds '{basename}' in the user-runtime telora directory; \
+             check whether a previous {instance_name} process is still running before retrying",
         ),
         ErrorKind::PermissionDenied => anyhow::anyhow!(
             "permission denied binding socket at '{basename}' — check parent ownership, directory mode, and any MAC policy"
@@ -433,9 +430,7 @@ fn map_bind_error(err: std::io::Error, path: &Path, instance_name: &str) -> anyh
         ErrorKind::InvalidInput => anyhow::anyhow!(
             "socket path '{basename}' is invalid or exceeds the Unix socket path limit"
         ),
-        _ => {
-            anyhow::Error::from(err).context(format!("Failed to bind unix socket at {}", basename))
-        }
+        _ => anyhow::Error::from(err).context(format!("Failed to bind unix socket at {basename}")),
     }
 }
 
