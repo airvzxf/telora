@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 target/
+**/target/
 pkg/
 
 # Models (large files) - Copied only if needed in Containerfile
@@ -13,7 +14,9 @@ models/
 .git/
 .gitignore
 .dockerignore
-.worktree
+.worktree*
+.worktrees/
+.worktrees/**/target/
 
 # Documentation & Packaging
 README.md
@@ -21,7 +24,6 @@ CONTRIBUTING.md
 LICENSE
 Makefile
 systemd/
-pkg/
 
 # IDE
 .vscode/
@@ -30,6 +32,12 @@ pkg/
 
 # OS
 .DS_Store
+**/.DS_Store
 
 # Logs
 *.log
+
+# Temp / scratch
+.out/
+tmp/
+**/*.tmp
