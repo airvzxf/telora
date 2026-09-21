@@ -13,6 +13,7 @@ models/
 .git/
 .gitignore
 .dockerignore
+.worktree
 
 # Documentation & Packaging
 README.md
