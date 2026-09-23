@@ -1,7 +1,33 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+#
+# scripts/build — produce ./bin/{telora-daemon,telora-gui,telora,telora-models}
+# by building the Containerfile in Podman (or Docker) and extracting the
+# four binaries from the resulting image.
+#
+# CUDA toolkit version selection is a four-tier cascade resolved at
+# start-up so the operator (and CI) never has to remember which nvidia/cuda
+# image tag to point at:
+#
+#   1. Explicit `$CUDA_VERSION` env var or `--cuda-version=…` CLI flag.
+#      Wins unconditionally; this is the path CI and the release matrix
+#      use (`CUDA_VERSION=13.4.1 ./scripts/build`).
+#   2. Host auto-detection: read `nvcc --version` first, fall back to
+#      `/opt/cuda/version.json`. Both report the *toolkit* major; the
+#      nvidia driver version (from `nvidia-smi`) is intentionally
+#      ignored because it does not identify the toolkit that compiled
+#      the .so files.
+#   3. Project default (`12.9.1`), matching the previous hardcoded
+#      value in `Containerfile` so existing `podman build .` callers
+#      get byte-identical artefacts.
+#
+# Set `TELORA_CUDA_AUTO_DETECT=0` to skip tier 2 and force tier 3 even
+# when a toolkit is installed locally; useful for reproducible local
+# builds against the project's pinned version.
+#
+# Every resolved build prints one line of provenance so the operator
+# can audit what the next 30-minute compile is targeting.
+set -euo pipefail
 
-# Configuration
 IMAGE_NAME="telora-daemon:latest"
 CONTAINER_ENGINE=$(command -v podman || command -v docker)
 
@@ -12,18 +38,100 @@ fi
 
 echo "--> Using $CONTAINER_ENGINE to build Telora"
 
-# Build the container
-$CONTAINER_ENGINE build -t "$IMAGE_NAME" .
+# ── 1. Resolve CUDA toolkit version (override > auto > default) ────
+# Parse a CLI `--cuda-version=X.Y.Z` if present so `./scripts/build
+# --cuda-version=13.4.1` works without needing `CUDA_VERSION=` in
+# the environment. Keep the rest of the script env-driven; the flag
+# is just a convenience wrapper.
+case "${1:-}" in
+    --cuda-version=*)
+        CUDA_VERSION="${1#--cuda-version=}"
+        shift
+        ;;
+esac
 
-# Create bin directory if it doesn't exist
+CUDA_VERSION_RESOLVED=""
+CUDA_SOURCE=""
+
+# Tier 1: explicit override
+if [ -n "${CUDA_VERSION:-}" ]; then
+    CUDA_VERSION_RESOLVED="${CUDA_VERSION}"
+    CUDA_SOURCE="explicit override (CUDA_VERSION=${CUDA_VERSION})"
+fi
+
+# Tier 2: host auto-detection (skip when TELORA_CUDA_AUTO_DETECT=0)
+if [ -z "${CUDA_VERSION_RESOLVED:-}" ] && [ "${TELORA_CUDA_AUTO_DETECT:-1}" != "0" ]; then
+    if command -v nvcc >/dev/null 2>&1; then
+        # Prefer `/opt/cuda/include/cuda.h`'s CUDA_VERSION macro: it is
+        # the canonical toolkit version (5-digit `MMmmpp` number, e.g.
+        # 13040 → 13.4.0, 12090 → 12.9.0, 11080 → 11.8.0) and decouples
+        # us from the compiler version that `nvcc --version` reports
+        # separately (`V13.4.59` ≠ toolkit 13.4.x patch).
+        if [ -r /opt/cuda/include/cuda.h ]; then
+            raw="$(awk '/^#[[:space:]]*define[[:space:]]+CUDA_VERSION[[:space:]]+/{gsub(/[^0-9]/,""); print; exit}' \
+                /opt/cuda/include/cuda.h 2>/dev/null || true)"
+            if [ -n "${raw:-}" ] && [ "${#raw}" -ge 4 ] && [ "${#raw}" -le 6 ]; then
+                # `MMmmpp` (5-digit) or `MMmmppXX` (6/7-digit) layout —
+                # always take MM as major, the next 2 digits as minor,
+                # and the trailing 1-2 digits as patch. Force decimal
+                # with `10#` because bash otherwise reads a leading-zero
+                # literal (`04`) as octal and silently drops it.
+                major="$((10#${raw:0:2}))"
+                minor="$((10#${raw:2:2}))"
+                patch="$((10#${raw:4}))"
+                detected="${major}.${minor}.${patch}"
+            fi
+        fi
+        # Fallback to `nvcc --version` when cuda.h is missing (driver-only
+        # host) or unparseable. We take the toolkit release (`13.4`) and
+        # default the patch to 0 — patch-aware consumers should set
+        # `CUDA_VERSION=` explicitly instead of relying on auto-detection.
+        if [ -z "${detected:-}" ]; then
+            detected="$(nvcc --version 2>/dev/null \
+                | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1.0/p' \
+                | head -n1)"
+        fi
+        if [ -n "${detected:-}" ]; then
+            CUDA_VERSION_RESOLVED="${detected}"
+            CUDA_SOURCE="host toolkit (cuda.h CUDA_VERSION macro)"
+        fi
+    fi
+    if [ -z "${CUDA_VERSION_RESOLVED:-}" ] && [ -r /opt/cuda/version.json ]; then
+        detected="$(python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["cuda"]["version"])
+except Exception:
+    sys.exit(1)
+' </opt/cuda/version.json 2>/dev/null || true)"
+        if [ -n "${detected:-}" ]; then
+            CUDA_VERSION_RESOLVED="${detected}"
+            CUDA_SOURCE="host /opt/cuda/version.json"
+        fi
+    fi
+fi
+
+# Tier 3: project default (matches the previous hardcoded Containerfile value)
+if [ -z "${CUDA_VERSION_RESOLVED:-}" ]; then
+    CUDA_VERSION_RESOLVED="12.9.1"
+    CUDA_SOURCE="project default (no host toolkit detected)"
+fi
+
+echo "--> Using CUDA ${CUDA_VERSION_RESOLVED} (source: ${CUDA_SOURCE})"
+
+# ── 2. Build the container ────────────────────────────────────────
+$CONTAINER_ENGINE build \
+    --build-arg "CUDA_VERSION=${CUDA_VERSION_RESOLVED}" \
+    -t "${IMAGE_NAME}" .
+
+# ── 3. Extract binaries ───────────────────────────────────────────
 mkdir -p bin
 
-# Extract the binaries
 echo "--> Extracting binaries to ./bin/"
-$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-daemon" > bin/telora-daemon
-$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-gui" > bin/telora-gui
-$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora" > bin/telora
-$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-models" > bin/telora-models
+$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-daemon"  > bin/telora-daemon
+$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-gui"     > bin/telora-gui
+$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora"          > bin/telora
+$CONTAINER_ENGINE run --rm --entrypoint /bin/sh "$IMAGE_NAME" -c "cat /usr/bin/telora-models"  > bin/telora-models
 
 chmod +x bin/telora-daemon bin/telora-gui bin/telora bin/telora-models
 

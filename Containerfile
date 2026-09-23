@@ -25,8 +25,21 @@
 #   runtime  → minimal nvidia/cuda runtime image with the four binaries
 #               and the gtk4-layer-shell shared library.
 
+# Pin the CUDA toolkit version the build + runtime images use.
+# `CUDA_VERSION` follows the `X.Y.Z` triplet the upstream nvidia/cuda
+# images are tagged with; `CUDA_FLAVOR` selects between `cudnn`
+# (default — ships libcudnn) and the plain `runtime`/`devel` flavor
+# if a future build needs the slimmer image. Defaults preserve the
+# previous hardcoded behaviour (12.9.1 + cudnn) so existing
+# `podman build .` invocations and CI runners that don't pass the
+# arg keep producing the same image byte-for-byte. CI overrides
+# via `--build-arg CUDA_VERSION=13.4.1` in the release matrix
+# (`.github/workflows/release.yml`).
+ARG CUDA_VERSION=12.9.1
+ARG CUDA_FLAVOR=cudnn
+
 # ─── Stage 0: chef ─────────────────────────────────────────────────
-FROM docker.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS chef
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-${CUDA_FLAVOR}-devel-ubuntu24.04 AS chef
 
 ARG RUST_VERSION=stable
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -157,7 +170,13 @@ RUN cargo clippy --release --workspace --locked -- -D warnings \
  && cargo build --release --workspace --locked
 
 # ─── Stage 3: runtime ─────────────────────────────────────────────
-FROM docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
+# Re-declare CUDA_VERSION/CUDA_FLAVOR: ARG scope is per-stage, so a
+# build-arg forwarded to the chef stage does not reach this FROM.
+# Re-declaring with the same default keeps the runtime image on the
+# same CUDA major as the binaries that were linked in the builder.
+ARG CUDA_VERSION=12.9.1
+ARG CUDA_FLAVOR=cudnn
+FROM docker.io/nvidia/cuda:${CUDA_VERSION}-${CUDA_FLAVOR}-runtime-ubuntu24.04
 
 WORKDIR /app
 
