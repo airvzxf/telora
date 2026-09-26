@@ -4,16 +4,18 @@
 # by building the Containerfile in Podman (or Docker) and extracting the
 # four binaries from the resulting image.
 #
-# CUDA toolkit version selection is a five-tier cascade resolved at
+# CUDA toolkit version selection is a six-tier cascade resolved at
 # start-up so the operator (and CI) never has to remember which nvidia/cuda
 # image tag to point at:
 #
 #   1. Explicit `$CUDA_VERSION` env var or `--cuda-version=…` CLI flag.
 #      Wins unconditionally; this is the path CI and the release matrix
 #      use (`CUDA_VERSION=13.4.1 ./scripts/build`). Explicit values are
-#      NEVER auto-upgraded — if you ask for `13.4.0` and that tag is
-#      not published, you get the registry's "manifest unknown" error
-#      straight from `podman build` and can debug from there.
+#      NEVER auto-upgraded or auto-downgraded — if you ask for `13.4.0`
+#      and that tag is not published, you get the registry's "manifest
+#      unknown" error straight from `podman build`; if cudarc can't
+#      compile it, you get cudarc's panic straight from `cargo chef
+#      cook`. Either way, an explicit choice is honoured.
 #   2. Host auto-detection from `/opt/cuda/include/cuda.h`'s
 #      `CUDA_VERSION` macro (canonical 5-digit `MMmmpp` toolkit
 #      version, e.g. `13040` → `13.4.0`). Falls back to
@@ -29,11 +31,26 @@
 #      version so the operator can audit it. Cross-minor / cross-major
 #      bumps are NOT done automatically — those are a different ABI
 #      class and the operator must set `CUDA_VERSION=` explicitly.
-#   5. Project default (`12.9.1`), matching the previous hardcoded
+#   5. **Toolchain compatibility.** When auto-detection finds a
+#      toolkit major newer than what `cudarc` (transitively pulled
+#      in by voxora-bridge via candle-core's `cuda-qwen3asr` feature)
+#      knows how to compile, downgrade to the highest published patch
+#      within the most-restrictive major cudarc supports. cudarc's
+#      `build.rs` panics with `Unsupported cuda toolkit version` when
+#      fed a major it doesn't recognize, so this tier prevents the
+#      ten-minute-in panic during `cargo chef cook`. Tier 5 reads
+#      `Cargo.lock` for the resolved cudarc versions, applies a
+#      hardcoded `cudarc <minor> → max supported CUDA major` matrix,
+#      picks the *minimum* across all cudarc entries (the most
+#      restrictive), and downgrades to the highest published patch
+#      within that major. Cross-major auto-upgrade is explicitly NOT
+#      attempted (a newer major would need a newer cudarc, which
+#      means bumping voxora-bridge — out of scope here).
+#   6. Project default (`12.9.1`), matching the previous hardcoded
 #      value in `Containerfile` so existing `podman build .` callers
 #      get byte-identical artefacts.
 #
-# Set `TELORA_CUDA_AUTO_DETECT=0` to skip tiers 2-4 and force tier 5
+# Set `TELORA_CUDA_AUTO_DETECT=0` to skip tiers 2-5 and force tier 6
 # even when a toolkit is installed locally; useful for reproducible
 # local builds against the project's pinned version.
 #
@@ -66,6 +83,29 @@ for t in data.get("results", []):
         patches.append(int(m.group(1)))
 if patches:
     print(",".join(str(p) for p in sorted(set(patches))))
+'
+
+# Python helper for `resolve_to_cudarc_compatible` (see function below).
+# Same module-level-var rationale as `_RESOLVE_PATCHES_PY`. Invoked as
+# `python3 -c "$_HIGHEST_FOR_MAJOR_PY" <cache_file> <major>`; prints the
+# highest published `major.minor.patch` triplet for that major (or empty
+# string if no tags exist). Used by the cudarc fallback path to land on
+# a real, published image tag instead of an invented `MAJOR.0.0`.
+_HIGHEST_FOR_MAJOR_PY='
+import json, re, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+target_major = int(sys.argv[2])
+best = None
+for t in data.get("results", []):
+    name = t["name"]
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)-cudnn-devel-ubuntu24\.04$", name)
+    if m and int(m.group(1)) == target_major:
+        v = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if best is None or v > best:
+            best = v
+if best:
+    print(f"{best[0]}.{best[1]}.{best[2]}")
 '
 
 IMAGE_NAME="telora-daemon:latest"
@@ -222,6 +262,162 @@ resolve_to_published_patch() {
     esac
 }
 
+# ── 0c. cudarc compat resolver + helper ──────────────────────────────
+# Auto-detection picks the host's actual toolkit version, but the
+# Rust crate `cudarc` (transitively pulled in by voxora-bridge via
+# candle-core's `cuda-qwen3asr` feature) refuses to compile against
+# CUDA toolkits it doesn't know about — its `build.rs` panics with
+# `Unsupported cuda toolkit version: '<ver>'. Please raise a github
+# issue.` when the major is newer than its hardcoded ceiling. As of
+# cudarc 0.19.x (the version voxora-bridge 0.6 pins), that ceiling
+# is CUDA 12; cudarc ≥ 0.20 would add CUDA 13 when upstream lands
+# it. When the host has CUDA 13 installed (e.g. via the Arch `cuda`
+# package, which currently tracks the latest), auto-detection lands
+# on a major cudarc can't compile, and the operator hits the panic
+# ~10 minutes into `cargo chef cook`.
+#
+# This pair of helpers prevents that failure by, on auto-detection
+# only, looking at every `cudarc` version in `Cargo.lock`, picking
+# the *minimum* of their CUDA-major ceilings, and downgrading the
+# resolved CUDA version to the highest published patch within that
+# most-restrictive major. Explicit `$CUDA_VERSION=` overrides
+# bypass this resolver — asking for `13.4.1` explicitly means you
+# want `13.4.1`, even if cudarc can't compile it.
+#
+# When candle upstream bumps cudarc to a version that supports CUDA
+# 13, update `_CUDARC_MAX_CUDA_MAJOR_BY_MINOR` below to reflect the
+# new ceiling for that minor. The same `cargo update cudarc` that
+# flips telora to a new cudarc line is the natural place to make
+# that edit (the new version lands in `Cargo.lock`, the function
+# reads it, the matrix is checked).
+
+# Matrix: cudarc <minor>.x → max CUDA major supported. Conservative
+# defaults for unknown versions (assume 12 — the last release cudarc
+# 0.19.x knows about). When cudarc 0.20 lands, add an entry here.
+#
+# Sources (verified at the time of writing):
+#   cudarc 0.17.x → CUDA 11 + 12 (released 2024-08, post-CUDA-12.4)
+#   cudarc 0.18.x → CUDA 11 + 12
+#   cudarc 0.19.x → CUDA 11 + 12 (no CUDA 13 yet — panic observed
+#     on CUDA 13.4 in `cudarc-0.19.9/build.rs:182`, see the issue
+#     reference at the top of `resolve_to_cudarc_compatible`).
+#   cudarc 0.20.x (TBD) → expected to add CUDA 13
+_CUDARC_MAX_CUDA_MAJOR_BY_MINOR='
+0.17 12
+0.18 12
+0.19 12
+'
+_CUDARC_DEFAULT_MAX_MAJOR=12
+
+# Print the maximum CUDA major supported by cudarc versions present in
+# `Cargo.lock`. Reads the lockfile (not `Cargo.toml`) so the result
+# reflects the *resolved* version after Cargo's resolution pass.
+get_max_cudarc_major() {
+    local max="${_CUDARC_DEFAULT_MAX_MAJOR}"
+    local cudarc_minors
+    cudarc_minors="$(awk '
+        /^name = "cudarc"$/ { in_pkg = 1; next }
+        in_pkg && /^version = / {
+            # Extract "X.Y" from "X.Y.Z"
+            match($0, /[0-9]+\.[0-9]+/)
+            print substr($0, RSTART, RLENGTH)
+            in_pkg = 0
+            next
+        }
+        in_pkg && /^$/ { in_pkg = 0 }
+    ' Cargo.lock 2>/dev/null | sort -u)"
+
+    if [ -z "${cudarc_minors}" ]; then
+        echo "${_CUDARC_DEFAULT_MAX_MAJOR}"
+        return 0
+    fi
+
+    local detected_max="${_CUDARC_DEFAULT_MAX_MAJOR}"
+    for v in ${cudarc_minors}; do
+        local v_max
+        # Look up in the matrix; fall back to default for unknown minors.
+        v_max="$(echo "${_CUDARC_MAX_CUDA_MAJOR_BY_MINOR}" \
+            | awk -v v="${v}" '$1 == v { print $2; exit }')"
+        if [ -z "${v_max}" ]; then
+            v_max="${_CUDARC_DEFAULT_MAX_MAJOR}"
+        fi
+        if [ "${v_max}" -lt "${detected_max}" ]; then
+            detected_max="${v_max}"
+        fi
+    done
+    echo "${detected_max}"
+}
+
+# Map an auto-detected X.Y.Z triplet to a CUDA version the cudarc
+# versions in `Cargo.lock` can compile. Returns the input unchanged
+# when cudarc supports the requested major; otherwise falls back to
+# the highest published patch for the highest major cudarc supports,
+# and tells the operator on stderr so the audit log is complete.
+resolve_to_cudarc_compatible() {
+    local requested="$1"
+    if ! [[ "$requested" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        echo "$requested"
+        return 0
+    fi
+    local requested_major="${BASH_REMATCH[1]}"
+
+    local max_major
+    max_major="$(get_max_cudarc_major)"
+
+    if [ "${requested_major}" -le "${max_major}" ]; then
+        echo "$requested"
+        return 0
+    fi
+
+    # Requested exceeds what cudarc supports. Downgrade within cudarc's
+    # supported major range. Find the highest published patch for
+    # `max_major.*` via `_HIGHEST_FOR_MAJOR_PY` (always a fresh
+    # Docker Hub query — this path runs at most once per build, so a
+    # short-lived per-build cache wouldn't help; the per-major cache
+    # written by `resolve_to_published_patch` only covers per-minor
+    # queries and doesn't fit the "any-minor-for-this-major" lookup
+    # this fallback needs).
+    echo "WARN: cudarc in Cargo.lock does not support CUDA ${requested_major}.x (max supported: ${max_major}.x); falling back to the highest published ${max_major}.x" >&2
+
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/telora"
+    local major_cache="${cache_dir}/nvidia-cuda-tags-${max_major}-cudnn-anyminor.json"
+    if ! mkdir -p "$cache_dir" 2>/dev/null; then
+        echo "WARN: cannot create cache dir '$cache_dir'; falling back to project default 12.9.1" >&2
+        echo "12.9.1"
+        return 0
+    fi
+    if ! curl -fsS \
+            "https://hub.docker.com/v2/repositories/nvidia/cuda/tags/?page_size=100&name=${max_major}." \
+            > "${major_cache}.tmp" 2>/dev/null; then
+        rm -f "${major_cache}.tmp"
+        echo "WARN: Docker Hub query for ${max_major}.* failed; falling back to project default 12.9.1" >&2
+        echo "12.9.1"
+        return 0
+    fi
+    # Validate JSON shape before swapping in (a non-JSON error page
+    # from a rate-limited Docker Hub would otherwise poison the cache).
+    if ! python3 -c 'import json,sys; json.load(sys.stdin)' \
+            < "${major_cache}.tmp" 2>/dev/null; then
+        rm -f "${major_cache}.tmp"
+        echo "WARN: Docker Hub response for ${max_major}.* was not valid JSON; falling back to project default 12.9.1" >&2
+        echo "12.9.1"
+        return 0
+    fi
+    mv "${major_cache}.tmp" "$major_cache"
+
+    local fallback_patch
+    fallback_patch="$(python3 -c "$_HIGHEST_FOR_MAJOR_PY" "$major_cache" "$max_major")"
+    if [ -z "${fallback_patch}" ]; then
+        # No published tags for that major at all — fall back to the
+        # project default so the operator at least gets a known-good
+        # image tag (and can still override explicitly).
+        echo "WARN: no published ${max_major}.X.Y tags in the registry; falling back to project default 12.9.1" >&2
+        echo "12.9.1"
+    else
+        echo "$fallback_patch"
+    fi
+}
+
 # ── 1. Resolve CUDA toolkit version (override > auto > registry > default) ───
 # Parse a CLI `--cuda-version=X.Y.Z` if present so `./scripts/build
 # --cuda-version=13.4.1` works without needing `CUDA_VERSION=` in
@@ -304,6 +500,19 @@ except Exception:
         if [ "$registry_patch" != "${CUDA_VERSION_RESOLVED}" ]; then
             CUDA_VERSION_RESOLVED="${registry_patch}"
             CUDA_SOURCE="${CUDA_SOURCE}, auto-upgraded to published patch"
+        fi
+    fi
+
+    # Tier 2.6: toolchain compatibility. Auto-detected versions whose
+    # major exceeds what the cudarc versions in `Cargo.lock` can
+    # compile are downgraded to the highest published patch within
+    # the highest major cudarc supports. Explicit overrides bypass
+    # this tier — see the function header for the rationale.
+    if [ -n "${CUDA_VERSION_RESOLVED:-}" ]; then
+        cudarc_compat="$(resolve_to_cudarc_compatible "${CUDA_VERSION_RESOLVED}")"
+        if [ "$cudarc_compat" != "${CUDA_VERSION_RESOLVED}" ]; then
+            CUDA_VERSION_RESOLVED="${cudarc_compat}"
+            CUDA_SOURCE="${CUDA_SOURCE}, downgraded to cudarc-compatible"
         fi
     fi
 fi
