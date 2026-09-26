@@ -4,29 +4,69 @@
 # by building the Containerfile in Podman (or Docker) and extracting the
 # four binaries from the resulting image.
 #
-# CUDA toolkit version selection is a four-tier cascade resolved at
+# CUDA toolkit version selection is a five-tier cascade resolved at
 # start-up so the operator (and CI) never has to remember which nvidia/cuda
 # image tag to point at:
 #
 #   1. Explicit `$CUDA_VERSION` env var or `--cuda-version=…` CLI flag.
 #      Wins unconditionally; this is the path CI and the release matrix
-#      use (`CUDA_VERSION=13.4.1 ./scripts/build`).
-#   2. Host auto-detection: read `nvcc --version` first, fall back to
-#      `/opt/cuda/version.json`. Both report the *toolkit* major; the
-#      nvidia driver version (from `nvidia-smi`) is intentionally
-#      ignored because it does not identify the toolkit that compiled
-#      the .so files.
-#   3. Project default (`12.9.1`), matching the previous hardcoded
+#      use (`CUDA_VERSION=13.4.1 ./scripts/build`). Explicit values are
+#      NEVER auto-upgraded — if you ask for `13.4.0` and that tag is
+#      not published, you get the registry's "manifest unknown" error
+#      straight from `podman build` and can debug from there.
+#   2. Host auto-detection from `/opt/cuda/include/cuda.h`'s
+#      `CUDA_VERSION` macro (canonical 5-digit `MMmmpp` toolkit
+#      version, e.g. `13040` → `13.4.0`). Falls back to
+#      `nvcc --version` when cuda.h is missing (driver-only host).
+#   3. `/opt/cuda/version.json` if the previous two steps did not
+#      resolve a version (the Arch Linux `cuda` package installs the
+#      toolkit but not the dev headers, so cuda.h is absent there).
+#   4. **Registry resolution.** When auto-detection finds a toolkit
+#      version whose patch tag is not published on Docker Hub
+#      (e.g. installed `13.4.0`, only `13.4.1` is published), upgrade
+#      within the same `major.minor` to the highest published patch.
+#      The upgrade is logged on stderr with the original and target
+#      version so the operator can audit it. Cross-minor / cross-major
+#      bumps are NOT done automatically — those are a different ABI
+#      class and the operator must set `CUDA_VERSION=` explicitly.
+#   5. Project default (`12.9.1`), matching the previous hardcoded
 #      value in `Containerfile` so existing `podman build .` callers
 #      get byte-identical artefacts.
 #
-# Set `TELORA_CUDA_AUTO_DETECT=0` to skip tier 2 and force tier 3 even
-# when a toolkit is installed locally; useful for reproducible local
-# builds against the project's pinned version.
+# Set `TELORA_CUDA_AUTO_DETECT=0` to skip tiers 2-4 and force tier 5
+# even when a toolkit is installed locally; useful for reproducible
+# local builds against the project's pinned version.
 #
 # Every resolved build prints one line of provenance so the operator
 # can audit what the next 30-minute compile is targeting.
 set -euo pipefail
+
+# Python helper for `resolve_to_published_patch` (see function below).
+# Stored at module scope (no heredoc-inside-$(…) nesting — bash emits
+# a spurious "unterminated here-document" warning when a heredoc body
+# is the source of a `$(…)` substitution, even when the heredoc IS
+# correctly closed). Invoked as `python3 -c "$_RESOLVE_PATCHES_PY" …`;
+# arguments: $1 = cache file path, $2 = flavor, $3 = major, $4 = minor.
+# Prints a comma-separated list of published patches for that
+# `major.minor` (empty string if none).
+_RESOLVE_PATCHES_PY='
+import json, re, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+flavor, major, minor = sys.argv[2], sys.argv[3], sys.argv[4]
+patches = []
+for t in data.get("results", []):
+    name = t["name"]
+    m = re.match(
+        r"^" + re.escape(major) + r"\." + re.escape(minor) + r"\.(\d+)-"
+        + re.escape(flavor) + r"-devel-ubuntu24\.04$",
+        name,
+    )
+    if m:
+        patches.append(int(m.group(1)))
+if patches:
+    print(",".join(str(p) for p in sorted(set(patches))))
+'
 
 IMAGE_NAME="telora-daemon:latest"
 CONTAINER_ENGINE=$(command -v podman || command -v docker)
@@ -38,7 +78,151 @@ fi
 
 echo "--> Using $CONTAINER_ENGINE to build Telora"
 
-# ── 1. Resolve CUDA toolkit version (override > auto > default) ────
+# ── 0. Registry resolver: map an auto-detected major.minor.patch to ─
+# the highest published patch for that major.minor on Docker Hub. ───
+# Used only when tier 2 (auto-detection) finds a toolkit version
+# whose exact patch is not published (e.g. user has `13.4.0` toolkit
+# installed, only `13.4.1-cudnn-devel-ubuntu24.04` is in the registry).
+# Within-major.minor patches are ABI-compatible per NVIDIA's CUDA
+# compatibility contract; cross-minor bumps are NOT done here.
+#
+# The function prints the resolved version on stdout and advisory
+# messages on stderr. On any failure (network down, registry API
+# change, no tags at all for that major.minor) it returns the input
+# unchanged so the operator sees the underlying `podman pull` error
+# instead of a silent fallback.
+#
+# Cache: ${XDG_CACHE_HOME:-~/.cache}/telora/nvidia-cuda-tags-<MM>-<flavor>.json
+# TTL: 1 hour. A fresh build pull hits the API once per major.minor
+# per hour — back-to-back builds with the same toolkit are free.
+resolve_to_published_patch() {
+    local requested="$1"
+    local flavor="${2:-cudnn}"
+
+    # Split major.minor.patch into major.minor + patch. Anything that
+    # doesn't look like X.Y.Z is rejected loudly — better than silently
+    # passing a malformed triplet to the Docker Hub query.
+    if ! [[ "$requested" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        echo "WARN: resolve_to_published_patch: '$requested' is not X.Y.Z; using as-is" >&2
+        echo "$requested"
+        return 0
+    fi
+    local major="${BASH_REMATCH[1]}"
+    local minor="${BASH_REMATCH[2]}"
+    local patch="${BASH_REMATCH[3]}"
+    local mm="${major}.${minor}"
+
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/telora"
+    local cache_file="${cache_dir}/nvidia-cuda-tags-${mm}-${flavor}.json"
+    local cache_ttl=3600
+
+    # Refresh cache if missing, empty, older than TTL, or corrupt.
+    # A corrupt cache (an operator running `echo garbage >
+    # $cache_file` to test, or a partial write from a killed curl) is
+    # treated as missing so the next call re-fetches; we never return
+    # wrong results from a stale-good-looking cache. The corrupt file
+    # is left in place — the `mv "$tmp" "$cache_file"` below
+    # overwrites it atomically, so we never need to `rm` it (and
+    # `rm` wrappers like `trash-cli` or `mavis-trash` would otherwise
+    # print to stdout and pollute our captured output).
+    local need_fetch=true
+    if [ -s "$cache_file" ]; then
+        if ! python3 -c 'import json,sys; json.load(sys.stdin)' \
+                < "$cache_file" 2>/dev/null; then
+            echo "INFO: cache file $cache_file is corrupt; re-fetching" >&2
+        else
+            local now file_mtime age
+            now="$(date +%s)"
+            file_mtime="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+            age=$((now - file_mtime))
+            if [ "$age" -lt "$cache_ttl" ]; then
+                need_fetch=false
+            fi
+        fi
+    fi
+    if [ "$need_fetch" = "true" ]; then
+        if ! mkdir -p "$cache_dir" 2>/dev/null; then
+            echo "WARN: cannot create cache dir '$cache_dir'; using detected ${requested}" >&2
+            echo "$requested"
+            return 0
+        fi
+        # The Docker Hub tag-list endpoint is unauthenticated; the
+        # `name=` filter is a server-side prefix match, so `13.4.`
+        # returns every tag starting with `13.4.`. `page_size=100` is
+        # the documented maximum and covers any single minor (the
+        # registry tops out around 80 tags per X.Y prefix).
+        local tmp="${cache_file}.tmp.$$"
+        if ! curl -fsS \
+                "https://hub.docker.com/v2/repositories/nvidia/cuda/tags/?page_size=100&name=${mm}." \
+                > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo "WARN: Docker Hub query for nvidia/cuda ${mm}.* failed; using detected ${requested}" >&2
+            echo "$requested"
+            return 0
+        fi
+        # Validate the response is a JSON object before swapping it in —
+        # a non-JSON error page (rate-limit, transient HTTP issue) would
+        # otherwise poison the cache and silently mis-resolve every
+        # subsequent build until the TTL expires.
+        if ! python3 -c 'import json,sys; json.load(sys.stdin); sys.exit(0)' \
+                < "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo "WARN: Docker Hub response for ${mm}.* was not valid JSON; using detected ${requested}" >&2
+            echo "$requested"
+            return 0
+        fi
+        mv "$tmp" "$cache_file"
+    fi
+
+    # Extract every published patch for `${mm}-${flavor}-devel-ubuntu24.04`.
+    # The matching runtime tag (`-runtime-ubuntu24.04`) is published
+    # in lockstep with the devel tag for every matrix entry we ship,
+    # so verifying the devel side is sufficient. Output is a
+    # comma-separated list (e.g. `0,1,2,3`) that the bash caller
+    # membership-tests via `case ",${list}," in *",${patch},"*`,
+    # avoiding a subshell for each lookup.
+    #
+    # The Python script lives in the module-level `_RESOLVE_PATCHES_PY`
+    # variable so it can be invoked via `python3 -c "$script" …`
+    # without nesting a heredoc inside `$(…)` (which bash mis-parses
+    # and emits a spurious "unterminated here-document" warning even
+    # when the heredoc IS correctly closed — see the function header
+    # comment for the full rationale).
+    local patches_csv
+    patches_csv="$(python3 -c "$_RESOLVE_PATCHES_PY" "$cache_file" "$flavor" "$major" "$minor" 2>/dev/null || true)"
+    if [ -z "${patches_csv:-}" ]; then
+        echo "WARN: no published ${flavor}-devel-ubuntu24.04 tags for ${mm}.* in the registry; using detected ${requested}" >&2
+        echo "$requested"
+        return 0
+    fi
+
+    # Membership check: is the requested patch actually published? If
+    # yes, use it as-is — the operator's auto-detected version wins,
+    # even when a higher patch is also available (auto-detect returns
+    # what's installed, and upgrading silently would surprise an
+    # operator who deliberately stays on a specific patch). If no,
+    # upgrade to the highest published patch within the same
+    # major.minor and tell the operator on stderr.
+    local highest
+    highest="$(echo "${patches_csv}" | tr ',' '\n' | sort -n | tail -n1)"
+    case ",${patches_csv}," in
+        *",${patch},"*)
+            # Exact patch is published. Use it silently.
+            echo "$requested"
+            ;;
+        *)
+            # Exact patch is NOT published — upgrade within same
+            # major.minor to the highest available. Cross-minor /
+            # cross-major bumps are NOT attempted here; those are a
+            # different ABI class and the operator must set
+            # `CUDA_VERSION=` explicitly.
+            echo "INFO: detected ${requested} is not published; using ${mm}.${highest} (highest available ${flavor}-devel-ubuntu24.04 patch for ${mm})" >&2
+            echo "${mm}.${highest}"
+            ;;
+    esac
+}
+
+# ── 1. Resolve CUDA toolkit version (override > auto > registry > default) ───
 # Parse a CLI `--cuda-version=X.Y.Z` if present so `./scripts/build
 # --cuda-version=13.4.1` works without needing `CUDA_VERSION=` in
 # the environment. Keep the rest of the script env-driven; the flag
@@ -107,6 +291,19 @@ except Exception:
         if [ -n "${detected:-}" ]; then
             CUDA_VERSION_RESOLVED="${detected}"
             CUDA_SOURCE="host /opt/cuda/version.json"
+        fi
+    fi
+
+    # Tier 2.5: registry resolution. Auto-detected versions whose exact
+    # patch is not on Docker Hub (e.g. `13.4.0` toolkit but only `13.4.1`
+    # published) are silently upgraded to the highest available patch for
+    # the same `major.minor`. Never invoked for explicit `$CUDA_VERSION=`
+    # overrides (those bypass tier 2 entirely).
+    if [ -n "${CUDA_VERSION_RESOLVED:-}" ]; then
+        registry_patch="$(resolve_to_published_patch "${CUDA_VERSION_RESOLVED}" "cudnn")"
+        if [ "$registry_patch" != "${CUDA_VERSION_RESOLVED}" ]; then
+            CUDA_VERSION_RESOLVED="${registry_patch}"
+            CUDA_SOURCE="${CUDA_SOURCE}, auto-upgraded to published patch"
         fi
     fi
 fi
