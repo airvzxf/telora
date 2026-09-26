@@ -399,6 +399,16 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
             "⚠ Respaldo simple (formato único)".to_string(),
             "orange".to_string(),
         ),
+        clipboard::PasteOutcome::KeystrokeUnavailable { .. } => (
+            // The clipboard has the transcription but the focused app did
+            // not receive a paste keystroke (most commonly: `wtype` is
+            // not installed — typical for KDE Plasma 6 without
+            // wlroots-ecosystem tooling). Tell the user explicitly to
+            // press Ctrl+V so they can recover without having to dig
+            // through the logs.
+            "Copiado — pegue con Ctrl+V".to_string(),
+            "orange".to_string(),
+        ),
         clipboard::PasteOutcome::Refused { .. } => (
             "✘ Cancelado (portapapeles protegido)".to_string(),
             "gray".to_string(),

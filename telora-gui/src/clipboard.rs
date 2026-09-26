@@ -168,13 +168,22 @@ pub enum PasteOutcome {
     /// The cycle was refused outright (sensitive data already in the
     /// clipboard, empty text, etc.). The clipboard was not modified.
     Refused { reason: String },
+    /// The text was published to the clipboard but we could not simulate
+    /// the paste shortcut (e.g. `wtype` is not installed and no fallback
+    /// synthesiser is available, as on KDE Plasma 6 without
+    /// wlroots-ecosystem tools). The receiving application did NOT
+    /// receive the text; the user must paste it manually with Ctrl+V.
+    /// `reason` is the underlying error for the log.
+    KeystrokeUnavailable { reason: String },
 }
 
 impl PasteOutcome {
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
-            PasteOutcome::FallbackSingleMime { .. } | PasteOutcome::Refused { .. }
+            PasteOutcome::FallbackSingleMime { .. }
+                | PasteOutcome::Refused { .. }
+                | PasteOutcome::KeystrokeUnavailable { .. }
         )
     }
 }
@@ -483,18 +492,48 @@ pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) -> PasteOutcome 
         app_id.as_deref().unwrap_or("<unknown>")
     );
 
-    match Command::new("wtype").args(&args).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => log::warn!("wtype exited with {:?}", status.code()),
-        Err(e) => {
-            log::warn!("Failed to run wtype ({}); text remains in clipboard", e);
-        }
-    }
+    // `wtype` is wlroots-only and is not shipped with KDE distros. When
+    // it is absent (the most common KDE Plasma 6 setup), the receiving
+    // application never gets the keystroke and the user is left looking
+    // at an empty field. We surface this explicitly via
+    // `PasteOutcome::KeystrokeUnavailable` so the OSD can tell the user
+    // to paste manually. A non-zero exit code (binary present but
+    // compositor refused the synthetic event) is treated as a warning
+    // and we still report `Ok` / `Partial`: there is no useful
+    // corrective action the user can take from the OSD.
+    let keystroke_unavailable_reason: Option<String> =
+        match Command::new("wtype").args(&args).status() {
+            Ok(status) if status.success() => None,
+            Ok(status) => {
+                log::warn!("wtype exited with {:?}", status.code());
+                None
+            }
+            Err(e) => {
+                let reason = format!("wtype not available: {}", e);
+                log::warn!(
+                    "Failed to run wtype ({}); transcription left in \
+                     clipboard for manual paste",
+                    e
+                );
+                Some(reason)
+            }
+        };
 
+    // If we couldn't synthesise the paste keystroke, restore the
+    // clipboard first (so we don't leave the transcription there
+    // permanently — the user can re-trigger if needed) and report the
+    // outcome. We do not return early: the restore path still has to
+    // run for users who had clipboard content before.
     if snap.had_content {
         thread::sleep(Duration::from_millis(RESTORE_DELAY_MS));
         match restore(&snap) {
-            Ok(()) => outcome_for_skipped(&snap),
+            Ok(()) => {
+                if let Some(reason) = keystroke_unavailable_reason {
+                    PasteOutcome::KeystrokeUnavailable { reason }
+                } else {
+                    outcome_for_skipped(&snap)
+                }
+            }
             Err(e) if is_protocol_error(&e) => {
                 let reason = copy_error_reason(&e);
                 log::warn!(
@@ -514,6 +553,8 @@ pub fn paste_text_via_clipboard(text: &str, config: &GuiConfig) -> PasteOutcome 
                 }
             }
         }
+    } else if let Some(reason) = keystroke_unavailable_reason {
+        PasteOutcome::KeystrokeUnavailable { reason }
     } else {
         outcome_for_skipped(&snap)
     }
