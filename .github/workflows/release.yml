@@ -406,17 +406,30 @@ jobs:
           ninja -C /tmp/gtk4-layer-shell/build install
           ldconfig
           pkg-config --modversion gtk4-layer-shell-0
-          # Fail loudly here if nvcc doesn't match the matrix entry
-          # (e.g. the image tag drifted and the patch level silently
-          # differs) — a `CUDA_VERSION=13.4.1` matrix entry that
-          # actually links against 12.x would publish a binary the
-          # AUR / docs claim is CUDA 13, which is exactly the
-          # mismatch this matrix was built to avoid.
-          nvcc --version
-          case "$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)" in
-            ${{ matrix.cuda_version }}*) echo "nvcc matches matrix cuda_version=${{ matrix.cuda_version }}" ;;
-            *) { echo "ERROR: nvcc version does not match matrix cuda_version=${{ matrix.cuda_version }}"; exit 1; } ;;
-          esac
+          # Verify that nvcc reports the same major.minor as the
+          # matrix entry. The patch level (third component) may
+          # drift — NVIDIA republishes the X.Y.Z-cudnn-devel tag
+          # with newer toolkit patches over time (e.g. the
+          # `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04` image we
+          # requested ended up shipping CUDA 12.9.86 in Sep 2026).
+          # The matrix exists to avoid major/minor mismatches (a
+          # CUDA 13 binary published under the "cuda-12" label
+          # would be the failure mode), so comparing just the
+          # major.minor is the correct invariant.
+          #
+          # nvcc prints `release X.Y, VX.Y.Z` (note the comma after
+          # the major.minor). sed extracts the X.Y before the
+          # comma; we truncate the matrix value to X.Y with
+          # `cut -d. -f1,2`.
+          NVCC_MAJOR_MINOR="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\),.*/\1/p' | head -n1)"
+          MATRIX_MAJOR_MINOR="$(echo "${{ matrix.cuda_version }}" | cut -d. -f1,2)"
+          echo "nvcc reports release ${NVCC_MAJOR_MINOR}; matrix asks for ${{ matrix.cuda_version }}"
+          if [ "${NVCC_MAJOR_MINOR}" = "${MATRIX_MAJOR_MINOR}" ]; then
+            echo "nvcc major.minor matches matrix (${MATRIX_MAJOR_MINOR})"
+          else
+            echo "ERROR: nvcc major.minor (${NVCC_MAJOR_MINOR}) does not match matrix major.minor (${MATRIX_MAJOR_MINOR})"
+            exit 1
+          fi
 
       - name: Build release binaries (cold)
         # Cold build by design: GitHub Actions caches are scoped per-ref
