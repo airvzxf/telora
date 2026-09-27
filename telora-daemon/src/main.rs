@@ -589,7 +589,7 @@ async fn main() -> Result<()> {
 
     let mut audio_engine = AudioEngine::new().context("Failed to init audio engine")?;
     audio_engine
-        .start(producer)
+        .start(producer, &daemon_cfg.audio)
         .context("Failed to start audio engine")?;
 
     // Socket

@@ -31,8 +31,8 @@ mod transcriber;
 // different shape, so we expose the TOML-mapped one as
 // `PathsConfigToml` to avoid the collision.
 pub use socket::{
-    Command, DaemonConfig, PathsConfig as PathsConfigToml, SocketServer, StatusResponse, SttConfig,
-    default_stt_config,
+    AudioConfig, Command, DaemonConfig, PathsConfig as PathsConfigToml, SocketServer,
+    StatusResponse, SttConfig, default_stt_config,
 };
 
 // Re-export the runtime path resolver from `telora-common` under the

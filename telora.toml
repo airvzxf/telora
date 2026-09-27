@@ -87,3 +87,43 @@ max_recording_seconds = 300
 socket_dir      = ""
 daemon_socket   = ""
 control_socket  = ""
+
+# Audio input device selection.
+#
+# The daemon captures microphone audio through `cpal`, whose default
+# host on Linux is ALSA. ALSA's `default` PCM on hosts running
+# PipeWire / PulseAudio (KDE Plasma 6, GNOME, etc.) routes through
+# the PipeWire ALSA plugin to whatever source the desktop has
+# selected — so on a machine where the operator chose the Fifine USB
+# mic in Plasma's audio settings, the default already captures from
+# the Fifine and there is nothing to override.
+#
+# `input_device` (empty by default) lets the operator pin a specific
+# capture device when the system default points at the wrong one.
+# The match is a case-insensitive substring against the cpal device
+# name as reported by the ALSA host, e.g.:
+#
+#   input_device = "sysdefault:CARD=Microphone"   # direct ALSA, exact card
+#   input_device = "front:CARD=Microphone,DEV=0"
+#   input_device = "Fifine"                       # any device whose name mentions Fifine
+#
+# When `input_device` is empty and the system default is named
+# `"default"` (the typical PipeWire / PulseAudio ALSA plugin
+# situation), `prefer_direct_alsa` controls the legacy auto-fallback:
+#
+#   *  `prefer_direct_alsa = false` (default): honour the system
+#      default. The daemon captures from whatever KDE / PipeWire
+#      selected — usually the right thing.
+#
+#   *  `prefer_direct_alsa = true`: switch to the first ALSA device
+#      whose name contains `"CARD="`, bypassing the plugin. Useful on
+#      hosts where the plugin lies about supported formats (older
+#      PipeWire versions, exotic USB mics). The previous behaviour of
+#      telora <= 0.7.2.
+#
+# The matching `TELORA_AUDIO__INPUT_DEVICE` /
+# `TELORA_AUDIO__PREFER_DIRECT_ALSA` env vars follow the same
+# `TELORA_*__SECTION__KEY` shape as `[paths]`.
+[audio]
+input_device        = ""
+prefer_direct_alsa  = false
