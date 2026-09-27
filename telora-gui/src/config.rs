@@ -12,6 +12,11 @@ use std::path::PathBuf;
 pub struct GuiConfig {
     pub paste_shortcut: String,
     pub paste_shortcut_by_app: HashMap<String, String>,
+    /// Whether to spawn the freedesktop StatusNotifierItem (SNI) tray
+    /// icon. `true` (default) shows a status icon in KDE Plasma 6,
+    /// GNOME, Cinnamon, LXQt and any other SNI-compliant watcher.
+    /// Set to `false` to run the OSD-only legacy mode (closes #193).
+    pub enable_tray: bool,
 }
 
 impl Default for GuiConfig {
@@ -27,6 +32,7 @@ impl Default for GuiConfig {
         Self {
             paste_shortcut: "ctrl+v".to_string(),
             paste_shortcut_by_app: map,
+            enable_tray: true,
         }
     }
 }
@@ -37,6 +43,7 @@ impl Default for GuiConfig {
 struct RawGuiConfig {
     paste_shortcut: Option<String>,
     paste_shortcut_by_app: Option<HashMap<String, String>>,
+    enable_tray: Option<bool>,
 }
 
 impl GuiConfig {
@@ -96,11 +103,20 @@ impl GuiConfig {
             }
         }
 
+        if let Some(enable) = raw.enable_tray {
+            cfg.enable_tray = enable;
+        }
+
         info!(
-            "Loaded config from {} (default shortcut: {}, {} per-app overrides)",
+            "Loaded config from {} (default shortcut: {}, {} per-app overrides, tray: {})",
             path.display(),
             cfg.paste_shortcut,
-            cfg.paste_shortcut_by_app.len()
+            cfg.paste_shortcut_by_app.len(),
+            if cfg.enable_tray {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
 
         cfg

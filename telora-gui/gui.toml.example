@@ -11,6 +11,15 @@
 # Final token is the key (v, insert, return, etc.).
 paste_shortcut = "ctrl+v"
 
+# Whether to show a system-tray icon (closes #193). Defaults to `true`.
+# The tray exposes the same controls as `telora-ctl` (Toggle TYPE,
+# Toggle COPY, Status, Quit) and surfaces the daemon state
+# (Idle / Recording / Processing / Error) without waiting for the OSD.
+# Talks the freedesktop StatusNotifierItem spec over the session DBus,
+# so it works on KDE Plasma 6, GNOME, Cinnamon, LXQt, etc. without
+# extra glue. Set to `false` to run in legacy OSD-only mode.
+enable_tray = true
+
 # Per-app overrides. The key is the focused window's `app_id` (you can see all
 # the app_ids your compositor exposes with `wlrctl toplevel list` on wlroots
 # compositors such as Sway, Hyprland, labwc, river, Wayfire). The value is a
