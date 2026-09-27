@@ -515,6 +515,23 @@ jobs:
         # init. Full smoke (e.g. the simulate.sh START→STOP cycle)
         # is too heavy for a release gate and runs in the regular
         # CI pipeline.
+        #
+        # The `nvidia/cuda:*-cudnn-devel` container ships the CUDA
+        # toolkit (compiler + dev headers + stubs) but NOT the
+        # NVIDIA driver runtime. Without a real driver, the
+        # binaries need libcuda.so.1 — and the container only
+        # has the compat shim at `/usr/local/cuda/compat/`. Prepend
+        # that directory (plus the toolkit lib dirs the binaries
+        # also link against) to `LD_LIBRARY_PATH` so the dynamic
+        # linker can resolve every symbol at `--version` time.
+        # End-to-end tested in `docker.io/nvidia/cuda:12.9.2-
+        # cudnn-devel-ubuntu24.04` via podman.
+        env:
+          LD_LIBRARY_PATH: >-
+            /usr/local/cuda/compat:
+            /usr/local/cuda/lib64:
+            /usr/local/cuda/targets/x86_64-linux/lib:
+            /usr/local/cuda/targets/x86_64-linux/lib/stubs
         run: |
           set -euo pipefail
           ART_DIR="${RUNNER_TEMP}/release-artifacts"
