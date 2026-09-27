@@ -363,9 +363,13 @@ jobs:
           docker --version
           # Build the runtime image (the Containerfile's final stage
           # already compiles the four binaries, strips them, and
-          # copies them into /usr/bin/ of the runtime image).
+          # copies them into /usr/bin/ of the runtime image). Use
+          # `-f Containerfile` because the project standardises on
+          # the Podman-style `Containerfile` name; `docker build`
+          # defaults to `Dockerfile` and would 404.
           docker build \
             --build-arg "CUDA_VERSION=${{ matrix.cuda_version }}" \
+            --file "Containerfile" \
             -t "telora-daemon:latest" \
             .
           # Extract the binaries into ./bin/ on the host runner
