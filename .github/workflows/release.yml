@@ -390,7 +390,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            gcc-14 g++-14 \
+            gcc-14 g++-14 git \
             libasound2-dev libgtk-4-dev libgtk-4-1 \
             libwayland-dev wayland-protocols \
             libssl-dev libclang-dev \
