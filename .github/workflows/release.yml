@@ -324,6 +324,27 @@ jobs:
       # Pin a rustc toolchain that matches ci.yml's pin (same SHA)
       # so the release artefact is built with the same compiler that
       # validated the merge commit. See ci.yml for the rationale.
+      - name: Install curl
+        # `nvidia/cuda:*-cudnn-devel-ubuntu24.04` (the build-root
+        # container for both CUDA 12 and CUDA 13 matrix entries)
+        # does NOT ship `curl` — only `wget`. `dtolnay/rust-toolchain`
+        # shells out to `curl` to fetch `rustup-init.sh` when no
+        # pre-existing rustup is detected in the container, so the
+        # Rust install step would fail with `curl: command not
+        # found` (exit 127). Pre-install curl here so the rustup
+        # bootstrap succeeds. Cheap (~1.5 s on a warm apt cache),
+        # idempotent (skipped if already present), and scoped to
+        # the build-release job so the publish / AUR jobs are not
+        # affected.
+        run: |
+          set -euo pipefail
+          if ! command -v curl >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends curl ca-certificates
+          fi
+          command -v curl
+          curl --version | head -n1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
