@@ -20,6 +20,16 @@ toml = "0.8"
 # for the operator-facing config surface.
 config = { version = "0.13", default-features = false, features = ["toml"] }
 wl-clipboard-rs = "0.9"
+# `ksni` 0.3 implements the freedesktop StatusNotifierItem (SNI)
+# specification over DBus in pure Rust. Used by `telora-gui` to expose
+# a system-tray icon (closes #193): KDE Plasma 6 (Wayland), GNOME,
+# Cinnamon, LXQt and any other SNI-compliant watcher recognise it.
+# We pin to the `tokio` feature (default) because `telora-gui` already
+# runs a multi-threaded `tokio::Runtime` in a worker thread — sharing
+# the same runtime avoids spinning a second executor. No GLib binding
+# needed; ksni talks directly to `org.kde.StatusNotifierWatcher` on
+# the session bus.
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 telora-common = { workspace = true }
 
 [dev-dependencies]

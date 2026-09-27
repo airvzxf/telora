@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use log::info;
+use log::{info, warn};
 
 mod clipboard;
 mod config;
@@ -18,11 +18,13 @@ mod focus;
 mod input;
 mod paths;
 mod text;
+mod tray;
 mod ui;
 
 use config::GuiConfig;
 use connection::{ControlServer, SocketClient};
 use telora_common::paths::ResolvedPaths;
+use tray::{TrayCommand, TrayHandle, TrayState};
 use ui::Osd;
 
 fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
@@ -216,14 +218,107 @@ fn main() {
             });
         });
 
+        // ----- Tray icon wiring (closes #193) -----
+        //
+        // The tray needs its own runtime because ksni's `spawn().await`
+        // must be called from inside a tokio runtime context, and the
+        // GTK main loop does not provide one. A dedicated OS thread
+        // with a single-threaded `tokio::Runtime` is the simplest
+        // isolation: it runs the ksni background task for the lifetime
+        // of the GUI and forwards user actions back through `tx` so
+        // they hit the same `AppAction` pipeline as hotkey / CLI
+        // triggers. State updates flow the other way via a
+        // `std::sync::Mutex<Option<TrayHandle>>` shared with the GTK
+        // loop — the lock is held only briefly to read the `Option`,
+        // and reads return `None` until the tray finishes registering.
+        let (tray_cmd_tx, tray_cmd_rx) = async_channel::unbounded::<TrayCommand>();
+        let tray_handle_slot: Arc<std::sync::Mutex<Option<TrayHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let tray_handle_slot_for_thread = Arc::clone(&tray_handle_slot);
+        let tx_for_tray_thread = tx.clone();
+        let tray_cmd_rx_for_thread = tray_cmd_rx.clone();
+
+        thread::spawn(move || {
+            let rt = Runtime::new().expect("Failed to create tray tokio runtime");
+            rt.block_on(async move {
+                match tray::spawn_tray(tray_cmd_tx).await {
+                    Ok(Some(handle)) => {
+                        // Hand the handle to the GTK loop. The lock is
+                        // uncontended in practice (only the GTK loop
+                        // ever reads it), but we still wrap it in a
+                        // `Mutex` so the `Option` write is sound.
+                        if let Ok(mut slot) = tray_handle_slot_for_thread.lock() {
+                            *slot = Some(handle);
+                        }
+                        info!("Tray command dispatcher started; awaiting menu events");
+                        while let Ok(cmd) = tray_cmd_rx_for_thread.recv().await {
+                            let action = match cmd {
+                                TrayCommand::ToggleType | TrayCommand::MenuToggleType => {
+                                    AppAction::ToggleRecording("TYPE".to_string(), false)
+                                }
+                                TrayCommand::MenuToggleCopy => {
+                                    AppAction::ToggleRecording("COPY".to_string(), false)
+                                }
+                                TrayCommand::MenuCancel => AppAction::CancelRecording,
+                                TrayCommand::MenuStatus => AppAction::OsdUpdate(
+                                    "Telora — listo".to_string(),
+                                    "blue".to_string(),
+                                ),
+                                TrayCommand::MenuQuit => {
+                                    info!("Quit requested from tray menu");
+                                    // Exit cleanly so systemd --user can
+                                    // restart us if the operator has an
+                                    // `Restart=on-failure` policy.
+                                    std::process::exit(0);
+                                }
+                            };
+                            if tx_for_tray_thread.send(action).await.is_err() {
+                                // GTK loop is gone — nothing left to do.
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "SNI tray not available; GUI running in OSD-only mode \
+                             (closes #193 fallback path)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to spawn SNI tray icon ({e}); falling back to OSD-only mode"
+                        );
+                    }
+                }
+            });
+        });
+        // ----- end tray wiring -----
+
         let osd = Osd::new(app);
         let osd_clone = osd.clone();
         let tx_back = tx.clone();
+        let tray_handle_for_loop = Arc::clone(&tray_handle_slot);
 
         // GTK Main Loop Context
         glib::MainContext::default().spawn_local(async move {
             let mut recording = false;
             let mut current_mode = String::new();
+
+            // Helper closure that pushes a new `TrayState` to the
+            // ksni tray task if the handle has finished registering.
+            // The `Mutex` is held only for the duration of the read;
+            // we never block on it (the slot is written once at
+            // startup and then read on every AppAction).
+            let tray_handle_clone = Arc::clone(&tray_handle_for_loop);
+            let set_tray = move |state: TrayState| {
+                if let Some(handle) = tray_handle_clone.lock().unwrap().as_ref() {
+                    handle.set_state(state);
+                }
+            };
+
+            // Initial state: idle. The tray task may not have registered
+            // yet; in that case the call is a silent no-op.
+            set_tray(TrayState::Idle);
 
             while let Ok(action) = rx.recv().await {
                 match action {
@@ -233,6 +328,7 @@ fn main() {
                             recording = true;
                             current_mode = mode;
                             osd_clone.show("● GRABANDO", "red");
+                            set_tray(TrayState::Recording);
                             let _ = daemon_tx.send(DaemonCommand::Start);
                         } else {
                             // STOP
@@ -242,6 +338,7 @@ fn main() {
                             } else {
                                 osd_clone.show("Procesando...", "orange");
                             }
+                            set_tray(TrayState::Processing);
                             let _ = daemon_tx.send(DaemonCommand::Stop {
                                 mode: current_mode.clone(),
                                 response_tx: tx_back.clone(),
@@ -258,6 +355,7 @@ fn main() {
                         if recording {
                             recording = false;
                             osd_clone.show("⏳ LÍMITE ALCANZADO", "orange");
+                            set_tray(TrayState::Processing);
                             let _ = daemon_tx.send(DaemonCommand::Stop {
                                 mode: current_mode.clone(),
                                 response_tx: tx_back.clone(),
@@ -268,6 +366,7 @@ fn main() {
                         if recording {
                             recording = false;
                             osd_clone.show("Cancelado", "gray");
+                            set_tray(TrayState::Processing);
                             let _ = daemon_tx.send(DaemonCommand::Cancel);
                             // Delay hide
                             let tx_inner = tx_back.clone();
@@ -279,12 +378,21 @@ fn main() {
                     }
                     AppAction::OsdUpdate(text, color) => {
                         if !recording {
+                            // Surface transient daemon status messages
+                            // on the tray too so the user can see them
+                            // without opening the OSD manually.
+                            if text.to_ascii_lowercase().contains("error") {
+                                set_tray(TrayState::Error);
+                            }
                             osd_clone.show(&text, &color);
                         }
                     }
                     AppAction::OsdHide => {
                         if !recording {
                             osd_clone.hide();
+                            // Return to the baseline Idle icon once
+                            // the OSD fades away.
+                            set_tray(TrayState::Idle);
                         }
                     }
                 }
