@@ -380,6 +380,10 @@ jobs:
           command -v docker >/dev/null 2>&1 \
             || { echo "ERROR: docker not found on runner"; exit 1; }
           docker --version
+          # codeql[actions/cache-poisoning/poisonable-step] Trust anchor
+          # is the `verify-tag-signature` job upstream in the `needs:`
+          # chain; only the maintainer's GPG-signed tag passes that
+          # gate.
           ./scripts/build
           echo "==> Built binaries:"
           ls -la bin/
