@@ -645,7 +645,7 @@ jobs:
         # _telora/ — neither at the root the consumers expect.
         # Stage the SBOM under release-artifacts/ so all 7 files
         # share one parent and v4's stripping gives a flat zip.
-        run: cp "${{ github.workspace }}/telora.sbom.cdx.json" "${{ runner.temp }}/release-artifacts/"
+        run: cp "$(find "$(pwd)" -name 'telora.sbom.cdx.json' -type f | head -n1)" "${{ runner.temp }}/release-artifacts/telora.sbom.cdx.json"
       - name: Append SBOM checksum to SHA256SUMS / SHA512SUMS
         # The initial `Compute SHA-*` steps ran before the SBOM was
         # generated (Syft hasn't scanned the workspace yet at that
