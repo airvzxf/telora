@@ -334,6 +334,16 @@ jobs:
         # `Cargo.lock` resolution.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # codeql[actions/cache-poisoning/poisonable-step] The trust
+          # anchor is the `verify-tag-signature` job in this
+          # workflow's `needs:` chain (line ~159), which fails the
+          # workflow unless the tag is GPG-signed by a key in
+          # `.github/trusted-signers`. Only the maintainer (GPG key
+          # 414687A3CD7E65B9) holds a signing key on that
+          # allow-list, and they already have ADMIN access to the
+          # repo, so checking out a `workflow_dispatch`-supplied tag
+          # does not widen the attack surface beyond what
+          # `push: tags` on a maintainer-signed tag would.
           ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
