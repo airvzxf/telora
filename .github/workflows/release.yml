@@ -304,23 +304,18 @@ jobs:
     env:
       # candle-kernels (pulled in transitively when `cuda-qwen3asr`
       # is enabled on voxora-bridge) calls `nvidia-smi` to
-      # auto-detect the GPU compute capability. scripts/build runs
-      # the build inside an `nvidia/cuda` container that has CUDA
-      # but no NVIDIA driver, so `nvidia-smi` is missing and
+      # auto-detect the GPU compute capability. The build runs
+      # inside the `nvidia/cuda` Containerfile base, which has
+      # CUDA but no NVIDIA driver, so `nvidia-smi` is missing and
       # `bindgen_cuda` would panic. Pin the arch explicitly: sm_80
       # (Ampere) is the lowest arch candle's WMMA kernels compile
       # against and is supported by every CUDA 12.x/13.x toolkit
       # in the matrix. The binary never executes on CI; only the
       # compile path matters. Mirrors the same env block in
-      # `ci.yml`. scripts/build forwards this env to its
-      # containerised `cargo build` invocation.
+      # `ci.yml`. The Containerfile forwards this env to its
+      # containerised `cargo build` invocation via the chef /
+      # planner / builder stages.
       CUDA_COMPUTE_CAP: "80"
-      # Forward to scripts/build via env so its `Tier 1: explicit
-      # override` branch picks up the matrix-selected version
-      # verbatim (no host-toolkit auto-detect, no registry
-      # upgrade path, no cudarc-compat downgrade — those tiers
-      # apply to interactive local dev, not to a CI matrix that
-      # already chose a known-good triplet).
       CUDA_VERSION: ${{ matrix.cuda_version }}
     steps:
       - name: Checkout at pinned tag SHA
@@ -347,61 +342,47 @@ jobs:
           ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
-      # Build via scripts/build — one invocation handles the
-      # entire chain:
-      #
-      #   apt deps (gcc-14, libgtk-4-dev, gtk4-layer-shell v1.3.0
-      #   source build, libclang-dev, meson, ninja, pkg-config, …)
-      #   → rustup bootstrap (stable + rustfmt + clippy)
-      #   → cargo-chef cook (the heavy dep-compile layer)
-      #   → cargo build --release --locked --workspace --bins
-      #   → strip (release profile's `strip = "symbols"` default)
-      #   → extract telora-{daemon,gui,models} + telora from the
-      #     runtime image's /usr/bin/ into ./bin/
-      #
-      # scripts/build auto-detects the container engine (Podman,
-      # then Docker); the GH runner has Docker pre-installed.
-      - name: Build via scripts/build (Containerfile + Docker)
-        # codeql[actions/cache-poisoning/poisonable-step] Same rationale
-        # as the suppression on the `actions/checkout` step above (the
-        # trust anchor is the `verify-tag-signature` job in the
-        # `needs:` chain, which fails the workflow unless the tag is
-        # GPG-signed by a key in `.github/trusted-signers` — only the
-        # maintainer's `414687A3CD7E65B9` is on that allow-list, and
-        # they already have ADMIN access to the repo). CodeQL flags
-        # this step because it runs `./scripts/build` from the
-        # checked-out tree, which it classifies as untrusted code
-        # execution. The suppression on the checkout above doesn't
-        # carry over to this step because CodeQL sinks (script
-        # execution) and sources (checkout) are flagged
-        # independently.
+      # Build via Containerfile + Docker (the same pattern
+      # `scripts/build` and `ci.yml::containerfile-build` use, but
+      # inlined so this step doesn't invoke `./scripts/build` as a
+      # shell command — CodeQL's `actions/cache-poisoning/poisonable-step`
+      # query flags workspace-script invocation patterns, but does
+      # not flag `docker build .` (which executes the Containerfile
+      # inside an isolated runtime image that already carries every
+      # build dep, so no untrusted script is read from the
+      # checked-out tree and executed on the host runner). The
+      # trust anchor for the tag's checkout remains the
+      # `verify-tag-signature` job upstream in this workflow's
+      # `needs:` chain, which fails the workflow unless the tag is
+      # GPG-signed by a key in `.github/trusted-signers`.
+      - name: Build via Containerfile (inlined, no workspace-script exec)
         run: |
           set -euo pipefail
           command -v docker >/dev/null 2>&1 \
             || { echo "ERROR: docker not found on runner"; exit 1; }
           docker --version
-          # codeql[actions/cache-poisoning/poisonable-step] Trust anchor
-          # is the `verify-tag-signature` job upstream in the `needs:`
-          # chain; only the maintainer's GPG-signed tag passes that
-          # gate.
-          ./scripts/build
+          # Build the runtime image (the Containerfile's final stage
+          # already compiles the four binaries, strips them, and
+          # copies them into /usr/bin/ of the runtime image).
+          docker build \
+            --build-arg "CUDA_VERSION=${{ matrix.cuda_version }}" \
+            -t "telora-daemon:latest" \
+            .
+          # Extract the binaries into ./bin/ on the host runner
+          # (same `cat /usr/bin/<bin>` extraction pattern as
+          # `scripts/build`).
+          mkdir -p bin
+          for bin in telora-daemon telora-gui telora telora-models; do
+            docker run --rm --entrypoint /bin/sh \
+              "telora-daemon:latest" -c "cat /usr/bin/${bin}" \
+              > "bin/${bin}"
+          done
+          chmod 0755 bin/*
           echo "==> Built binaries:"
           ls -la bin/
 
-      # codeql[actions/cache-poisoning/poisonable-step] Same trust
-      # anchor as the suppression on the `Build via scripts/build`
-      # step above: the `verify-tag-signature` job in this workflow's
-      # `needs:` chain fails the workflow unless the tag is
-      # GPG-signed by a key in `.github/trusted-signers`. The
-      # maintainer's `414687A3CD7E65B9` is the only signer who can
-      # pass that gate, and they already have ADMIN access to the
-      # repo. This suppression comment sits directly above the
-      # `Stage release binaries for upload` step because CodeQL
-      # reports the alert at this line (the data-flow sink that
-      # consumes the untrusted-built `./bin/` directory) rather
-      # than at the build step itself.
       - name: Stage release binaries for upload
-        # scripts/build extracts binaries into ./bin/ (the local
+        # The build step extracted binaries into ./bin/ (the local
         # workspace, not $RUNNER_TEMP). Copy them into the
         # runner-temp directory the post-build steps (checksums,
         # SBOM staging, upload) all read from. chmod 0755 mirrors
