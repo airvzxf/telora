@@ -362,6 +362,19 @@ jobs:
       # scripts/build auto-detects the container engine (Podman,
       # then Docker); the GH runner has Docker pre-installed.
       - name: Build via scripts/build (Containerfile + Docker)
+        # codeql[actions/cache-poisoning/poisonable-step] Same rationale
+        # as the suppression on the `actions/checkout` step above (the
+        # trust anchor is the `verify-tag-signature` job in the
+        # `needs:` chain, which fails the workflow unless the tag is
+        # GPG-signed by a key in `.github/trusted-signers` — only the
+        # maintainer's `414687A3CD7E65B9` is on that allow-list, and
+        # they already have ADMIN access to the repo). CodeQL flags
+        # this step because it runs `./scripts/build` from the
+        # checked-out tree, which it classifies as untrusted code
+        # execution. The suppression on the checkout above doesn't
+        # carry over to this step because CodeQL sinks (script
+        # execution) and sources (checkout) are flagged
+        # independently.
         run: |
           set -euo pipefail
           command -v docker >/dev/null 2>&1 \
