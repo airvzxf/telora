@@ -613,12 +613,16 @@ jobs:
         run: |
           # `download-artifact` v8.0.1 with `merge-multiple: true`
           # should extract the single artifact directly into the
-          # workspace, but the file lands at
-          # `telora.sbom.cdx.json/telora.sbom.cdx.json` in
-          # practice. Use `find` to locate the file wherever it
-          # ended up — works for both the subdirectory and the
-          # direct extraction.
-          SBOM="$(find "${{ github.workspace }}" -name 'telora.sbom.cdx.json' -type f | head -n1)"
+          # workspace, but in practice the file lands at
+          # `telora.sbom.cdx.json/telora.sbom.cdx.json` and
+          # `github.workspace` resolves to the HOST path
+          # (`/home/runner/work/...`), not the container's view
+          # (`/__w/...`). Use the `GITHUB_WORKSPACE` env var (which
+          # is set to the container's path inside `container:` jobs)
+          # and `find` to locate the file wherever it ended up —
+          # works for both the subdirectory and the direct
+          # extraction.
+          SBOM="$(find "${GITHUB_WORKSPACE}" -name 'telora.sbom.cdx.json' -type f | head -n1)"
           test -n "${SBOM}" -a -f "${SBOM}" \
             || { echo "ERROR: SBOM file missing after download"; exit 1; }
           test -s "${SBOM}" \
