@@ -611,8 +611,15 @@ jobs:
         # zero-byte SBOM that passes only the `test -f` gate would
         # ship silently.
         run: |
-          SBOM="${{ github.workspace }}/telora.sbom.cdx.json"
-          test -f "${SBOM}" \
+          # `download-artifact` v8.0.1 with `merge-multiple: true`
+          # should extract the single artifact directly into the
+          # workspace, but the file lands at
+          # `telora.sbom.cdx.json/telora.sbom.cdx.json` in
+          # practice. Use `find` to locate the file wherever it
+          # ended up — works for both the subdirectory and the
+          # direct extraction.
+          SBOM="$(find "${{ github.workspace }}" -name 'telora.sbom.cdx.json' -type f | head -n1)"
+          test -n "${SBOM}" -a -f "${SBOM}" \
             || { echo "ERROR: SBOM file missing after download"; exit 1; }
           test -s "${SBOM}" \
             || { echo "ERROR: SBOM is empty (zero bytes)"; exit 1; }
