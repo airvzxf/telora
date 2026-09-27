@@ -388,6 +388,18 @@ jobs:
           echo "==> Built binaries:"
           ls -la bin/
 
+      # codeql[actions/cache-poisoning/poisonable-step] Same trust
+      # anchor as the suppression on the `Build via scripts/build`
+      # step above: the `verify-tag-signature` job in this workflow's
+      # `needs:` chain fails the workflow unless the tag is
+      # GPG-signed by a key in `.github/trusted-signers`. The
+      # maintainer's `414687A3CD7E65B9` is the only signer who can
+      # pass that gate, and they already have ADMIN access to the
+      # repo. This suppression comment sits directly above the
+      # `Stage release binaries for upload` step because CodeQL
+      # reports the alert at this line (the data-flow sink that
+      # consumes the untrusted-built `./bin/` directory) rather
+      # than at the build step itself.
       - name: Stage release binaries for upload
         # scripts/build extracts binaries into ./bin/ (the local
         # workspace, not $RUNNER_TEMP). Copy them into the
