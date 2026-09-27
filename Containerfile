@@ -126,7 +126,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ─── Stage 2: builder ─────────────────────────────────────────────
 FROM chef AS builder
 
-ARG CMAKE_CUDA_ARCHITECTURES=61
+ARG CMAKE_CUDA_ARCHITECTURES=80
 # candle-kernels (pulled in transitively via cuda-qwen3asr) calls
 # `nvidia-smi` to auto-detect the GPU compute capability and panics
 # if it isn't found. The local `.cargo/config.toml` propagates
