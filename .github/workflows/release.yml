@@ -336,6 +336,13 @@ jobs:
         # idempotent (skipped if already present), and scoped to
         # the build-release job so the publish / AUR jobs are not
         # affected.
+        # Shell is forced to bash because the nvidia/cuda container
+        # ships `dash` as `/bin/sh`, which doesn't accept
+        # `set -o pipefail`. Other steps in this job deliberately
+        # avoid that option for the same reason; this one needs
+        # pipefail (so `curl --version | head -n1` failing aborts
+        # the step), so we ask bash explicitly.
+        shell: bash
         run: |
           set -euo pipefail
           if ! command -v curl >/dev/null 2>&1; then
