@@ -271,6 +271,18 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # The build matrix runs inside `nvidia/cuda:*-cudnn-devel-
+    # ubuntu24.04`, whose default `/bin/sh` is `dash` (not bash).
+    # GitHub Actions defaults a step's shell to the container's
+    # `sh` in `container:` jobs, which makes every script using
+    # `set -euo pipefail` abort with `set: Illegal option -o
+    # pipefail` (exit 2) before doing any useful work — exactly
+    # what `set -euo pipefail` was added for in ci.yml. Force
+    # bash for every step in this job so the existing scripts
+    # (which assume bash's `pipefail`) work as written.
+    defaults:
+      run:
+        shell: bash
     needs: [verify-tag-reachability, verify-tag-signature]
     strategy:
       # Don't cancel the surviving matrix entries when one fails
