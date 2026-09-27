@@ -261,10 +261,18 @@ jobs:
   # major — the runtime `.so` filenames (`libcudart.so.NN`,
   # `libcublas.so.NN`) are pinned per major, so binaries built
   # against CUDA 12 do not load on a system with only the CUDA 13
-  # toolkit installed (and vice versa). The matrix mirrors the
-  # `Containerfile`'s `CUDA_VERSION` build-arg and the same
-  # gtk4-layer-shell source build, so a tag that builds here will
-  # also build cleanly on the next PR to main.
+  # toolkit installed (and vice versa).
+  #
+  # The whole build (apt deps, gtk4-layer-shell source build, Rust
+  # toolchain, cargo-chef dep cache, cargo build, strip, binary
+  # extraction) is delegated to `scripts/build`, which builds the
+  # `Containerfile` via Docker (the GH-hosted Ubuntu 24.04 runner
+  # already ships Docker; scripts/build falls back to Docker when
+  # Podman is absent) and cats the four binaries out of the
+  # resulting runtime image. This is the same pattern
+  # `ci.yml::containerfile-build` uses on every PR — by reusing it
+  # here, the release artefact and the merge-commit CI artefact
+  # come from the same build chain.
   build-release:
     name: 'Build · release binaries (cuda-${{ matrix.cuda_short }})'
     runs-on: ubuntu-24.04
@@ -278,165 +286,97 @@ jobs:
       # block the CUDA 12 artefact from being published.
       fail-fast: false
       matrix:
-        # Each entry selects the `nvidia/cuda:X.Y.Z-cudnn-devel-ubuntu24.04`
-        # base image (same triplet the Containerfile consumes via
-        # `--build-arg CUDA_VERSION=X.Y.Z`). The patch level tracks
-        # the latest upstream nvidia/cuda tag for the major; bump
-        # here when a newer `nvidia/cuda:X.Y.Z-cudnn-devel-ubuntu24.04`
-        # is published.
+        # Each entry selects the Containerfile's `CUDA_VERSION`
+        # build-arg, which the Containerfile maps to the matching
+        # `nvidia/cuda:X.Y.Z-cudnn-devel-ubuntu24.04` base image
+        # internally. scripts/build's six-tier CUDA resolver maps
+        # the X.Y.Z string to the highest published patch for that
+        # major.minor if the exact patch is not on Docker Hub.
+        #
+        # 13.3.0 (not 13.4.x) because cudarc 0.19.9 panics on 13.4
+        # with `Unsupported cuda toolkit version`. Bump when cudarc
+        # upstream adds 13.4 support.
         include:
           - cuda_version: 12.9.1
             cuda_short: "12"
-          - cuda_version: 13.4.1
+          - cuda_version: 13.3.0
             cuda_short: "13"
-    # Run the job inside the matching nvidia/cuda devel image so
-    # nvcc + the matching CUDA runtime headers are available
-    # without relying on `nvidia-cuda-toolkit` (which only ships
-    # CUDA 12.0 on Ubuntu 24.04). The host runner still provides
-    # GitHub Actions plumbing; the container is the build root.
-    container:
-      image: docker.io/nvidia/cuda:${{ matrix.cuda_version }}-cudnn-devel-ubuntu24.04
     env:
       # candle-kernels (pulled in transitively when `cuda-qwen3asr`
       # is enabled on voxora-bridge) calls `nvidia-smi` to
-      # auto-detect the GPU compute capability. The container has
-      # CUDA but no NVIDIA driver, so `nvidia-smi` is missing and
-      # `bindgen_cuda` panics. Pin the arch explicitly: sm_80
-      # (Ampere) is the lowest arch candle's WMMA kernels (BF16
-      # fragments in `src/moe/moe_wmma*.cu`) compile against and
-      # is supported by every CUDA 12.x/13.x toolkit in the
-      # matrix. The binary never executes on CI; only the compile
-      # path matters here. Mirrors the same fix in `ci.yml` (env
-      # block, top of file).
+      # auto-detect the GPU compute capability. scripts/build runs
+      # the build inside an `nvidia/cuda` container that has CUDA
+      # but no NVIDIA driver, so `nvidia-smi` is missing and
+      # `bindgen_cuda` would panic. Pin the arch explicitly: sm_80
+      # (Ampere) is the lowest arch candle's WMMA kernels compile
+      # against and is supported by every CUDA 12.x/13.x toolkit
+      # in the matrix. The binary never executes on CI; only the
+      # compile path matters. Mirrors the same env block in
+      # `ci.yml`. scripts/build forwards this env to its
+      # containerised `cargo build` invocation.
       CUDA_COMPUTE_CAP: "80"
+      # Forward to scripts/build via env so its `Tier 1: explicit
+      # override` branch picks up the matrix-selected version
+      # verbatim (no host-toolkit auto-detect, no registry
+      # upgrade path, no cudarc-compat downgrade — those tiers
+      # apply to interactive local dev, not to a CI matrix that
+      # already chose a known-good triplet).
+      CUDA_VERSION: ${{ matrix.cuda_version }}
     steps:
       - name: Checkout at pinned tag SHA
         # Pinning to the immutable commit SHA (resolved by
-        # `verify-tag-reachability` and propagated through the job
-        # graph) closes the TOCTOU gap: a tag force-push that arrives
-        # mid-workflow cannot redirect checkout away from the commit
-        # the two verify jobs just approved.
+        # `verify-tag-reachability`) closes the TOCTOU gap:
+        # a tag force-push mid-workflow cannot redirect the
+        # checkout away from the commit the two verify jobs just
+        # approved. `fetch-depth: 0` so `scripts/build` (and the
+        # Containerfile's `planner` stage, which calls
+        # `cargo chef prepare`) see the full git history for the
+        # `Cargo.lock` resolution.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
-      # Pin a rustc toolchain that matches ci.yml's pin (same SHA)
-      # so the release artefact is built with the same compiler that
-      # validated the merge commit. See ci.yml for the rationale.
-      - name: Install curl
-        # `nvidia/cuda:*-cudnn-devel-ubuntu24.04` (the build-root
-        # container for both CUDA 12 and CUDA 13 matrix entries)
-        # does NOT ship `curl` — only `wget`. `dtolnay/rust-toolchain`
-        # shells out to `curl` to fetch `rustup-init.sh` when no
-        # pre-existing rustup is detected in the container, so the
-        # Rust install step would fail with `curl: command not
-        # found` (exit 127). Pre-install curl here so the rustup
-        # bootstrap succeeds. Cheap (~1.5 s on a warm apt cache),
-        # idempotent (skipped if already present), and scoped to
-        # the build-release job so the publish / AUR jobs are not
-        # affected.
+      # Build via scripts/build — one invocation handles the
+      # entire chain:
+      #
+      #   apt deps (gcc-14, libgtk-4-dev, gtk4-layer-shell v1.3.0
+      #   source build, libclang-dev, meson, ninja, pkg-config, …)
+      #   → rustup bootstrap (stable + rustfmt + clippy)
+      #   → cargo-chef cook (the heavy dep-compile layer)
+      #   → cargo build --release --locked --workspace --bins
+      #   → strip (release profile's `strip = "symbols"` default)
+      #   → extract telora-{daemon,gui,models} + telora from the
+      #     runtime image's /usr/bin/ into ./bin/
+      #
+      # scripts/build auto-detects the container engine (Podman,
+      # then Docker); the GH runner has Docker pre-installed.
+      - name: Build via scripts/build (Containerfile + Docker)
         run: |
           set -euo pipefail
-          if ! command -v curl >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends curl ca-certificates
-          fi
-          command -v curl
-          curl --version | head -n1
+          command -v docker >/dev/null 2>&1 \
+            || { echo "ERROR: docker not found on runner"; exit 1; }
+          docker --version
+          ./scripts/build
+          echo "==> Built binaries:"
+          ls -la bin/
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Install dependencies
-        # Mirror of ci.yml + the Containerfile chef stage. We do
-        # NOT install `nvidia-cuda-toolkit` because the container
-        # image already provides CUDA ${{ matrix.cuda_version }}
-        # with nvcc on PATH; apt's package would re-pin us to
-        # CUDA 12.0 on Ubuntu 24.04 and break the matrix entry
-        # for CUDA 13.
-        #
-        # `gcc-14` / `g++-14` are pinned because the workspace's
-        # local-only `.cargo/config.toml` propagates
-        # `NVCC_CCBIN=/usr/bin/gcc-14` to every cargo invocation.
-        # The nvidia/cuda devel image only ships `gcc-13` via
-        # `build-essential`; without gcc-14 bindgen_cuda invokes
-        # nvcc with `-ccbin /usr/bin/gcc-14`, which nvcc then
-        # fails to find.
-        #
-        # Ubuntu 24.04 (Noble) does not ship `libgtk4-layer-shell-dev`
-        # (only the GTK3 variant), so we build the C library from
-        # source at the same tag the Rust crate's `v1_3` feature
-        # requires (`gtk4-layer-shell-sys` 0.5.2 needs >= 1.3).
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-14 g++-14 \
-            libasound2-dev libgtk-4-dev libgtk-4-1 \
-            libwayland-dev wayland-protocols \
-            libssl-dev libclang-dev \
-            gobject-introspection libgirepository1.0-dev \
-            meson ninja-build \
-            build-essential cmake pkg-config
-          git clone --depth 1 --branch v1.3.0 \
-            https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
-          sudo meson setup \
-            -Dexamples=false -Ddocs=false -Dtests=false \
-            -Dintrospection=false -Dvapi=false \
-            /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell
-          sudo ninja -C /tmp/gtk4-layer-shell/build install
-          sudo ldconfig
-          pkg-config --modversion gtk4-layer-shell-0
-          # Fail loudly here if nvcc doesn't match the matrix entry
-          # (e.g. the image tag drifted and the patch level silently
-          # differs) — a `CUDA_VERSION=13.4.1` matrix entry that
-          # actually links against 12.x would publish a binary the
-          # AUR / docs claim is CUDA 13, which is exactly the
-          # mismatch this matrix was built to avoid.
-          nvcc --version
-          case "$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)" in
-            ${{ matrix.cuda_version }}*) echo "nvcc matches matrix cuda_version=${{ matrix.cuda_version }}" ;;
-            *) { echo "ERROR: nvcc version does not match matrix cuda_version=${{ matrix.cuda_version }}"; exit 1; } ;;
-          esac
-
-      - name: Build release binaries (cold)
-        # Cold build by design: GitHub Actions caches are scoped per-ref
-        # (https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache),
-        # and tag-to-tag restore is forbidden. CI on main continues
-        # to use rust-cache (via the dedicated workflow); releases
-        # pay ~5 min cold build per tag, which is acceptable for
-        # 1-2 releases/week.
-        run: cargo build --release --locked --workspace --bins
-
-      - name: Strip binaries
-        # `cargo build --release` already strips on Linux for the
-        # `release` profile (`strip = "symbols"` is the default in
-        # the workspace). This step is defensive: if a future change
-        # ever disables that, this `strip` invocation keeps the
-        # release artefacts small.
+      - name: Stage release binaries for upload
+        # scripts/build extracts binaries into ./bin/ (the local
+        # workspace, not $RUNNER_TEMP). Copy them into the
+        # runner-temp directory the post-build steps (checksums,
+        # SBOM staging, upload) all read from. chmod 0755 mirrors
+        # the PKGBUILD's `install -m755` so the AUR `.pkg.tar.zst`
+        # and the GitHub Release artefact ship with the same mode.
         run: |
           set -euo pipefail
+          ART_DIR="${RUNNER_TEMP}/release-artifacts"
+          mkdir -p "${ART_DIR}"
           for bin in telora-daemon telora-gui telora telora-models; do
-            BIN="target/release/${bin}"
-            test -x "${BIN}" || { echo "ERROR: missing ${BIN}"; exit 1; }
-            strip --strip-unneeded "${BIN}"
-            ls -la "${BIN}"
+            cp "bin/${bin}" "${ART_DIR}/${bin}"
+            chmod 0755 "${ART_DIR}/${bin}"
           done
-
-      - name: Locate binaries
-        id: locate
-        run: |
-          set -euo pipefail
-          for bin in telora-daemon telora-gui telora telora-models; do
-            BIN="${RUNNER_TEMP}/release-artifacts/${bin}"
-            mkdir -p "$(dirname "${BIN}")"
-            cp "target/release/${bin}" "${BIN}"
-            echo "${bin}=${BIN}" >> "$GITHUB_OUTPUT"
-          done
-          ls -la "${RUNNER_TEMP}/release-artifacts/"
+          ls -la "${ART_DIR}/"
 
       - name: Compute SHA-256 checksums
         id: sha256
@@ -464,13 +404,29 @@ jobs:
         # init. Full smoke (e.g. the simulate.sh START→STOP cycle)
         # is too heavy for a release gate and runs in the regular
         # CI pipeline.
+        #
+        # The binaries were built inside the nvidia/cuda runtime
+        # image, which ships `libcuda.so.1` (compat shim under
+        # `/usr/local/cuda/compat/`) and `libgtk4-layer-shell.so.0`
+        # — neither of which is on the GH runner host. telora and
+        # telora-models are pure Rust with only `libc` / `libasan`
+        # / `libgcc_s` deps and run fine on the host, but
+        # telora-daemon and telora-gui must execute inside the
+        # runtime image that built them. scripts/build leaves the
+        # `telora-daemon:latest` runtime image in the local
+        # Podman/Docker cache, so we reuse it.
         run: |
           set -euo pipefail
           ART_DIR="${RUNNER_TEMP}/release-artifacts"
-          "${ART_DIR}/telora-daemon" --version
-          "${ART_DIR}/telora-gui" --help | head -5
+          # CLI binaries — host runner has libc + libasan + libgcc_s.
           "${ART_DIR}/telora" --version
           "${ART_DIR}/telora-models" --version
+          # Binaries that link against container-only shared libs —
+          # run inside the runtime image scripts/build produced.
+          # Mirrors the smoke pattern in
+          # `ci.yml::containerfile-build`.
+          docker run --rm --entrypoint /bin/sh telora-daemon:latest \
+            -c 'telora-daemon --version && telora-gui --help | head -5'
 
       - name: Write .syft.yaml for SBOM source metadata
         # Syft does not interpolate workflow expressions inside a
