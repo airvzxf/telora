@@ -4,6 +4,8 @@ use log::{error, info};
 use ringbuf::{HeapRb, Producer};
 use std::sync::Arc;
 
+use crate::socket::AudioConfig;
+
 /// Sample rate the downstream ASR (voxora-bridge `AsrEngine::transcribe`)
 /// and the daemon's recording buffer are sized for. The capture stream
 /// may run at a different native rate (e.g. Fifine's 48 kHz via direct
@@ -57,47 +59,14 @@ impl AudioEngine {
         Ok(Self { stream: None })
     }
 
-    pub fn start(&mut self, mut producer: Producer<f32, Arc<HeapRb<f32>>>) -> Result<u32> {
+    pub fn start(
+        &mut self,
+        mut producer: Producer<f32, Arc<HeapRb<f32>>>,
+        config: &AudioConfig,
+    ) -> Result<u32> {
         let host = cpal::default_host();
 
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("No input device found"))?;
-
-        // If `default_input_device()` resolves to ALSA's `default` alias
-        // (which on hosts running PipeWire routes through the PipeWire
-        // ALSA plugin and then lies about sample-rate ranges — Fifine
-        // capture hangs because the plugin advertises a junk 2 ch /
-        // 44100 Hz / F32 default that Fifine rejects, and even 1-ch
-        // mono configs through the plugin never start streaming),
-        // pick a direct ALSA HW device instead. The plugin only
-        // intercepts `default`; `sysdefault:CARD=*` and
-        // `front:CARD=*,DEV=0` go straight to the kernel ALSA driver
-        // and Fifine's HW path captures fine via them.
-        // `host.input_devices()` enumerates those direct devices; we
-        // pick the first one whose name looks like an ALSA HW hint
-        // (contains "CARD=").
-        let device = {
-            let name = device.name().unwrap_or_default();
-            if name == "default" {
-                let replacement = host.input_devices().ok().and_then(|it| {
-                    it.into_iter()
-                        .find(|d| d.name().ok().map(|n| n.contains("CARD=")).unwrap_or(false))
-                });
-                if let Some(d) = replacement {
-                    info!(
-                        "Default input '{}' routes through PipeWire ALSA plugin; switching to direct ALSA device '{}'",
-                        name,
-                        d.name().unwrap_or_else(|_| "Unknown".to_string())
-                    );
-                    d
-                } else {
-                    device
-                }
-            } else {
-                device
-            }
-        };
+        let device = select_input_device(&host, config).context("no usable input device")?;
 
         info!(
             "Using input device: {}",
@@ -315,5 +284,173 @@ impl AudioEngine {
         self.stream = Some(stream);
 
         Ok(sample_rate)
+    }
+}
+
+/// Pick the capture device according to the operator's `[audio]`
+/// settings.
+///
+/// Precedence (highest wins):
+///
+/// 1. `config.input_device` — case-insensitive substring match
+///    against `Device::name()`. Empty skips this branch.
+/// 2. `cpal::default_input_device()` — the desktop default
+///    (PipeWire / PulseAudio on KDE Plasma 6, GNOME, etc.).
+///    `prefer_direct_alsa = true` overrides only this step: when
+///    the default device is the ALSA plugin (name == `"default"`),
+///    the helper falls back to the first direct ALSA HW device with
+///    `"CARD="` in its name.
+///
+/// This used to swap the system default unconditionally whenever the
+/// ALSA plugin was in play. That heuristic predated modern PipeWire
+/// and mis-selected laptops with both an integrated Intel HDA mic
+/// and a USB capture card (cpal enumerated the built-in card first,
+/// so telora captured from the laptop's internal mic while the
+/// operator spoke into the USB one). Honours the desktop default
+/// now; the legacy fallback is opt-in via `prefer_direct_alsa` and
+/// the pin via `input_device`.
+pub fn select_input_device(host: &cpal::Host, config: &AudioConfig) -> Result<cpal::Device> {
+    let pin = config.input_device.trim();
+    if !pin.is_empty() {
+        let needle = pin.to_lowercase();
+        let picked = host.input_devices().ok().and_then(|it| {
+            it.into_iter().find(|d| {
+                d.name()
+                    .ok()
+                    .map(|n| n.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+            })
+        });
+        return match picked {
+            Some(d) => {
+                info!(
+                    "audio.input_device '{}' matched capture device '{}'",
+                    pin,
+                    d.name().unwrap_or_default()
+                );
+                Ok(d)
+            }
+            None => Err(anyhow!(
+                "audio.input_device '{}' did not match any capture device",
+                pin
+            )),
+        };
+    }
+
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("No input device found"))?;
+
+    let name = device.name().unwrap_or_default();
+    if config.prefer_direct_alsa && name == "default" {
+        let replacement = host.input_devices().ok().and_then(|it| {
+            it.into_iter()
+                .find(|d| d.name().ok().map(|n| n.contains("CARD=")).unwrap_or(false))
+        });
+        if let Some(d) = replacement {
+            info!(
+                "audio.prefer_direct_alsa=true: bypassing ALSA plugin 'default' for direct capture on '{}'",
+                d.name().unwrap_or_default()
+            );
+            return Ok(d);
+        }
+        info!(
+            "audio.prefer_direct_alsa=true but no direct ALSA 'CARD=' device found; falling back to '{}'",
+            name
+        );
+    }
+    Ok(device)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Exercise the audio device-selection helper against the live
+    //! `cpal::default_host()`. The tests do not need an actual
+    //! capture stream — only the device-name surface cpal exposes —
+    //! which makes them cheap and deterministic on whatever ALSA /
+    //! PipeWire setup the CI runner happens to use.
+
+    use super::*;
+    use crate::socket::AudioConfig;
+
+    #[test]
+    fn empty_config_respects_system_default() {
+        let host = cpal::default_host();
+        let cfg = AudioConfig::default();
+        let picked = select_input_device(&host, &cfg).expect("default device available");
+        let picked_name = picked.name().unwrap_or_default();
+        // With `prefer_direct_alsa=false` and an empty `input_device`,
+        // the helper MUST return exactly what `cpal::default_input_device()`
+        // returns — the desktop default, even when a `CARD=` device
+        // exists alongside it. The historical bug was overriding the
+        // desktop default with the first `CARD=` device; this test
+        // pins the new "respect the desktop default" contract.
+        let system_default_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            picked_name, system_default_name,
+            "select_input_device silently overrode the desktop default \
+             '{system_default_name}' with '{picked_name}' even though \
+             prefer_direct_alsa=false; check the precedence rules."
+        );
+    }
+
+    #[test]
+    fn input_device_pin_matches_case_insensitively() {
+        let host = cpal::default_host();
+        let names: Vec<String> = host
+            .input_devices()
+            .ok()
+            .map(|it| it.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default();
+        let some_candidate = names
+            .iter()
+            .find(|n| n.contains("CARD="))
+            .cloned()
+            .or_else(|| names.first().cloned());
+        let Some(target) = some_candidate else {
+            // No input devices on this host at all — `cpal` can't
+            // enumerate anything. Skip: nothing to match against.
+            return;
+        };
+
+        // Take the first `CARD=` chunk from the device name and
+        // search for it; the match is case-insensitive.
+        let needle: String = target
+            .split("CARD=")
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ']).next())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| target.to_lowercase());
+        let cfg = AudioConfig {
+            input_device: needle.clone(),
+            prefer_direct_alsa: false,
+        };
+        let picked = select_input_device(&host, &cfg).expect("device matching the pin");
+        assert!(
+            picked
+                .name()
+                .ok()
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false),
+            "picked device '{}' did not contain pin '{}'",
+            picked.name().unwrap_or_default(),
+            needle
+        );
+    }
+
+    #[test]
+    fn input_device_pin_with_no_match_returns_error() {
+        let host = cpal::default_host();
+        let cfg = AudioConfig {
+            input_device: "definitely-not-a-real-device-xyz".to_string(),
+            prefer_direct_alsa: false,
+        };
+        assert!(
+            select_input_device(&host, &cfg).is_err(),
+            "expected an error when the pin matches no capture device"
+        );
     }
 }

@@ -95,12 +95,61 @@ pub struct PathsConfig {
     pub control_socket: Option<String>,
 }
 
+/// `[audio]` section of `telora.toml`.
+///
+/// `cpal::default_input_device()` on Linux returns the ALSA `default`
+/// PCM, which on hosts running PipeWire / PulseAudio (KDE Plasma 6,
+/// GNOME, etc.) is routed by the PipeWire ALSA plugin to whatever
+/// source the desktop selected. On those hosts honouring the system
+/// default is the right behaviour — the operator already picked the
+/// mic they want to use.
+///
+/// The daemon used to unconditionally swap that default for the
+/// first direct ALSA device with `"CARD="` in its name (see the
+/// `telora-daemon/src/audio.rs` history). That heuristic predated
+/// modern PipeWire and broke laptops with both an integrated Intel
+/// HDA mic and a USB capture card: cpal enumerated the built-in
+/// card first, so telora captured from the laptop's internal mic
+/// while the operator spoke into the USB one. The override is now
+/// opt-in via [`AudioConfig::prefer_direct_alsa`]; the pin to a
+/// specific capture device via [`AudioConfig::input_device`].
+///
+/// `Default` is derived so the `#[serde(default)]` attribute on the
+/// `audio` field in [`DaemonConfig`] composes cleanly when the
+/// user's `telora.toml` omits the section.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioConfig {
+    /// Pin to a specific capture device when the system default
+    /// points at the wrong hardware. The match is a case-insensitive
+    /// substring against the cpal device name returned by
+    /// `Device::name()`. Empty means "use the system default
+    /// unchanged".
+    ///
+    /// Common values:
+    ///
+    /// * `""` — honour the desktop's default.
+    /// * `"sysdefault:CARD=Microphone"` — direct ALSA, exact card.
+    /// * `"Fifine"` — first device whose name mentions Fifine.
+    #[serde(default)]
+    pub input_device: String,
+    /// When `input_device` is empty and `cpal::default_input_device()`
+    /// returns a device whose name is `"default"` (the typical
+    /// PipeWire / PulseAudio ALSA plugin case), opt in to the legacy
+    /// direct-alsa fallback: pick the first ALSA device whose name
+    /// contains `"CARD="`. Defaults to `false` (respect the desktop
+    /// default — usually the right thing on Plasma 6 / GNOME).
+    #[serde(default)]
+    pub prefer_direct_alsa: bool,
+}
+
 /// Top-level daemon configuration rooted at `telora.toml`.
 ///
 /// STT fields (`model_id`, `model_kind`, `language`, etc.) are kept
 /// at the top level for backwards compatibility with the original
 /// `telora.toml` format. The `[paths]` overrides are a separate
-/// section added in EPIC #27.
+/// section added in EPIC #27. The `[audio]` input-device overrides
+/// live in their own section to keep the device-selection concerns
+/// out of the STT schema.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonConfig {
     /// STT configuration, inlined at the top level via
@@ -111,6 +160,9 @@ pub struct DaemonConfig {
     /// `[paths]` section. See [`PathsConfig`].
     #[serde(default)]
     pub paths: PathsConfig,
+    /// `[audio]` section. See [`AudioConfig`].
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Default for DaemonConfig {
@@ -118,6 +170,7 @@ impl Default for DaemonConfig {
         Self {
             stt: default_stt_config(),
             paths: PathsConfig::default(),
+            audio: AudioConfig::default(),
         }
     }
 }
