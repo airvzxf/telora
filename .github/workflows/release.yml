@@ -287,7 +287,17 @@ jobs:
         include:
           - cuda_version: 12.9.1
             cuda_short: "12"
-          - cuda_version: 13.4.1
+          # cudarc 0.19.9 (the version pinned in Cargo.lock by
+          # telora-daemon's direct dep) only supports CUDA up to
+          # 13.3 — its `build.rs` panics with `Unsupported cuda
+          # toolkit version: '13.4'` when fed a 13.4 toolkit.
+          # Downgrade the matrix patch to 13.3.x (the highest
+          # cudarc 0.19.9 supports) instead of forcing a cudarc
+          # upgrade just for one release artefact. A cudarc
+          # bump can land as its own PR once 13.4 support
+          # actually matters (e.g. an upstream voxora-hf
+          # release that requires it).
+          - cuda_version: 13.3.0
             cuda_short: "13"
     # Run the job inside the matching nvidia/cuda devel image so
     # nvcc + the matching CUDA runtime headers are available
