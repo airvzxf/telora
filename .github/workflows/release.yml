@@ -14,18 +14,17 @@ on:
     # (`pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'`).
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (e.g. v0.5.0 or v0.5.0-rc.1). Must exist on the remote.'
-        required: true
-        type: string
-        # Mirrors the push-trigger shape above. A SemVer 2.0.0
-        # pre-release suffix (`-rc.1`, `-alpha.2`, `-beta.3+build.7`)
-        # is accepted; non-SemVer suffixes fail fast in the
-        # validate-tag-input job below instead of producing a
-        # confusing `git rev-parse` error mid-build.
-        pattern: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$'
+  # No `workflow_dispatch:` trigger on purpose. The release flow
+  # is tag-push-only — `git tag -s vX.Y.Z && git push origin vX.Y.Z`
+  # on the maintainer's workstation is the documented release path
+  # (see README.md § Release process). The `verify-tag-signature`
+  # job gates the workflow on a GPG signature from a key in
+  # `.github/trusted-signers`, which a `workflow_dispatch` input
+  # would bypass (no tag object exists to verify) — so a manual
+  # trigger widened the attack surface for zero operational gain.
+  # To re-run a failed release, delete the broken tag locally and
+  # push it again (or amend the commit and re-tag — `--force`
+  # on the tag is fine because the workflow keys on the new commit).
 
 # Releases need to write tags and create a GitHub Release page, but only the
 # `publish` job does — the `build-release` job only reads repo contents. Scoping
@@ -35,7 +34,7 @@ on:
 # Do not let two release jobs for the same tag run in parallel; the
 # second one would race the upload.
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 # Default permissions for every job. Each job narrows or
@@ -45,14 +44,13 @@ permissions:
   contents: read
 
 jobs:
-  # Tag-input validator: the `push` trigger filters to
-  # `v[0-9]+.[0-9]+.[0-9]+` so a manual dispatch could otherwise
-  # feed arbitrary strings (`main`, `refs/tags/v…`, leading
-  # whitespace, etc.) into `git rev-parse`, producing a confusing
-  # failure mid-build. This job runs first and fails fast on a
-  # malformed tag name. It also confirms the tag exists on the
-  # remote — the push trigger guarantees this for tag events, but
-  # the dispatch path is unvalidated otherwise.
+  # Tag-input validator. The trigger is `push: tags: 'v*'`, so
+  # `github.ref_name` is already the tag name (e.g. `v0.7.4`).
+  # This job still re-validates the SemVer shape because tag-glob
+  # patterns can match weird strings (`v` alone, `v1.0`,
+  # leading whitespace from a malformed push, etc.) and the
+  # downstream `git rev-parse ${TAG}^{commit}` would otherwise fail
+  # mid-build with a confusing error. Fails fast here.
   validate-tag-input:
     name: 'Validate · tag input'
     runs-on: ubuntu-latest
@@ -65,13 +63,14 @@ jobs:
       - name: Validate tag shape
         id: resolve
         env:
-          RAW: ${{ github.event.inputs.tag || github.ref_name }}
+          RAW: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           TAG="${RAW}"
-          # Mirrors the `workflow_dispatch.inputs.tag.pattern` exactly
-          # so both validators agree on the canonical SemVer 2.0.0 set
-          # (including pre-release suffixes like `-rc.1`).
+          # Mirrors the push-trigger tag-glob (`v*`) and the documented
+          # SemVer 2.0.0 shape (including pre-release suffixes like
+          # `-rc.1`) so both validators agree on the canonical tag
+          # set the maintainer signs locally.
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] \
             || { echo "ERROR: '$TAG' is not vX.Y.Z[-prerelease]"; exit 1; }
           echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
@@ -101,7 +100,7 @@ jobs:
         # is the second half of the same closure.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Resolve tag commit + fetch main
@@ -170,7 +169,7 @@ jobs:
         # `build-release` job's responsibility.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -328,9 +327,12 @@ jobs:
           # `.github/trusted-signers`. Only the maintainer (GPG key
           # 414687A3CD7E65B9) holds a signing key on that
           # allow-list, and they already have ADMIN access to the
-          # repo, so checking out a `workflow_dispatch`-supplied tag
-          # does not widen the attack surface beyond what
-          # `push: tags` on a maintainer-signed tag would.
+          # repo, so the only way this workflow runs is when the
+          # maintainer signs a `v*` SemVer tag locally and pushes it.
+          # No `workflow_dispatch` trigger exists by design — a
+          # manual run would have nothing to verify the signature
+          # against and would therefore widen the attack surface for
+          # zero operational gain.
           ref: ${{ needs.verify-tag-reachability.outputs.tag_commit }}
           fetch-depth: 0
 
@@ -782,7 +784,7 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ github.ref_name }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 

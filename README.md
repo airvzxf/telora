@@ -61,7 +61,8 @@ merged from lowest to highest priority in this order:
 4. **Environment Variables**: e.g. `TELORA_LANGUAGE=fr`
 
 After those sources are merged, direct value flags such as `--language en`
-override the resulting configuration.
+override the resulting configuration. See `./telora-daemon --help` for the
+full list of CLI overrides.
 
 ### Example Configuration (`config.toml`)
 
