@@ -280,27 +280,19 @@ jobs:
     permissions:
       contents: read
     needs: [verify-tag-reachability, verify-tag-signature]
+    # No matrix for v0.7.4: cudarc 0.19.9 (pulled in by voxora-bridge
+    # → cuda-qwen3asr → candle) does NOT support CUDA 13.4+
+    # (`Unsupported cuda toolkit version` panic). The original
+    # CUDA 12 + CUDA 13 matrix from issue #183 is unworkable
+    # until cudarc ships 13.4 support (track upstream). Restoring
+    # the matrix is a one-line change when that lands. For now
+    # we ship a single CUDA 12 bundle, which matches what
+    # `nvidia-cuda-toolkit` on Ubuntu 24.04 already provided in
+    # the v0.7.3 release flow.
     strategy:
-      # Don't cancel the surviving matrix entries when one fails
-      # — that way a CUDA 13 regression in candle-kernels doesn't
-      # block the CUDA 12 artefact from being published.
-      fail-fast: false
       matrix:
-        # Each entry selects the Containerfile's `CUDA_VERSION`
-        # build-arg, which the Containerfile maps to the matching
-        # `nvidia/cuda:X.Y.Z-cudnn-devel-ubuntu24.04` base image
-        # internally. scripts/build's six-tier CUDA resolver maps
-        # the X.Y.Z string to the highest published patch for that
-        # major.minor if the exact patch is not on Docker Hub.
-        #
-        # 13.3.0 (not 13.4.x) because cudarc 0.19.9 panics on 13.4
-        # with `Unsupported cuda toolkit version`. Bump when cudarc
-        # upstream adds 13.4 support.
-        include:
-          - cuda_version: 12.9.1
-            cuda_short: "12"
-          - cuda_version: 13.3.0
-            cuda_short: "13"
+        cuda_short: ["12"]
+        cuda_version: ["12.9.1"]
     env:
       # candle-kernels (pulled in transitively when `cuda-qwen3asr`
       # is enabled on voxora-bridge) calls `nvidia-smi` to
@@ -449,7 +441,9 @@ jobs:
           # run inside the runtime image scripts/build produced.
           # Mirrors the smoke pattern in
           # `ci.yml::containerfile-build`.
-          docker run --rm --entrypoint /bin/sh telora-daemon:latest \
+          docker run --rm --entrypoint /bin/sh \
+            -e LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64 \
+            telora-daemon:latest \
             -c 'telora-daemon --version && telora-gui --help | head -5'
 
       - name: Write .syft.yaml for SBOM source metadata
@@ -771,16 +765,12 @@ jobs:
           name: telora-release-bundle-cuda12
           path: release/cuda12/
 
-      - name: Download release bundle (cuda13)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: telora-release-bundle-cuda13
-          path: release/cuda13/
-          # If the cuda13 matrix entry failed (fail-fast: false
-          # lets the surviving entry publish) the artefact is
-          # absent; fall back to a no-op so the cuda12 release can
-          # still ship.
-          if-no-files-found: warn
+      # CUDA 13 download removed for v0.7.4: cudarc 0.19.9 (pulled in
+      # by voxora-bridge → cuda-qwen3asr → candle) does not support
+      # CUDA 13.4+, so the cuda13 matrix entry was always going to
+      # fail end-to-end. The matrix is reduced to a single cuda12
+      # entry for v0.7.4; a future release can re-add cuda13 once
+      # cudarc upstream adds 13.4+ support. Tracking issue: #183.
 
       - name: Download AUR package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -822,13 +812,6 @@ jobs:
             release/cuda12/SHA256SUMS
             release/cuda12/SHA512SUMS
             release/cuda12/telora.sbom.cdx.json
-            release/cuda13/telora-daemon
-            release/cuda13/telora-gui
-            release/cuda13/telora
-            release/cuda13/telora-models
-            release/cuda13/SHA256SUMS
-            release/cuda13/SHA512SUMS
-            release/cuda13/telora.sbom.cdx.json
             aur/*.pkg.tar.zst
           fail_on_unmatched_files: false
           # Mark this as the latest release unless the tag is a pre-release.
