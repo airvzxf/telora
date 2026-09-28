@@ -765,16 +765,12 @@ jobs:
           name: telora-release-bundle-cuda12
           path: release/cuda12/
 
-      - name: Download release bundle (cuda13)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: telora-release-bundle-cuda13
-          path: release/cuda13/
-          # If the cuda13 matrix entry failed (fail-fast: false
-          # lets the surviving entry publish) the artefact is
-          # absent; fall back to a no-op so the cuda12 release can
-          # still ship.
-          if-no-files-found: warn
+      # CUDA 13 download removed for v0.7.4: cudarc 0.19.9 (pulled in
+      # by voxora-bridge → cuda-qwen3asr → candle) does not support
+      # CUDA 13.4+, so the cuda13 matrix entry was always going to
+      # fail end-to-end. The matrix is reduced to a single cuda12
+      # entry for v0.7.4; a future release can re-add cuda13 once
+      # cudarc upstream adds 13.4+ support. Tracking issue: #183.
 
       - name: Download AUR package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -816,13 +812,6 @@ jobs:
             release/cuda12/SHA256SUMS
             release/cuda12/SHA512SUMS
             release/cuda12/telora.sbom.cdx.json
-            release/cuda13/telora-daemon
-            release/cuda13/telora-gui
-            release/cuda13/telora
-            release/cuda13/telora-models
-            release/cuda13/SHA256SUMS
-            release/cuda13/SHA512SUMS
-            release/cuda13/telora.sbom.cdx.json
             aur/*.pkg.tar.zst
           fail_on_unmatched_files: false
           # Mark this as the latest release unless the tag is a pre-release.
