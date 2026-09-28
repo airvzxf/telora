@@ -280,27 +280,19 @@ jobs:
     permissions:
       contents: read
     needs: [verify-tag-reachability, verify-tag-signature]
+    # No matrix for v0.7.4: cudarc 0.19.9 (pulled in by voxora-bridge
+    # → cuda-qwen3asr → candle) does NOT support CUDA 13.4+
+    # (`Unsupported cuda toolkit version` panic). The original
+    # CUDA 12 + CUDA 13 matrix from issue #183 is unworkable
+    # until cudarc ships 13.4 support (track upstream). Restoring
+    # the matrix is a one-line change when that lands. For now
+    # we ship a single CUDA 12 bundle, which matches what
+    # `nvidia-cuda-toolkit` on Ubuntu 24.04 already provided in
+    # the v0.7.3 release flow.
     strategy:
-      # Don't cancel the surviving matrix entries when one fails
-      # — that way a CUDA 13 regression in candle-kernels doesn't
-      # block the CUDA 12 artefact from being published.
-      fail-fast: false
       matrix:
-        # Each entry selects the Containerfile's `CUDA_VERSION`
-        # build-arg, which the Containerfile maps to the matching
-        # `nvidia/cuda:X.Y.Z-cudnn-devel-ubuntu24.04` base image
-        # internally. scripts/build's six-tier CUDA resolver maps
-        # the X.Y.Z string to the highest published patch for that
-        # major.minor if the exact patch is not on Docker Hub.
-        #
-        # 13.3.0 (not 13.4.x) because cudarc 0.19.9 panics on 13.4
-        # with `Unsupported cuda toolkit version`. Bump when cudarc
-        # upstream adds 13.4 support.
-        include:
-          - cuda_version: 12.9.1
-            cuda_short: "12"
-          - cuda_version: 13.3.0
-            cuda_short: "13"
+        cuda_short: ["12"]
+        cuda_version: ["12.9.1"]
     env:
       # candle-kernels (pulled in transitively when `cuda-qwen3asr`
       # is enabled on voxora-bridge) calls `nvidia-smi` to
