@@ -441,7 +441,9 @@ jobs:
           # run inside the runtime image scripts/build produced.
           # Mirrors the smoke pattern in
           # `ci.yml::containerfile-build`.
-          docker run --rm --entrypoint /bin/sh telora-daemon:latest \
+          docker run --rm --entrypoint /bin/sh \
+            -e LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64 \
+            telora-daemon:latest \
             -c 'telora-daemon --version && telora-gui --help | head -5'
 
       - name: Write .syft.yaml for SBOM source metadata
