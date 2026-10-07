@@ -4,12 +4,13 @@ use log::{error, info};
 use ringbuf::{HeapRb, Producer};
 use std::sync::Arc;
 
+use crate::resample::MonoResampler;
 use crate::socket::AudioConfig;
 
 /// Sample rate the downstream ASR (voxora-bridge `AsrEngine::transcribe`)
 /// and the daemon's recording buffer are sized for. The capture stream
 /// may run at a different native rate (e.g. Fifine's 48 kHz via direct
-/// ALSA); the audio thread downsamples to this rate so the ring buffer
+/// ALSA); the audio thread resamples to this rate so the ring buffer
 /// always holds audio at the rate the rest of the pipeline expects.
 ///
 /// Per `voxora-traits/src/engine.rs`: "Transcribe a buffer of mono PCM
@@ -19,36 +20,6 @@ use crate::socket::AudioConfig;
 /// rate, so the buffer MUST hold samples at this rate regardless of
 /// capture rate.
 const WHISPER_RATE_HZ: u32 = 16000;
-
-/// Push one mono frame into the ring buffer, averaging every
-/// `decimation_factor` consecutive samples first when the capture rate
-/// exceeds the target rate (i.e. `decimation_factor > 1`). The scratch
-/// buffer carries any unaligned leftovers across callbacks so a partial
-/// window at the end of one callback is completed by the next, instead
-/// of being silently dropped.
-///
-/// `decimation_factor <= 1` is a passthrough (capture already at 16 kHz
-/// or below).
-fn push_mono_decimated(
-    mono_frame: f32,
-    producer: &mut Producer<f32, Arc<HeapRb<f32>>>,
-    scratch: &mut Vec<f32>,
-    decimation_factor: usize,
-) {
-    if decimation_factor <= 1 {
-        let _ = producer.push(mono_frame);
-        return;
-    }
-    scratch.push(mono_frame);
-    if scratch.len() >= decimation_factor {
-        // Average exactly `decimation_factor` samples and reset the
-        // scratch. `drain(..)` consumes the elements; we divide by the
-        // configured factor (not `scratch.len()` post-drain, which is
-        // already 0).
-        let avg: f32 = scratch.drain(..).sum::<f32>() / decimation_factor as f32;
-        let _ = producer.push(avg);
-    }
-}
 
 pub struct AudioEngine {
     stream: Option<cpal::Stream>,
@@ -148,21 +119,16 @@ impl AudioEngine {
         // factor 1 (passthrough). Below 16 kHz capture is degenerate
         // (would force factor 0); the config preference list keeps that
         // from happening, but defend against it explicitly.
-        let decimation_factor: usize = if sample_rate >= WHISPER_RATE_HZ {
-            (sample_rate / WHISPER_RATE_HZ) as usize
-        } else {
-            1
-        };
         info!(
-            "Audio thread: capture {} Hz, downsampling to {} Hz (decimation factor {})",
-            sample_rate, WHISPER_RATE_HZ, decimation_factor
+            "Audio thread: capture {} Hz, resampling to {} Hz",
+            sample_rate, WHISPER_RATE_HZ
         );
 
         let err_fn = |err| error!("an error occurred on stream: {}", err);
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
                 device.build_input_stream(
                     &actual_config,
                     move |data: &[f32], _: &_| {
@@ -170,12 +136,9 @@ impl AudioEngine {
                         for frame in data.chunks(channels as usize) {
                             let sum: f32 = frame.iter().sum();
                             let mono = sum / channels as f32;
-                            push_mono_decimated(
-                                mono,
-                                &mut producer,
-                                &mut scratch,
-                                decimation_factor,
-                            );
+                            resampler.push(mono, |s| {
+                                let _ = producer.push(s);
+                            });
                         }
                     },
                     err_fn,
@@ -183,19 +146,16 @@ impl AudioEngine {
                 )?
             }
             cpal::SampleFormat::I16 => {
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
                 device.build_input_stream(
                     &actual_config,
                     move |data: &[i16], _: &_| {
                         for frame in data.chunks(channels as usize) {
                             let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
                             let mono = sum / channels as f32;
-                            push_mono_decimated(
-                                mono,
-                                &mut producer,
-                                &mut scratch,
-                                decimation_factor,
-                            );
+                            resampler.push(mono, |s| {
+                                let _ = producer.push(s);
+                            });
                         }
                     },
                     err_fn,
@@ -203,7 +163,7 @@ impl AudioEngine {
                 )?
             }
             cpal::SampleFormat::U16 => {
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
                 device.build_input_stream(
                     &actual_config,
                     move |data: &[u16], _: &_| {
@@ -215,12 +175,9 @@ impl AudioEngine {
                                 })
                                 .sum();
                             let mono = sum / channels as f32;
-                            push_mono_decimated(
-                                mono,
-                                &mut producer,
-                                &mut scratch,
-                                decimation_factor,
-                            );
+                            resampler.push(mono, |s| {
+                                let _ = producer.push(s);
+                            });
                         }
                     },
                     err_fn,
@@ -228,7 +185,7 @@ impl AudioEngine {
                 )?
             }
             cpal::SampleFormat::U8 => {
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
                 device.build_input_stream(
                     &actual_config,
                     move |data: &[u8], _: &_| {
@@ -240,12 +197,9 @@ impl AudioEngine {
                                 })
                                 .sum();
                             let mono = sum / channels as f32;
-                            push_mono_decimated(
-                                mono,
-                                &mut producer,
-                                &mut scratch,
-                                decimation_factor,
-                            );
+                            resampler.push(mono, |s| {
+                                let _ = producer.push(s);
+                            });
                         }
                     },
                     err_fn,
@@ -253,7 +207,7 @@ impl AudioEngine {
                 )?
             }
             cpal::SampleFormat::I32 => {
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
                 device.build_input_stream(
                     &actual_config,
                     move |data: &[i32], _: &_| {
@@ -264,12 +218,9 @@ impl AudioEngine {
                         for frame in data.chunks(channels as usize) {
                             let sum: f32 = frame.iter().map(|&s| s as f32 / i32::MAX as f32).sum();
                             let mono = sum / channels as f32;
-                            push_mono_decimated(
-                                mono,
-                                &mut producer,
-                                &mut scratch,
-                                decimation_factor,
-                            );
+                            resampler.push(mono, |s| {
+                                let _ = producer.push(s);
+                            });
                         }
                     },
                     err_fn,

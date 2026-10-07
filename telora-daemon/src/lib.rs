@@ -23,6 +23,7 @@
 pub mod socket;
 
 mod audio;
+mod resample;
 mod transcriber;
 
 // Re-export the deserialisable config types from `socket` so external
