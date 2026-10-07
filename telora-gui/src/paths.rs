@@ -28,6 +28,8 @@
 //!   4. `TELORA_PATHS__*` env vars (highest priority; same helper
 //!      the daemon uses so the separator behaviour stays in lock-step).
 
+use std::path::Path;
+
 use config::{Config, File};
 use serde::Deserialize;
 use telora_common::env::telora_env_source;
@@ -60,8 +62,16 @@ struct TeloraPathsRoot {
 /// silently swallow a malformed file — log a one-line diagnostic and
 /// fall back to defaults so the operator can still launch the GUI.
 pub fn load_paths_config() -> telora_common::paths::PathsConfig {
-    let mut builder =
-        Config::builder().add_source(File::with_name("/etc/telora.toml").required(false));
+    load_paths_config_from(Path::new(SYSTEM_CONFIG))
+}
+
+/// System-wide config file, the lowest-priority layer.
+const SYSTEM_CONFIG: &str = "/etc/telora.toml";
+
+/// [`load_paths_config`] with the system-config path injected, so tests
+/// do not depend on whatever `/etc/telora.toml` the host has.
+fn load_paths_config_from(system_cfg: &Path) -> telora_common::paths::PathsConfig {
+    let mut builder = Config::builder().add_source(File::from(system_cfg).required(false));
 
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
@@ -102,6 +112,10 @@ mod tests {
     /// `telora-common`'s `pub(crate)` lock).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Stand-in for `/etc/telora.toml` that never exists, so the host's
+    /// real system config cannot leak into these tests.
+    const NO_SYSTEM_CONFIG: &str = "/nonexistent/telora-test/telora.toml";
+
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         // Recover from poisoning — the only state we mutate is the
         // env vars themselves, which the per-test `EnvRestore` /
@@ -126,7 +140,7 @@ mod tests {
             std::env::set_var("TELORA_PATHS__SOCKET_DIR", "/tmp/override");
         }
 
-        let cfg = load_paths_config();
+        let cfg = load_paths_config_from(Path::new(NO_SYSTEM_CONFIG));
         assert_eq!(
             cfg.socket_dir.as_deref(),
             Some("/tmp/override"),
@@ -177,7 +191,7 @@ mod tests {
             std::env::set_var("HOME", &home_str);
         }
 
-        let cfg = load_paths_config();
+        let cfg = load_paths_config_from(Path::new(NO_SYSTEM_CONFIG));
         assert_eq!(
             cfg.socket_dir.as_deref(),
             Some("/tmp/from-file"),
@@ -235,7 +249,7 @@ mod tests {
             std::env::set_var("TELORA_PATHS__SOCKET_DIR", "/tmp/from-env");
         }
 
-        let cfg = load_paths_config();
+        let cfg = load_paths_config_from(Path::new(NO_SYSTEM_CONFIG));
         assert_eq!(
             cfg.socket_dir.as_deref(),
             Some("/tmp/from-env"),
@@ -277,7 +291,7 @@ mod tests {
             std::env::remove_var("TELORA_PATHS__CONTROL_SOCKET");
         }
 
-        let cfg = load_paths_config();
+        let cfg = load_paths_config_from(Path::new(NO_SYSTEM_CONFIG));
         assert!(
             cfg.socket_dir.is_none(),
             "missing files + no env vars must leave socket_dir unset (got {:?})",
@@ -332,7 +346,7 @@ mod tests {
         }
 
         // Must not panic.
-        let cfg = load_paths_config();
+        let cfg = load_paths_config_from(Path::new(NO_SYSTEM_CONFIG));
         assert!(
             cfg.socket_dir.is_none(),
             "malformed user config must fall back to defaults"
@@ -345,5 +359,53 @@ mod tests {
             cfg.control_socket.is_none(),
             "malformed user config must fall back to defaults"
         );
+    }
+    /// The system config is read, and the user config overrides it.
+    #[test]
+    fn system_config_is_read_and_user_config_overrides_it() {
+        let _guard = lock_env();
+
+        struct HomeRestore(Option<String>);
+        impl Drop for HomeRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe {
+                        std::env::set_var("HOME", v);
+                    },
+                    None => unsafe {
+                        std::env::remove_var("HOME");
+                    },
+                }
+            }
+        }
+        let prev_home = std::env::var("HOME").ok();
+        let _home_restore = HomeRestore(prev_home);
+
+        let tmp = TempDir::new().expect("tempdir");
+        let system_cfg = tmp.path().join("system.toml");
+        std::fs::write(
+            &system_cfg,
+            "[paths]\nsocket_dir = \"/tmp/from-system\"\ndaemon_socket = \"/tmp/sys.sock\"\n",
+        )
+        .expect("write system config");
+        let home = tmp.path().join("home");
+        let cfg_dir = home.join(".config").join("telora");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[paths]\nsocket_dir = \"/tmp/from-user\"\n",
+        )
+        .expect("write user config");
+
+        // SAFETY: serialised by `ENV_LOCK`.
+        unsafe {
+            std::env::set_var("HOME", home.to_str().expect("utf-8 path"));
+            std::env::remove_var("TELORA_PATHS__SOCKET_DIR");
+            std::env::remove_var("TELORA_PATHS__DAEMON_SOCKET");
+        }
+
+        let cfg = load_paths_config_from(&system_cfg);
+        assert_eq!(cfg.socket_dir.as_deref(), Some("/tmp/from-user"));
+        assert_eq!(cfg.daemon_socket.as_deref(), Some("/tmp/sys.sock"));
     }
 }
