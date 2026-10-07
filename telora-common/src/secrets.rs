@@ -298,22 +298,15 @@ mod tests {
 
     #[test]
     fn user_path_resolves_to_xdg_config_home_telora_env() {
-        // SAFETY: read-only env access; no mutation, no lock needed.
-        let original = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: mutate XDG_CONFIG_HOME for the assertion. No
-        // concurrent test reads this path (lock-free singleton
-        // derived from process env). The test does not depend on
-        // any other env-mutating test running in parallel because
-        // `user_telora_dotenv_path()` only reads XDG_CONFIG_HOME.
+        // Other tests in this module set XDG_CONFIG_HOME too, so this
+        // one must hold the lock as well.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::new();
+        // SAFETY: lock held.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", "/tmp/example-cfg");
         }
         let p = user_telora_dotenv_path().unwrap();
         assert_eq!(p, PathBuf::from("/tmp/example-cfg/telora/.env"));
-        // SAFETY: restore.
-        match original {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
     }
 }
