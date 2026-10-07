@@ -4,49 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# GPU backends are on by default so release builds (CI, Containerfile,
+# AUR) keep shipping CUDA binaries. For a CPU-only build on a host
+# without a cudarc-supported CUDA toolkit:
+#   cargo build -p telora-daemon --no-default-features
+default = ["cuda"]
+cuda = ["cuda-whisper", "cuda-qwen3asr"]
+# ggml-cuda for whisper.cpp (Pascal sm_50+).
+cuda-whisper = ["voxora-bridge/cuda-whisper"]
+# candle CUDA for qwen3-asr (needs sm_70+; older GPUs fall back to CPU
+# at runtime). `cudarc` is used directly to probe compute capability.
+cuda-qwen3asr = ["voxora-bridge/cuda-qwen3asr", "dep:cudarc"]
+
 [dependencies]
-# voxora-bridge 0.6 replaces the direct whisper-rs dependency.
-# voxora-bridge defaults to `["whisper", "qwen3asr"]`, which is
-# exactly what the daemon needs so users can switch model_kind
-# without a rebuild. voxora-bridge 0.6 also re-exports
-# `voxora_traits::*`, so the trait surface used by the daemon
-# (`AsrEngine`, `EngineFamily`, `ModelSource`, `ResolveOptions`,
-# `AsrError`, `ModelDir`) is reachable via `voxora_bridge::*`
-# without pulling the deprecated `voxora-core` shim.
-#
-# `cuda-whisper` enables ggml-cuda for whisper.cpp (Pascal sm_50+ OK).
-# `cuda-qwen3asr` enables candle's CUDA path for qwen3-asr (sm_70+ / Volta
-# or newer — candle's WMMA kernels need Volta). On older hardware the
-# qwen3-asr engine falls back to CPU at runtime; the binary keeps both
-# backends compiled in so Volta+ users get GPU acceleration out of the
-# box without editing the manifest.
-#
-# `minimax` (closes #163) re-exports `voxora-minimax 0.6.1`, the
-# first hosted-API engine adapter in the voxora workspace (closes
-# airvzxf/voxora#157 / EPIC #153). With this feature enabled the
-# daemon's `BridgeTranscriber::from_id` arm for `EngineFamily::MiniMax`
-# becomes reachable: an operator can set `model_kind = "minimax"` in
-# `telora.toml` and have the daemon POST captured audio to the
-# MiniMax `/v1/speech_to_text` endpoint using a bearer token
-# resolved via `MINIMAX_API_KEY` / `VOXORA_MINIMAX_API_KEY` /
-# `telora.toml`'s optional `minimax_api_key` field. There is no
-# GPU backend for MiniMax (compute happens server-side) and no
-# `cuda-minimax` forward — operators on low-end hardware that
-# cannot run Whisper / Qwen3-ASR locally now have an opt-in
-# hosted-API off-ramp.
-voxora-bridge = { workspace = true, features = ["cuda-whisper", "cuda-qwen3asr", "minimax"] }
-# `cudarc` is the CUDA driver binding candle-core uses under the
-# `cuda` feature. Pulled in transitively today; we re-list it here
-# directly so `transcriber::pick_qwen3asr_device` can call
-# `cudarc::driver::CudaDevice::compute_capability()` at startup
-# and force CPU when the local GPU is below candle's WMMA floor
-# (sm_70). Without this direct dep, candle-core's choice of cudarc
-# version is hidden behind a transitive pin and we would either
-# have to round-trip through candle's public API (which doesn't
-# expose compute_capability) or shell out to `nvidia-smi`. Version
-# pinned to whatever candle-core 0.9.2 currently uses; bump
-# alongside candle-core in the voxora-bump PR.
-cudarc = "0.19"
+# Default bridge features (whisper + qwen3asr) plus the hosted MiniMax engine.
+voxora-bridge = { workspace = true, features = ["minimax"] }
+cudarc = { version = "0.19", optional = true }
 # voxora-registry 0.6.x owns the canonical resolution path
 # (`Registry::resolve(&ModelId::parse(id), &opts) -> ResolvedModel`)
 # the daemon goes through so it never has to lex-sort `*.bin`
