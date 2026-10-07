@@ -59,17 +59,7 @@ The recommended way to build is using the provided script, which ensures a consi
 
 #### 3.1. Building on hosts without a CUDA-capable GPU (or below `sm_70`)
 
-The simplest option is a CPU-only daemon, which needs no CUDA toolkit
-at all (Whisper, Qwen3-ASR and MiniMax all still work, on CPU):
-
-```bash
-cargo build --release -p telora-daemon --no-default-features
-```
-
-This also avoids `cudarc`'s `Unsupported cuda toolkit version` panic
-on hosts whose CUDA toolkit is newer than `cudarc` supports.
-
-To keep GPU support instead, read on. If `cargo build --release --workspace --bins --locked` fails while
+If `cargo build --release --workspace --bins --locked` fails while
 compiling `candle-kernels v0.9.2` with a `bindgen_cuda` panic on
 the missing `nvidia-smi` binary, the build is failing before it
 ever reaches telora's source. It happens on three classes of host:
