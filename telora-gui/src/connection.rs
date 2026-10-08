@@ -76,11 +76,16 @@ impl ControlServer {
         &self.socket_path
     }
 
-    pub async fn next_command(&self) -> Result<String> {
+    /// Accept one client and read its command. The stream is returned so
+    /// the caller can write a reply.
+    pub async fn next_command(&self) -> Result<(String, UnixStream)> {
         let (mut stream, _) = self.listener.accept().await?;
         let mut buf = [0; 1024];
         let n = stream.read(&mut buf).await?;
-        Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
+        Ok((
+            String::from_utf8_lossy(&buf[..n]).trim().to_string(),
+            stream,
+        ))
     }
 }
 
