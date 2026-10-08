@@ -8,17 +8,7 @@ target/
 # Models (large files)
 models/
 
-# Local-only Cargo overrides. A `.cargo/config.toml` checked into
-# the repo is legitimate (linker config, registry aliases, build
-# flags shared across the team), but machine-specific environment
-# overrides (e.g. `CUDA_COMPUTE_CAP`, `NVCC_CCBIN`, an SSH key path
-# for a private registry) are per-developer and must not be
-# committed. We block the common offender (`config.toml`) and leave
-# the door open for project-level shared config in other files
-# inside `.cargo/` — opt in with `git add -f` if a shared one is
-# ever needed. See `CONTRIBUTING.md` "Building on hosts without
-# CUDA / below candle's WMMA floor" for the full rationale and the
-# one-liner that recreates the file locally on a Pascal laptop.
+# Per-developer Cargo env (CUDA_COMPUTE_CAP, NVCC_CCBIN, ...).
 .cargo/config.toml
 
 # IDE

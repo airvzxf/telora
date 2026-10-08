@@ -20,7 +20,6 @@ models/
 
 # Documentation & Packaging
 README.md
-CONTRIBUTING.md
 LICENSE
 Makefile
 systemd/

@@ -51,8 +51,8 @@ BIN_DIR := $(if $(filter $(words $(BINARIES)),$(words $(foreach b,$(BINARIES),$(
 
 .PHONY: audit build build-native build-release check ci clean clean-all \
         doctor fmt fmt-check help install install-systemd-user lint package \
-        reinstall run-ctl run-daemon run-gui run-models setup-env simulate \
-        test test-one uninstall uninstall-systemd-user verify
+        reinstall run-ctl run-daemon run-gui run-models  \
+        test test-one uninstall uninstall-systemd-user
 
 # ─── Utility ─────────────────────────────────────────────────────────
 ## Utility
@@ -182,15 +182,6 @@ test-one: ## Run a single test: make test-one TEST=voxora_020_resolution
 	@test -n "$(TEST)" || { echo "Usage: make test-one TEST=<name>"; exit 1; }
 	cargo test --locked --workspace $(TEST)
 
-# Note: an explicit `test-integration` target is intentionally absent.
-# The three integration tests under telora-daemon/tests/ run under
-# the plain `cargo test --workspace` invocation above; no Cargo feature
-# called `integration` gates them. `test-compat` is also absent; use
-# the `verify` target in the Compatibility section below.
-
-simulate: ## Run scripts/compatibility/simulate.sh (full stack: daemon + GUI)
-	./scripts/compatibility/simulate.sh
-
 # ─── Packaging ───────────────────────────────────────────────────────
 ## Packaging
 
@@ -273,17 +264,3 @@ run-ctl: ## cargo run -p telora-ctl (binary name is `telora`)
 
 run-models: ## cargo run -p telora-models (debug)
 	cargo run -p telora-models
-
-# Note: `run-examples` is intentionally absent. There is no
-# `examples/` directory at the workspace root nor in any member crate;
-# `cargo run --example` would fail with "no example targets". Add
-# examples before reintroducing this target.
-
-# ─── Compatibility ───────────────────────────────────────────────────
-## Compatibility
-
-setup-env: ## Install runtime dependencies for the host distro (Debian/Fedora/Arch)
-	./scripts/compatibility/setup-env.sh
-
-verify: ## Smoke-test all four binaries (scripts/compatibility/verify.sh)
-	./scripts/compatibility/verify.sh
