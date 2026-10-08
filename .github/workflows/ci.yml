@@ -25,6 +25,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,8 +48,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y \
           libasound2-dev libgtk-4-dev libgtk-4-1 \
           libwayland-dev wayland-protocols \
           meson ninja-build \
