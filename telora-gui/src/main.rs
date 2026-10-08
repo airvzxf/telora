@@ -17,12 +17,14 @@ mod connection;
 mod focus;
 mod input;
 mod paths;
+mod session;
 mod text;
 mod tray;
 mod ui;
 
 use config::GuiConfig;
 use connection::{ControlServer, SocketClient};
+use session::{Effect, Event, Session};
 use telora_common::paths::ResolvedPaths;
 use tray::{TrayCommand, TrayHandle, TrayState};
 use ui::Osd;
@@ -70,25 +72,23 @@ fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 enum AppAction {
-    ToggleRecording(String, bool), // mode, is_auto_stop
-    /// Idempotent STOP dispatched by the daemon when the recording
-    /// safety limit (`max_recording_seconds`) fires. Distinct from
-    /// `ToggleRecording` so the GUI never accidentally STARTS a new
-    /// recording in response to a duplicate `AUTO_STOP`.
-    AutoStop,
-    CancelRecording,
-    OsdUpdate(String, String), // Text, Color
-    OsdHide,
+    Event(Event),
+    QueryStatus,
 }
 
 #[derive(Debug)]
 enum DaemonCommand {
-    Start,
+    Start {
+        response_tx: Sender<AppAction>,
+    },
     Stop {
         mode: String,
         response_tx: Sender<AppAction>,
     },
     Cancel,
+    Status {
+        response_tx: Sender<AppAction>,
+    },
 }
 
 fn main() {
@@ -213,7 +213,7 @@ fn main() {
                             log::error!("Control server failed: {}", e);
                         }
                     }
-                    _ = handle_daemon_commands(daemon_rx, tx_clone, cfg_for_tokio, resolved_for_client) => {}
+                    _ = handle_daemon_commands(daemon_rx, cfg_for_tokio, resolved_for_client) => {}
                 }
             });
         });
@@ -254,16 +254,15 @@ fn main() {
                         while let Ok(cmd) = tray_cmd_rx_for_thread.recv().await {
                             let action = match cmd {
                                 TrayCommand::ToggleType | TrayCommand::MenuToggleType => {
-                                    AppAction::ToggleRecording("TYPE".to_string(), false)
+                                    AppAction::Event(Event::Toggle {
+                                        mode: "TYPE".to_string(),
+                                    })
                                 }
-                                TrayCommand::MenuToggleCopy => {
-                                    AppAction::ToggleRecording("COPY".to_string(), false)
-                                }
-                                TrayCommand::MenuCancel => AppAction::CancelRecording,
-                                TrayCommand::MenuStatus => AppAction::OsdUpdate(
-                                    "Telora — listo".to_string(),
-                                    "blue".to_string(),
-                                ),
+                                TrayCommand::MenuToggleCopy => AppAction::Event(Event::Toggle {
+                                    mode: "COPY".to_string(),
+                                }),
+                                TrayCommand::MenuCancel => AppAction::Event(Event::Cancel),
+                                TrayCommand::MenuStatus => AppAction::QueryStatus,
                                 TrayCommand::MenuQuit => {
                                     info!("Quit requested from tray menu");
                                     // Exit cleanly so systemd --user can
@@ -285,9 +284,7 @@ fn main() {
                         );
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to spawn SNI tray icon ({e}); falling back to OSD-only mode"
-                        );
+                        warn!("Failed to spawn SNI tray icon ({e}); falling back to OSD-only mode");
                     }
                 }
             });
@@ -299,101 +296,53 @@ fn main() {
         let tx_back = tx.clone();
         let tray_handle_for_loop = Arc::clone(&tray_handle_slot);
 
-        // GTK Main Loop Context
         glib::MainContext::default().spawn_local(async move {
-            let mut recording = false;
-            let mut current_mode = String::new();
-
-            // Helper closure that pushes a new `TrayState` to the
-            // ksni tray task if the handle has finished registering.
-            // The `Mutex` is held only for the duration of the read;
-            // we never block on it (the slot is written once at
-            // startup and then read on every AppAction).
             let tray_handle_clone = Arc::clone(&tray_handle_for_loop);
             let set_tray = move |state: TrayState| {
                 if let Some(handle) = tray_handle_clone.lock().unwrap().as_ref() {
                     handle.set_state(state);
                 }
             };
-
-            // Initial state: idle. The tray task may not have registered
-            // yet; in that case the call is a silent no-op.
             set_tray(TrayState::Idle);
 
+            let mut session = Session::default();
             while let Ok(action) = rx.recv().await {
-                match action {
-                    AppAction::ToggleRecording(mode, is_auto_stop) => {
-                        if !recording {
-                            // START
-                            recording = true;
-                            current_mode = mode;
-                            osd_clone.show("● GRABANDO", "red");
-                            set_tray(TrayState::Recording);
-                            let _ = daemon_tx.send(DaemonCommand::Start);
-                        } else {
-                            // STOP
-                            recording = false;
-                            if is_auto_stop {
-                                osd_clone.show("⏳ LÍMITE ALCANZADO", "orange");
-                            } else {
-                                osd_clone.show("Procesando...", "orange");
-                            }
-                            set_tray(TrayState::Processing);
-                            let _ = daemon_tx.send(DaemonCommand::Stop {
-                                mode: current_mode.clone(),
+                let event = match action {
+                    AppAction::Event(event) => event,
+                    AppAction::QueryStatus => {
+                        let _ = daemon_tx.send(DaemonCommand::Status {
+                            response_tx: tx_back.clone(),
+                        });
+                        continue;
+                    }
+                };
+                for effect in session.handle(event) {
+                    match effect {
+                        Effect::SendStart => {
+                            let _ = daemon_tx.send(DaemonCommand::Start {
                                 response_tx: tx_back.clone(),
                             });
                         }
-                    }
-                    AppAction::AutoStop => {
-                        // Idempotent STOP. Only acts when the GUI is
-                        // currently recording — duplicate `AUTO_STOP`
-                        // deliveries (network blip, retry, double
-                        // buffer flush) are no-ops. The `mode` is
-                        // recovered from `current_mode` so the daemon
-                        // still knows whether to TYPE or COPY.
-                        if recording {
-                            recording = false;
-                            osd_clone.show("⏳ LÍMITE ALCANZADO", "orange");
-                            set_tray(TrayState::Processing);
+                        Effect::SendStop { mode } => {
                             let _ = daemon_tx.send(DaemonCommand::Stop {
-                                mode: current_mode.clone(),
+                                mode,
                                 response_tx: tx_back.clone(),
                             });
                         }
-                    }
-                    AppAction::CancelRecording => {
-                        if recording {
-                            recording = false;
-                            osd_clone.show("Cancelado", "gray");
-                            set_tray(TrayState::Processing);
+                        Effect::SendCancel => {
                             let _ = daemon_tx.send(DaemonCommand::Cancel);
-                            // Delay hide
-                            let tx_inner = tx_back.clone();
-                            glib::timeout_add_seconds_local(1, move || {
-                                let _ = tx_inner.send_blocking(AppAction::OsdHide);
+                        }
+                        Effect::ShowOsd { text, color } => osd_clone.show(&text, &color),
+                        Effect::HideOsd => osd_clone.hide(),
+                        Effect::HideOsdAfter { secs, generation } => {
+                            let tx_timer = tx_back.clone();
+                            glib::timeout_add_seconds_local(secs, move || {
+                                let _ = tx_timer
+                                    .send_blocking(AppAction::Event(Event::HideOsd { generation }));
                                 glib::ControlFlow::Break
                             });
                         }
-                    }
-                    AppAction::OsdUpdate(text, color) => {
-                        if !recording {
-                            // Surface transient daemon status messages
-                            // on the tray too so the user can see them
-                            // without opening the OSD manually.
-                            if text.to_ascii_lowercase().contains("error") {
-                                set_tray(TrayState::Error);
-                            }
-                            osd_clone.show(&text, &color);
-                        }
-                    }
-                    AppAction::OsdHide => {
-                        if !recording {
-                            osd_clone.hide();
-                            // Return to the baseline Idle icon once
-                            // the OSD fades away.
-                            set_tray(TrayState::Idle);
-                        }
+                        Effect::Tray(state) => set_tray(state),
                     }
                 }
             }
@@ -405,84 +354,119 @@ fn main() {
 
 async fn handle_daemon_commands(
     mut rx: mpsc::UnboundedReceiver<DaemonCommand>,
-    _tx: Sender<AppAction>,
     gui_config: GuiConfig,
     resolved_paths: Arc<ResolvedPaths>,
 ) {
-    // Snapshot the daemon socket path once: every command in this
-    // loop connects to the same address, and threading the path
-    // through `SocketClient::send_command` lets the GUI honour
-    // `[paths] socket_dir` / `TELORA_PATHS__SOCKET_DIR` for the
-    // first time (issue #64). `PathBuf::clone` is cheap (one
-    // `Arc`-style refcount bump), so doing it at the loop top
-    // would also work; here we do it once outside the loop for a
-    // tighter borrow on `resolved_paths`.
     let daemon_sock: PathBuf = resolved_paths.daemon_sock.clone();
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            DaemonCommand::Start => {
-                let _ = SocketClient::send_command("START", &daemon_sock).await;
-            }
-            DaemonCommand::Stop { mode, response_tx } => {
-                // The STOP command now returns the transcription result directly
-                match SocketClient::send_command("STOP", &daemon_sock).await {
-                    Ok(raw_text)
-                        if !raw_text.trim().is_empty() && !raw_text.starts_with("ERROR:") =>
-                    {
-                        let cleaned = text::clean_transcription(&raw_text);
-                        let is_auto = mode == "AUTO";
-                        let paste_outcome = if mode == "TYPE" || is_auto {
-                            input::type_text(&cleaned, &gui_config)
-                        } else {
-                            input::copy_text(&cleaned);
-                            clipboard::PasteOutcome::Ok
-                        };
-
-                        if is_auto {
-                            let _ = response_tx
-                                .send(AppAction::OsdUpdate(
-                                    "⏳ LÍMITE ALCANZADO".to_string(),
-                                    "orange".to_string(),
-                                ))
-                                .await;
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        } else {
-                            let (msg, color) = outcome_osd(&paste_outcome, mode == "TYPE");
-                            let _ = response_tx.send(AppAction::OsdUpdate(msg, color)).await;
-                            let hold_secs = if paste_outcome.is_failure() { 3 } else { 1 };
-                            tokio::time::sleep(std::time::Duration::from_secs(hold_secs)).await;
-                        }
-
-                        let _ = response_tx.send(AppAction::OsdHide).await;
-                    }
-                    Ok(text) if text.starts_with("ERROR:") => {
-                        log::error!("Daemon error: {}", text);
-                        let _ = response_tx.send(AppAction::OsdHide).await;
-                    }
-                    Ok(_) => {
-                        // Empty result
-                        let _ = response_tx.send(AppAction::OsdHide).await;
+            DaemonCommand::Start { response_tx } => {
+                let event = match SocketClient::send_command("START", &daemon_sock).await {
+                    Ok(reply) if reply.starts_with("STATUS: RECORDING") => Event::StartAccepted,
+                    Ok(reply) => {
+                        log::error!("Daemon refused START: {reply}");
+                        Event::StartRejected(session::short_error(&reply))
                     }
                     Err(e) => {
-                        log::error!("Failed to get result from daemon: {}", e);
-                        let _ = response_tx.send(AppAction::OsdHide).await;
+                        log::error!("Failed to reach daemon for START: {e:#}");
+                        Event::StartRejected("Daemon no disponible".to_string())
                     }
-                }
+                };
+                let _ = response_tx.send(AppAction::Event(event)).await;
+            }
+            DaemonCommand::Stop { mode, response_tx } => {
+                let event = stop_and_deliver(&daemon_sock, &mode, &gui_config).await;
+                let _ = response_tx.send(AppAction::Event(event)).await;
             }
             DaemonCommand::Cancel => {
-                let _ = SocketClient::send_command("CANCEL", &daemon_sock).await;
+                if let Err(e) = SocketClient::send_command("CANCEL", &daemon_sock).await {
+                    log::error!("Failed to send CANCEL: {e:#}");
+                }
+            }
+            DaemonCommand::Status { response_tx } => {
+                let text = match SocketClient::send_command("STATUS", &daemon_sock).await {
+                    Ok(reply) => describe_status(&reply),
+                    Err(e) => {
+                        log::error!("Failed to reach daemon for STATUS: {e:#}");
+                        "✘ Daemon no disponible".to_string()
+                    }
+                };
+                let _ = response_tx.send(AppAction::Event(Event::Info(text))).await;
             }
         }
     }
+}
+
+/// Run STOP and hand the text to the clipboard; the returned event says
+/// what the user should see.
+async fn stop_and_deliver(daemon_sock: &Path, mode: &str, gui_config: &GuiConfig) -> Event {
+    let raw_text = match SocketClient::send_command("STOP", daemon_sock).await {
+        Ok(text) => text,
+        Err(e) => {
+            log::error!("Failed to get result from daemon: {e:#}");
+            return finished_error("Daemon no disponible");
+        }
+    };
+    if raw_text.starts_with("ERROR:") {
+        log::error!("Daemon error: {raw_text}");
+        return finished_error(&session::short_error(&raw_text));
+    }
+    if raw_text.trim().is_empty() {
+        return Event::Finished {
+            message: "Sin texto".to_string(),
+            color: session::COLOR_NEUTRAL.to_string(),
+            hold_secs: 2,
+            error: false,
+        };
+    }
+    let cleaned = text::clean_transcription(&raw_text);
+    let paste_outcome = if mode == "TYPE" {
+        input::type_text(&cleaned, gui_config)
+    } else {
+        input::copy_text(&cleaned);
+        clipboard::PasteOutcome::Ok
+    };
+    let (message, color) = outcome_osd(&paste_outcome, mode == "TYPE");
+    let failed = paste_outcome.is_failure();
+    Event::Finished {
+        message,
+        color,
+        hold_secs: if failed { 3 } else { 1 },
+        error: failed,
+    }
+}
+
+fn finished_error(reason: &str) -> Event {
+    Event::Finished {
+        message: format!("✘ {reason}"),
+        color: session::COLOR_ERROR.to_string(),
+        hold_secs: session::ERROR_HOLD_SECS,
+        error: true,
+    }
+}
+
+/// One-line daemon summary for the tray's "Show status" item.
+fn describe_status(reply: &str) -> String {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(reply) else {
+        return format!("✘ {}", session::short_error(reply));
+    };
+    let field = |key: &str| status.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+    let model = field("model_id").rsplit('/').next().unwrap_or("?");
+    let engine = match field("engine") {
+        "ready" => "listo".to_string(),
+        "loading" => "cargando modelo".to_string(),
+        other => other.to_string(),
+    };
+    format!("{model} · {engine} · {}", field("state"))
 }
 
 fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String, String) {
     match outcome {
         clipboard::PasteOutcome::Ok => {
             if is_type_mode {
-                ("Escrito".to_string(), "green".to_string())
+                ("Escrito".to_string(), session::COLOR_OK.to_string())
             } else {
-                ("Copiado".to_string(), "green".to_string())
+                ("Copiado".to_string(), session::COLOR_OK.to_string())
             }
         }
         clipboard::PasteOutcome::Partial { skipped } => {
@@ -500,7 +484,7 @@ fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String
                 // green as `Ok` so the colour does not suggest something
                 // went wrong; only the trailing '⚠ N tipos perdidos'
                 // tells the user that some clipboard content was dropped.
-                "green".to_string(),
+                session::COLOR_OK.to_string(),
             )
         }
         clipboard::PasteOutcome::FallbackSingleMime { .. } => (
@@ -543,19 +527,23 @@ async fn run_control_server(
                 match cmd.as_str() {
                     "TOGGLE_TYPE" => {
                         let _ = tx
-                            .send(AppAction::ToggleRecording("TYPE".to_string(), false))
+                            .send(AppAction::Event(Event::Toggle {
+                                mode: "TYPE".to_string(),
+                            }))
                             .await;
                     }
                     "TOGGLE_COPY" => {
                         let _ = tx
-                            .send(AppAction::ToggleRecording("COPY".to_string(), false))
+                            .send(AppAction::Event(Event::Toggle {
+                                mode: "COPY".to_string(),
+                            }))
                             .await;
                     }
                     "CANCEL" => {
-                        let _ = tx.send(AppAction::CancelRecording).await;
+                        let _ = tx.send(AppAction::Event(Event::Cancel)).await;
                     }
                     "AUTO_STOP" => {
-                        let _ = tx.send(AppAction::AutoStop).await;
+                        let _ = tx.send(AppAction::Event(Event::AutoStop)).await;
                     }
                     _ => {}
                 }
@@ -564,5 +552,27 @@ async fn run_control_server(
                 log::error!("Control server error: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_status;
+
+    #[test]
+    fn status_summary_names_model_and_engine_state() {
+        let reply = r#"{"model_id":"ggerganov/whisper.cpp/ggml-large-v3.bin","engine":"loading","state":"Idle"}"#;
+        assert_eq!(
+            describe_status(reply),
+            "ggml-large-v3.bin · cargando modelo · Idle"
+        );
+    }
+
+    #[test]
+    fn status_summary_surfaces_daemon_errors() {
+        assert_eq!(
+            describe_status("ERROR: Failed to get status"),
+            "✘ Failed to get status"
+        );
     }
 }

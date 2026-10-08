@@ -4091,6 +4091,7 @@ dependencies = [
  "ksni",
  "log",
  "serde",
+ "serde_json",
  "telora-common",
  "tempfile",
  "tokio",
