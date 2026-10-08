@@ -133,6 +133,26 @@ fn try_inherited_listener(instance_name: &str) -> Result<Option<UnixListener>> {
     }
 }
 
+/// Adopt the listening socket systemd passed via `LISTEN_FDS`, if any.
+///
+/// # Errors
+///
+/// Returns an error when the activation descriptors cannot be read.
+#[cfg(target_os = "linux")]
+pub fn adopt_systemd_listener(instance_name: &str) -> Result<Option<UnixListener>> {
+    try_inherited_listener(instance_name)
+}
+
+/// Socket activation only exists on Linux.
+///
+/// # Errors
+///
+/// Never fails on this platform.
+#[cfg(not(target_os = "linux"))]
+pub fn adopt_systemd_listener(_instance_name: &str) -> Result<Option<UnixListener>> {
+    Ok(None)
+}
+
 /// Bind a Unix stream listener at `path` with the same security
 /// guarantees the daemon's and GUI's pre-extraction bind routines
 /// shipped individually.

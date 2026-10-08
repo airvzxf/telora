@@ -1,6 +1,6 @@
 [Unit]
-Description=Telora Audio Daemon (Whisper)
-After=network.target pipewire.service telora-daemon.socket
+Description=Telora speech-to-text daemon
+After=pipewire.service telora-daemon.socket
 Wants=pipewire.service
 Requires=telora-daemon.socket
 
@@ -9,8 +9,8 @@ Type=notify
 ExecStart=/usr/bin/telora-daemon
 Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
 Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
-RuntimeDirectory=telora
-RuntimeDirectoryMode=0700
+# No RuntimeDirectory= here: it would delete the socket unit's daemon.sock
+# every time this service stops or fails to start.
 # Hardening (light, optional but recommended)
 NoNewPrivileges=true
 PrivateTmp=true

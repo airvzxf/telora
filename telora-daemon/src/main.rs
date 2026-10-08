@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use telora_common::cache::resolve_voxora_cache;
 use telora_common::env::telora_env_source;
 use telora_daemon::{
-    AudioEngine, BridgeTranscriber, Command, DaemonConfig, NoopTranscriber, SocketServer,
-    StatusResponse, SttConfig, Transcriber, paths,
+    AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
+    Transcriber, paths,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -93,19 +93,65 @@ enum State {
     Processing,
 }
 
-/// State shared between the main event loop and the REFRESH
-/// background task. Wrapped in `Arc<tokio::sync::RwLock<_>>` so the
-/// rebuild path can run on a spawned task (issue #93) while the
-/// main loop keeps `STATUS` / `START` / `STOP` responsive.
-///
-/// Atomicity contract: the engine swap and the `stt_config` mutation
-/// commit together under a single write lock — see the REFRESH
-/// handler below. While the rebuild runs, the engine is replaced by
-/// a [`NoopTranscriber`] sentinel so any in-flight transcribe call
-/// returns an empty string instead of panicking on a `None` engine.
+/// The model is loaded after the socket is ready, so the daemon can be
+/// up without a usable engine; every caller must check which case applies.
+enum Engine {
+    Loading,
+    Ready(Box<dyn Transcriber>),
+    Failed(String),
+}
+
+impl Engine {
+    fn status_label(&self) -> String {
+        match self {
+            Engine::Loading => "loading".to_string(),
+            Engine::Ready(_) => "ready".to_string(),
+            Engine::Failed(e) => format!("failed: {e}"),
+        }
+    }
+
+    /// Why START cannot proceed, or `None` when the engine is usable.
+    fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            Engine::Loading => Some("el modelo todavía se está cargando".to_string()),
+            Engine::Ready(_) => None,
+            Engine::Failed(e) => Some(format!("no se pudo cargar el modelo: {e}")),
+        }
+    }
+}
+
 struct DaemonState {
-    transcriber: Box<dyn Transcriber>,
+    engine: Engine,
     stt_config: SttConfig,
+}
+
+/// Load the engine in the background and publish the outcome into
+/// `state`. Copies the engine's resolved id/path/endpoint back into the
+/// config so STATUS shows what was actually loaded.
+fn spawn_engine_load(
+    state: Arc<RwLock<DaemonState>>,
+    config: SttConfig,
+    voxora_cache: PathBuf,
+    minimax_env_file: Option<PathBuf>,
+) {
+    tokio::spawn(async move {
+        state.write().await.engine = Engine::Loading;
+        match build_transcriber(&config, voxora_cache, minimax_env_file.as_deref()).await {
+            Ok((transcriber, model_id, path, endpoint)) => {
+                let mut s = state.write().await;
+                s.engine = Engine::Ready(transcriber);
+                s.stt_config.model_id = model_id;
+                s.stt_config.model_path = path;
+                s.stt_config.endpoint = endpoint;
+                info!("Model loaded; ready to transcribe.");
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                error!("Failed to load model: {msg}");
+                state.write().await.engine = Engine::Failed(msg);
+            }
+        }
+    });
 }
 
 /// Load and merge configuration from the four-tier cascade
@@ -329,6 +375,9 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
             "\nFull Model Id:   {}\nEngine Kind:     {}",
             status.model_id, status.model_kind
         );
+        if !status.engine.is_empty() {
+            println!("Model State:     {}", status.engine);
+        }
         if !status.endpoint.is_empty() {
             println!("Endpoint:        {}", status.endpoint);
         }
@@ -513,7 +562,7 @@ async fn main() -> Result<()> {
         }
     };
     let paths_config = daemon_cfg.paths.clone();
-    let mut stt_config = daemon_cfg.stt;
+    let stt_config = daemon_cfg.stt;
 
     // Resolve the voxora cache root. The explicit override and the
     // `VOXORA_CACHE_DIR` env var both pin a custom location; in
@@ -555,32 +604,9 @@ async fn main() -> Result<()> {
     info!("Model id:   {}", stt_config.model_id);
     info!("Language:   {}", stt_config.language);
 
-    // 1. Initialize Components — voxora engine via BridgeTranscriber.
-    // The engine and its config are bundled into a `DaemonState` and
-    // wrapped in `Arc<RwLock<_>>` so the REFRESH handler can rebuild
-    // the engine on a `tokio::spawn`'d task (issue #93) without
-    // blocking the event loop on a multi-second / multi-minute
-    // model load.
-    let (initial_transcriber, resolved_model_id, resolved_path, resolved_endpoint) =
-        build_transcriber(
-            &stt_config,
-            voxora_cache.clone(),
-            args.minimax_env_file.as_deref(),
-        )
-        .await
-        .context("Failed to load voxora engine")?;
-    // Copy the engine's authoritative values back into
-    // `stt_config` so the status display (and the REFRESH
-    // `needs_reload` comparison at the call site below) reflect
-    // what voxora actually loaded, not the operator's raw TOML
-    // input. Closes #165 / #167.
-    stt_config.model_id = resolved_model_id;
-    stt_config.model_path = resolved_path;
-    stt_config.endpoint = resolved_endpoint;
-
     let daemon_state = Arc::new(RwLock::new(DaemonState {
-        transcriber: initial_transcriber,
-        stt_config,
+        engine: Engine::Loading,
+        stt_config: stt_config.clone(),
     }));
 
     // Audio Engine initialization
@@ -612,15 +638,9 @@ async fn main() -> Result<()> {
         socket_server.run().await;
     });
 
-    // Type=notify: signal systemd that we are ready to accept
-    // connections. Without this, the unit's `Type=simple` flips
-    // `ActiveState=active` before the model has loaded and the
-    // socket has bound, opening a startup-race window where a
-    // client `telora-daemon status` reports `STOPPED` while the
-    // daemon is mid-load. The call is gated on `NOTIFY_SOCKET`
-    // (set by systemd) and `target_os = "linux"` so non-systemd
-    // invocations (development shell, CI) do not produce noisy
-    // error logs.
+    // READY=1 goes out before the model loads: loading large models can
+    // exceed systemd's start timeout, and a killed start used to leave the
+    // socket unit pointing at a deleted path.
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("NOTIFY_SOCKET").is_some()
@@ -631,6 +651,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    spawn_engine_load(
+        Arc::clone(&daemon_state),
+        stt_config,
+        voxora_cache.clone(),
+        args.minimax_env_file.clone(),
+    );
+
     // 2. Event Loop
     let mut state = State::Idle;
     let mut audio_buffer: Vec<f32> = Vec::with_capacity(16000 * 30); // Linear buffer for recording
@@ -640,7 +667,7 @@ async fn main() -> Result<()> {
     let mut pending_result: Option<String> = None;
 
     info!(
-        "System Ready. Waiting for commands on {}",
+        "Socket ready on {}; loading model in the background",
         resolved_paths.daemon_sock.display()
     );
 
@@ -674,11 +701,18 @@ async fn main() -> Result<()> {
         // Non-blocking check for commands
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                Command::Start => {
+                Command::Start { response_tx } => {
                     info!("Command: START");
-                    state = State::Recording;
-                    audio_buffer.clear();
-                    pending_result = None;
+                    let refusal = daemon_state.read().await.engine.unavailable_reason();
+                    if let Some(reason) = refusal {
+                        warn!("START refused: {reason}");
+                        let _ = response_tx.send(Err(reason));
+                    } else {
+                        state = State::Recording;
+                        audio_buffer.clear();
+                        pending_result = None;
+                        let _ = response_tx.send(Ok(()));
+                    }
                 }
                 Command::Stop { response_tx } => {
                     info!("Command: STOP");
@@ -723,6 +757,7 @@ async fn main() -> Result<()> {
                                 State::Recording => "Recording".to_string(),
                                 State::Processing => "Processing".to_string(),
                             },
+                            engine: s.engine.status_label(),
                         }
                     };
                     let _ = response_tx.send(status_resp);
@@ -747,6 +782,7 @@ async fn main() -> Result<()> {
                         let s = daemon_state.read().await;
                         new_config.model_id != s.stt_config.model_id
                             || new_config.model_kind != s.stt_config.model_kind
+                            || !matches!(s.engine, Engine::Ready(_))
                     };
                     if !needs_reload {
                         // No engine swap needed, but other fields
@@ -782,19 +818,13 @@ async fn main() -> Result<()> {
                             // new engine.
                             let new_config_for_build = new_config.clone();
 
-                            // Step 1: drop the old engine first
-                            // (#94). Installing a `NoopTranscriber`
-                            // sentinel under the write lock keeps
-                            // any in-flight `transcribe` call safe
-                            // (returns `""`) and lets `STATUS`
-                            // immediately reflect the new
-                            // `model_id` / `model_kind` the user
-                            // just asked for.
+                            // Drop the old engine before building the new
+                            // one so both never sit in (V)RAM at once.
                             {
                                 let mut s = daemon_state_bg.write().await;
-                                s.transcriber = Box::new(NoopTranscriber);
+                                s.engine = Engine::Loading;
                                 s.stt_config = new_config;
-                            } // old engine dropped here, lock released
+                            }
 
                             // Step 2: build the new engine outside
                             // the lock. This is the multi-second /
@@ -815,7 +845,7 @@ async fn main() -> Result<()> {
                                     resolved_endpoint,
                                 )) => {
                                     let mut s = daemon_state_bg.write().await;
-                                    s.transcriber = new_transcriber;
+                                    s.engine = Engine::Ready(new_transcriber);
                                     // Closes #165 / #167: copy the
                                     // engine's authoritative
                                     // model_id / resolved_path /
@@ -830,13 +860,12 @@ async fn main() -> Result<()> {
                                     let _ = response_tx.send(Ok(()));
                                 }
                                 Err(e) => {
-                                    error!("Failed to reload transcriber: {}", e);
+                                    let msg = format!("{e:#}");
+                                    error!("Failed to reload transcriber: {msg}");
+                                    daemon_state_bg.write().await.engine =
+                                        Engine::Failed(msg.clone());
                                     let _ = response_tx
-                                        .send(Err(anyhow::anyhow!("Failed to load model: {}", e)));
-                                    // `NoopTranscriber` stays in
-                                    // place — the daemon still
-                                    // answers STATUS and
-                                    // transcribe (returns "").
+                                        .send(Err(anyhow::anyhow!("Failed to load model: {msg}")));
                                 }
                             }
                         });
@@ -891,21 +920,23 @@ async fn main() -> Result<()> {
                 warn!("Audio buffer empty, skipping transcription.");
                 "".to_string()
             } else {
-                // Read-lock just for the transcribe call. The guard
-                // is dropped at the end of the `match` because
-                // `transcribe` is fully synchronous (no `.await`
-                // inside) — that is what lets the spawned REFRESH
-                // task take a write lock between transcribe calls
-                // without deadlocking the read guard.
                 let s = daemon_state.read().await;
-                match s
-                    .transcriber
-                    .transcribe(&audio_buffer, Some(&s.stt_config.language))
-                {
-                    Ok(text) => text,
-                    Err(e) => {
-                        error!("Transcription failed: {}", e);
-                        format!("ERROR: {}", e)
+                match &s.engine {
+                    Engine::Ready(t) => {
+                        match t.transcribe(&audio_buffer, Some(&s.stt_config.language)) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                error!("Transcription failed: {}", e);
+                                format!("ERROR: {}", e)
+                            }
+                        }
+                    }
+                    other => {
+                        let reason = other
+                            .unavailable_reason()
+                            .unwrap_or_else(|| "modelo no disponible".to_string());
+                        error!("Recording discarded: {reason}");
+                        format!("ERROR: {reason}")
                     }
                 }
             };

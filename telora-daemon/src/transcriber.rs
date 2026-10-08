@@ -66,28 +66,6 @@ pub trait Transcriber: Send + Sync {
     fn transcribe(&self, audio_data: &[f32], language: Option<&str>) -> Result<String>;
 }
 
-/// No-op transcriber used as a sentinel during REFRESH. While the
-/// daemon drops the old engine and waits for the new one, the
-/// `Processing` branch of the event loop can still fire (e.g. a
-/// STOP that arrived in the swap window); this stub returns an
-/// empty string so the daemon stays processable instead of
-/// panicking on a `None` engine.
-///
-/// Also used as the install-target when a REFRESH starts: the
-/// main loop takes a write lock, replaces the live engine with
-/// `NoopTranscriber`, drops the lock, then awaits `build_transcriber`
-/// in the spawned task before committing the real engine. That
-/// keeps the swap window bounded by `max(old, new) + build_scratch`
-/// instead of `old + new + build_scratch` (#94).
-#[derive(Debug, Default)]
-pub struct NoopTranscriber;
-
-impl Transcriber for NoopTranscriber {
-    fn transcribe(&self, _audio_data: &[f32], _language: Option<&str>) -> Result<String> {
-        Ok(String::new())
-    }
-}
-
 /// voxora-backed transcriber.
 ///
 /// Holds `Arc<dyn AsrEngine>` so the same instance can be shared

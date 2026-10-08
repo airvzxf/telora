@@ -43,4 +43,4 @@ pub use paths::{
     resolve,
 };
 pub use secrets::{resolve_minimax_api_key, system_telora_dotenv_path, user_telora_dotenv_path};
-pub use socket_bind::{bind_unix_socket, bind_unix_socket_manual};
+pub use socket_bind::{adopt_systemd_listener, bind_unix_socket, bind_unix_socket_manual};

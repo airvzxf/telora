@@ -215,10 +215,33 @@ async fn start_dispatches_command_start_and_replies_recording() {
     let (server, mut cmd_rx) = spawn_server();
     let sock_path = server.sock_path().to_path_buf();
     let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
-    let cmd = cmd_rx.recv().await.expect("command");
-    assert!(matches!(cmd, Command::Start));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
+        other => panic!("expected Command::Start, got {other:?}"),
+    }
     let response = client_task.await.expect("client task");
     assert_eq!(response, b"STATUS: RECORDING");
+}
+
+/// Catches the GUI showing "recording" while no model can transcribe:
+/// a refused START must reach the client as an `ERROR:` reply.
+#[tokio::test(flavor = "current_thread")]
+async fn start_refused_by_event_loop_replies_error() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (server, mut cmd_rx) = spawn_server();
+    let sock_path = server.sock_path().to_path_buf();
+    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
+    match cmd_rx.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx
+            .send(Err("el modelo todavía se está cargando".to_string()))
+            .expect("refuse start"),
+        other => panic!("expected Command::Start, got {other:?}"),
+    }
+    let response = client_task.await.expect("client task");
+    assert_eq!(
+        String::from_utf8(response).unwrap(),
+        "ERROR: el modelo todavía se está cargando"
+    );
 }
 
 /// `CANCEL` must dispatch [`Command::Cancel`] and reply
@@ -285,6 +308,7 @@ async fn status_returns_serialised_status_response() {
         language: "es".to_string(),
         max_recording_seconds: 600,
         state: "Idle".to_string(),
+        engine: "loading".to_string(),
     };
     response_tx.send(expected).expect("send status");
     let response = client_task.await.expect("client task");
@@ -294,6 +318,7 @@ async fn status_returns_serialised_status_response() {
     assert_eq!(parsed.state, "Idle");
     assert_eq!(parsed.pid, 4242);
     assert_eq!(parsed.language, "es");
+    assert_eq!(parsed.engine, "loading");
 }
 
 /// `REFRESH {json}` must parse the JSON, dispatch
@@ -556,8 +581,10 @@ async fn second_bind_takes_over_the_path() {
     let sock_path_for_client = sock_path.clone();
     let client_task =
         tokio::spawn(async move { round_trip(&sock_path_for_client, b"START").await });
-    let cmd = cmd_rx2.recv().await.expect("command");
-    assert!(matches!(cmd, Command::Start));
+    match cmd_rx2.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
+        other => panic!("expected Command::Start, got {other:?}"),
+    }
     let response = client_task.await.expect("client task");
     assert_eq!(response, b"STATUS: RECORDING");
     drop(server2);
@@ -685,8 +712,10 @@ async fn lifecycle_resolve_picks_xdg_socket_dir() {
     let (server, mut cmd_rx) = spawn_server_at(&resolved.daemon_sock);
     let sock_path = resolved.daemon_sock.clone();
     let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
-    let cmd = cmd_rx.recv().await.expect("command");
-    assert!(matches!(cmd, Command::Start));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
+        other => panic!("expected Command::Start, got {other:?}"),
+    }
     let response = client_task.await.expect("client task");
     assert_eq!(response, b"STATUS: RECORDING");
 
