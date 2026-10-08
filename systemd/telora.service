@@ -17,12 +17,9 @@ Type=simple
 Environment=GSK_RENDERER=gl
 Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
 Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
-# Keep the runtime directory alive while the GUI is running so the
-# control socket stays reachable even if `telora-daemon.socket` is stopped.
-# The daemon service and socket unit declare the same directory; systemd
-# joins them into one owned by the same UID when the first unit starts.
-RuntimeDirectory=telora
-RuntimeDirectoryMode=0700
+# No RuntimeDirectory= here: systemd deletes a service's RuntimeDirectory
+# when the service stops, which would also delete the daemon socket that
+# telora-daemon.socket owns. The GUI creates %t/telora itself if missing.
 ExecStart=/usr/bin/telora-gui
 Restart=on-failure
 RestartSec=5

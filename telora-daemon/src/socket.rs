@@ -2,7 +2,7 @@ use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use telora_common::socket_bind::{bind_unix_socket, bind_unix_socket_manual};
+use telora_common::socket_bind::{adopt_systemd_listener, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -38,6 +38,9 @@ pub struct StatusResponse {
     pub language: String,
     pub max_recording_seconds: u32,
     pub state: String,
+    /// `loading`, `ready` or `failed: <reason>`.
+    #[serde(default)]
+    pub engine: String,
 }
 
 /// Configuration the daemon reads from `telora.toml` (or
@@ -191,7 +194,10 @@ pub fn default_stt_config() -> SttConfig {
 
 #[derive(Debug)]
 pub enum Command {
-    Start,
+    /// Answered with `Err(reason)` when no model is ready to transcribe.
+    Start {
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
     Stop {
         response_tx: oneshot::Sender<String>,
     },
@@ -221,6 +227,9 @@ pub struct SocketServer {
     /// already cleans up; the `Drop` impl tolerates the resulting
     /// `NotFound` so the double-cleanup is harmless.
     socket_path: PathBuf,
+    /// True when the listener came from systemd: the socket unit owns
+    /// the path, so dropping the server must not unlink it.
+    inherited: bool,
 }
 
 impl SocketServer {
@@ -238,15 +247,21 @@ impl SocketServer {
         cmd_tx: mpsc::Sender<Command>,
         allow_activation: bool,
     ) -> Result<Self> {
-        let listener = if allow_activation {
-            bind_unix_socket(path, "telora-daemon")?
+        let inherited_listener = if allow_activation {
+            adopt_systemd_listener("telora-daemon")?
         } else {
-            bind_unix_socket_manual(path, "telora-daemon")?
+            None
+        };
+        let inherited = inherited_listener.is_some();
+        let listener = match inherited_listener {
+            Some(listener) => listener,
+            None => bind_unix_socket_manual(path, "telora-daemon")?,
         };
         Ok(Self {
             listener,
             cmd_tx,
             socket_path: path.to_path_buf(),
+            inherited,
         })
     }
 
@@ -341,15 +356,20 @@ impl SocketServer {
 
                                 match command_str.as_str() {
                                     "START" => {
-                                        if let Err(e) = cmd_tx.send(Command::Start).await {
+                                        let (tx, rx) = oneshot::channel();
+                                        let reply = if let Err(e) =
+                                            cmd_tx.send(Command::Start { response_tx: tx }).await
+                                        {
                                             error!("Failed to send start command: {}", e);
-                                            let _ = stream
-                                                .write_all(b"ERROR: Internal channel error")
-                                                .await;
+                                            "ERROR: Internal channel error".to_string()
                                         } else {
-                                            let _ =
-                                                write_half.write_all(b"STATUS: RECORDING").await;
-                                        }
+                                            match rx.await {
+                                                Ok(Ok(())) => "STATUS: RECORDING".to_string(),
+                                                Ok(Err(reason)) => format!("ERROR: {reason}"),
+                                                Err(_) => "ERROR: Start cancelled".to_string(),
+                                            }
+                                        };
+                                        let _ = write_half.write_all(reply.as_bytes()).await;
                                     }
                                     "STOP" => {
                                         let (tx, rx) = oneshot::channel();
@@ -408,17 +428,6 @@ impl SocketServer {
                                             write_half.write_all(b"ERROR: Unknown command").await;
                                     }
                                 };
-
-                                // TODO: Implementing full bidirectional wait for transcription is tricky here without a shared state or response channel.
-                                // Architecture: the main loop already
-                                // routes every command through a
-                                // oneshot response channel; this
-                                // socket task just sends the command
-                                // and writes the result back to the
-                                // stream. The skeleton below is no
-                                // longer aspirational — STOP /
-                                // STATUS / REFRESH all follow this
-                                // pattern.
                             }
                             Err(e) => error!("Failed to read from socket: {}", e),
                         }
@@ -431,21 +440,13 @@ impl SocketServer {
 }
 
 impl Drop for SocketServer {
-    /// Best-effort unlink on drop so a `Ctrl-C` in a development
-    /// shell, a panic, or any other non-systemd shutdown path does
-    /// not leave a stale socket file behind. The next start will
-    /// usually succeed anyway (the bind helper's
-    /// `remove_stale_socket` cleans up same-UID leftovers), but a
-    /// debris-free `/run/user/<uid>/telora/` is the operator-facing
-    /// hygiene goal.
-    ///
-    /// Field drop order matters: `listener` drops before
-    /// `socket_path` (fields are dropped top-to-bottom), so the FD
-    /// is closed and the kernel stops holding the inode before we
-    /// attempt the unlink. The systemd-managed path (`Accept=no`)
-    /// has already cleaned the file via `RemoveOnStop=yes`, so a
-    /// `NotFound` here is expected and not logged as a warning.
+    /// Unlink a socket we bound ourselves so a dev-shell Ctrl-C leaves no
+    /// debris. A systemd-inherited socket belongs to the socket unit:
+    /// unlinking it would leave the unit listening on an unreachable path.
     fn drop(&mut self) {
+        if self.inherited {
+            return;
+        }
         match std::fs::remove_file(&self.socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
