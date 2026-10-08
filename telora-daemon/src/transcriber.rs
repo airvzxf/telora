@@ -327,18 +327,31 @@ impl BridgeTranscriber {
                 // forward-compat PTX in addition to SASS.
                 let device = pick_qwen3asr_device();
                 let engine = if device.is_cpu() {
-                    // CPU path: bypass voxora's `from_hf` (which
-                    // always calls `best_device()` and would re-pick
-                    // CUDA) and use `load_with_device` directly.
-                    // voxora's tokenizer-synthesis step is private
-                    // to voxora-qwen3asr; calling `from_hf` once
-                    // writes `tokenizer.json` to disk before
-                    // attempting the engine load, so even if the
-                    // CUDA load fails on this host the cache is
-                    // shaped correctly for the CPU retry.
-                    let _ =
-                        voxora_bridge::QwenAsrEngine::from_hf(hf_source.as_ref(), model_id, &opts)
-                            .await;
+                    // CPU path: `from_hf` always loads on
+                    // `best_device()`, so load with `load_with_device`.
+                    // The official HF snapshot has no `tokenizer.json`,
+                    // and the voxora 0.6 release we depend on only
+                    // synthesises it inside `from_hf`. So on the first
+                    // run (file missing) we still call `from_hf` for that
+                    // side effect, which costs one throwaway load; once
+                    // the file exists we skip it. Switch to
+                    // `QwenAsrEngine::from_hf_with_device` once a voxora
+                    // release ships it (airvzxf/voxora#249).
+                    if !dir.path.join("tokenizer.json").is_file() {
+                        info!(
+                            "qwen3-asr: tokenizer.json missing; one-off preparation load \
+                             before loading on CPU"
+                        );
+                        if let Err(e) = voxora_bridge::QwenAsrEngine::from_hf(
+                            hf_source.as_ref(),
+                            model_id,
+                            &opts,
+                        )
+                        .await
+                        {
+                            log::warn!("qwen3-asr preparation load failed (continuing): {e}");
+                        }
+                    }
                     voxora_bridge::QwenAsrEngine::load_with_device(&dir.path, device).with_context(
                         || format!("failed to load Qwen3-ASR engine for {model_id:?}"),
                     )?
