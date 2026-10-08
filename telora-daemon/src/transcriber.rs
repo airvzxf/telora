@@ -45,8 +45,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "cuda-qwen3asr")]
 use cudarc::driver::CudaContext;
-use log::{info, warn};
+use log::info;
 use voxora_bridge::{
     AsrEngine, Device, EngineFamily, HuggingFaceSource, MiniMaxConfig, MiniMaxEngine, ModelSource,
     ResolveOptions, TranscribeOptions, WhisperEngine,
@@ -605,6 +606,7 @@ fn refuse_if_symlink(p: &Path) -> Result<()> {
 /// - the GPU's compute capability is below sm_70,
 /// - the device creation succeeds but `Device::new_cuda(0)` later
 ///   fails (out of VRAM, exclusivity conflict, etc.).
+#[cfg(feature = "cuda-qwen3asr")]
 fn pick_qwen3asr_device() -> Device {
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
@@ -616,7 +618,7 @@ fn pick_qwen3asr_device() -> Device {
     let (major, minor) = match ctx.compute_capability() {
         Ok(cc) => cc,
         Err(e) => {
-            warn!(
+            log::warn!(
                 "could not query local CUDA compute capability ({e}); \
                  qwen3-asr will use CPU"
             );
@@ -624,7 +626,7 @@ fn pick_qwen3asr_device() -> Device {
         }
     };
     if major < 7 {
-        warn!(
+        log::warn!(
             "local GPU compute capability is sm_{major}.{minor}, below candle's WMMA \
              BF16 floor (sm_70 / Volta); forcing CPU for qwen3-asr. The CI-built \
              telora-daemon binary embeds sm_80 SASS for qwen3-asr's CUDA path that \
@@ -641,12 +643,18 @@ fn pick_qwen3asr_device() -> Device {
     // compute_capability, in which case we fall back to CPU rather
     // than propagate the error.
     Device::new_cuda(0).unwrap_or_else(|e| {
-        warn!(
+        log::warn!(
             "local GPU is sm_{major}.{minor} but Device::new_cuda(0) failed ({e}); \
              qwen3-asr will use CPU"
         );
         Device::Cpu
     })
+}
+
+/// CPU-only build: qwen3-asr has no GPU backend compiled in.
+#[cfg(not(feature = "cuda-qwen3asr"))]
+fn pick_qwen3asr_device() -> Device {
+    Device::Cpu
 }
 
 #[cfg(test)]
