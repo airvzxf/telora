@@ -26,9 +26,7 @@ pub enum Phase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Toggle {
-        mode: String,
-    },
+    Toggle,
     AutoStop,
     Cancel,
     StartAccepted,
@@ -51,9 +49,7 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendStart,
-    SendStop {
-        mode: String,
-    },
+    SendStop,
     SendCancel,
     ShowOsd {
         text: String,
@@ -71,7 +67,6 @@ pub enum Effect {
 #[derive(Debug)]
 pub struct Session {
     phase: Phase,
-    mode: String,
     /// Bumped on every OSD change so stale hide timers do nothing.
     osd_generation: u64,
     /// Keep the tray in `Error` after the OSD fades, until the next action.
@@ -82,7 +77,6 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             phase: Phase::Idle,
-            mode: String::new(),
             osd_generation: 0,
             last_was_error: false,
         }
@@ -97,13 +91,12 @@ impl Session {
 
     pub fn handle(&mut self, event: Event) -> Vec<Effect> {
         match (self.phase, event) {
-            (Phase::Idle, Event::Toggle { mode }) => {
+            (Phase::Idle, Event::Toggle) => {
                 self.phase = Phase::Starting;
-                self.mode = mode;
                 self.last_was_error = false;
                 vec![Effect::SendStart]
             }
-            (Phase::Recording, Event::Toggle { .. }) => self.stop("Procesando..."),
+            (Phase::Recording, Event::Toggle) => self.stop("Procesando..."),
             (Phase::Recording, Event::AutoStop) => self.stop("⏳ LÍMITE ALCANZADO"),
             (Phase::Starting, Event::StartAccepted) => {
                 self.phase = Phase::Recording;
@@ -170,9 +163,7 @@ impl Session {
         self.phase = Phase::Processing;
         let mut effects = self.show(label, COLOR_BUSY);
         effects.push(Effect::Tray(TrayState::Processing));
-        effects.push(Effect::SendStop {
-            mode: self.mode.clone(),
-        });
+        effects.push(Effect::SendStop);
         effects
     }
 
@@ -216,9 +207,7 @@ mod tests {
     use super::*;
 
     fn toggle() -> Event {
-        Event::Toggle {
-            mode: "COPY".to_string(),
-        }
+        Event::Toggle
     }
 
     fn sends_start(effects: &[Effect]) -> bool {
@@ -293,9 +282,7 @@ mod tests {
         s.handle(toggle());
         s.handle(Event::StartAccepted);
         let effects = s.handle(toggle());
-        assert!(effects.contains(&Effect::SendStop {
-            mode: "COPY".into()
-        }));
+        assert!(effects.contains(&Effect::SendStop));
         let effects = s.handle(Event::Finished {
             message: "Copiado".into(),
             color: COLOR_OK.into(),
