@@ -1,11 +1,11 @@
-use anyhow::Context;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use telora_common::paths::control_socket_path;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
-
-use log::info;
 
 #[derive(Parser)]
 #[command(author, version, about = "Telora CLI - Control client", long_about = None)]
@@ -16,47 +16,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Toggle recording and type the result
-    ToggleType,
-    /// Toggle recording and copy the result to clipboard
+    /// Start recording, or stop it and copy the transcription to the clipboard
+    #[command(alias = "toggle")]
     ToggleCopy,
-    /// Cancel current recording
+    /// Cancel the current recording
     Cancel,
+    /// Copy the last transcription to the clipboard again
+    Last,
 }
 
-async fn send_control_command(cmd: &str) -> anyhow::Result<()> {
+async fn send_control_command(cmd: &str) -> anyhow::Result<String> {
     let mut stream = UnixStream::connect(control_socket_path())
         .await
-        .context("Failed to connect to control socket (is the GUI running?)")?;
+        .context("Failed to connect to control socket (is telora-gui running?)")?;
     stream
         .write_all(cmd.as_bytes())
         .await
         .context("Failed to send control command")?;
-    Ok(())
+    stream.shutdown().await.ok();
+    let mut reply = String::new();
+    // Older GUIs close without replying; treat a silent close as success.
+    let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_string(&mut reply)).await;
+    Ok(reply)
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
-
-    let cmd_str = match cli.command {
-        Commands::ToggleType => "TOGGLE_TYPE",
+    let cmd = match Cli::parse().command {
         Commands::ToggleCopy => "TOGGLE_COPY",
         Commands::Cancel => "CANCEL",
+        Commands::Last => "LAST",
     };
 
-    let rt = Runtime::new().expect("Failed to create Tokio runtime");
-    rt.block_on(async {
-        match send_control_command(cmd_str).await {
-            Ok(()) => {
-                info!("Command '{cmd_str}' sent successfully.");
-                Ok(())
-            }
-            Err(e) => {
-                log::error!("Failed to send command: {e}");
-                Err(e)
-            }
-        }
-    })
+    let rt = Runtime::new().context("Failed to create Tokio runtime")?;
+    let reply = rt.block_on(send_control_command(cmd))?;
+    if let Some(reason) = reply.strip_prefix("ERROR:") {
+        bail!("{}", reason.trim());
+    }
+    log::info!("Command '{cmd}' sent.");
+    Ok(())
 }
