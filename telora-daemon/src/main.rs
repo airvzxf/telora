@@ -5,7 +5,6 @@ use log::{error, info, warn};
 use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use telora_common::cache::resolve_voxora_cache;
 use telora_common::env::telora_env_source;
 use telora_daemon::{
@@ -16,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 async fn notify_client_auto_stop(control_socket: &str) {
     if let Ok(mut stream) = UnixStream::connect(control_socket).await {
@@ -97,7 +96,7 @@ enum State {
 /// up without a usable engine; every caller must check which case applies.
 enum Engine {
     Loading,
-    Ready(Box<dyn Transcriber>),
+    Ready(Arc<dyn Transcriber>),
     Failed(String),
 }
 
@@ -412,7 +411,7 @@ async fn build_transcriber(
     config: &SttConfig,
     voxora_cache: std::path::PathBuf,
     minimax_env_file: Option<&std::path::Path>,
-) -> Result<(Box<dyn Transcriber>, String, String, String)> {
+) -> Result<(Arc<dyn Transcriber>, String, String, String)> {
     let kind = voxora_bridge::EngineFamily::from_config(&config.model_kind).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown model_kind {:?}; expected one of `whisper`, `qwen3-asr`, or `minimax`",
@@ -435,7 +434,7 @@ async fn build_transcriber(
     let resolved_path = bridge.resolved_path().to_string();
     let resolved_endpoint = bridge.endpoint().to_string();
     Ok((
-        Box::new(bridge),
+        Arc::new(bridge),
         resolved_model_id,
         resolved_path,
         resolved_endpoint,
@@ -658,27 +657,9 @@ async fn main() -> Result<()> {
         args.minimax_env_file.clone(),
     );
 
-    // 2. Event Loop
-    let mut state = State::Idle;
-    let mut audio_buffer: Vec<f32> = Vec::with_capacity(16000 * 30); // Linear buffer for recording
-    let chunk_size = 512;
-    let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_size);
-    let mut response_tx_opt: Option<oneshot::Sender<String>> = None;
-    let mut pending_result: Option<String> = None;
-
-    info!(
-        "Socket ready on {}; loading model in the background",
-        resolved_paths.daemon_sock.display()
-    );
-
-    // Graceful shutdown: systemd sends SIGTERM on
-    // `systemctl --user stop telora-daemon.socket`; without a handler the
-    // loop dies abruptly with no log and no chance to drop the audio
-    // engine or socket server cleanly. SIGINT lets Ctrl-C in a dev shell
-    // do the same.
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Graceful shutdown on SIGTERM (systemd) and SIGINT (dev shell).
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     {
-        let shutdown_signal = Arc::clone(&shutdown);
         let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
         tokio::spawn(async move {
@@ -686,28 +667,46 @@ async fn main() -> Result<()> {
                 _ = sigterm.recv() => info!("Received SIGTERM; initiating graceful shutdown"),
                 _ = sigint.recv()  => info!("Received SIGINT; initiating graceful shutdown"),
             }
-            shutdown_signal.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(true);
         });
     }
 
-    loop {
-        // Check shutdown flag at every tick (idle tick is 5 ms) so SIGTERM
-        // and SIGINT from systemd / Ctrl-C drain the loop promptly.
-        if shutdown.load(Ordering::SeqCst) {
-            info!("Shutdown flag set; exiting event loop");
-            break;
-        }
+    info!(
+        "Socket ready on {}; loading model in the background",
+        resolved_paths.daemon_sock.display()
+    );
 
-        // Non-blocking check for commands
-        if let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
+    let mut state = State::Idle;
+    let mut audio_buffer: Vec<f32> = Vec::new();
+    let mut response_tx_opt: Option<oneshot::Sender<String>> = None;
+    let mut pending_result: Option<String> = None;
+    // Transcription runs on a blocking thread; results carry the job id so
+    // a cancelled job's late result is dropped.
+    let (result_tx, mut result_rx) = mpsc::channel::<(u64, String)>(4);
+    let mut job_id: u64 = 0;
+    let mut audio_tick = tokio::time::interval(Duration::from_millis(20));
+    audio_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("Shutdown requested; exiting event loop");
+                break;
+            }
+            Some(cmd) = cmd_rx.recv() => match cmd {
                 Command::Start { response_tx } => {
                     info!("Command: START");
-                    let refusal = daemon_state.read().await.engine.unavailable_reason();
+                    let refusal = if state == State::Processing {
+                        Some("todavía se está transcribiendo la grabación anterior".to_string())
+                    } else {
+                        daemon_state.read().await.engine.unavailable_reason()
+                    };
                     if let Some(reason) = refusal {
                         warn!("START refused: {reason}");
                         let _ = response_tx.send(Err(reason));
                     } else {
+                        // Drop audio captured before START.
+                        while consumer.pop().is_some() {}
                         state = State::Recording;
                         audio_buffer.clear();
                         pending_result = None;
@@ -718,241 +717,276 @@ async fn main() -> Result<()> {
                     info!("Command: STOP");
                     match state {
                         State::Recording => {
+                            drain_audio(&mut consumer, &mut audio_buffer, usize::MAX);
+                            response_tx_opt = Some(response_tx);
+                            job_id += 1;
+                            start_transcription(
+                                &daemon_state,
+                                std::mem::take(&mut audio_buffer),
+                                job_id,
+                                result_tx.clone(),
+                            )
+                            .await;
                             state = State::Processing;
-                            response_tx_opt = Some(response_tx);
                         }
-                        State::Processing => {
-                            response_tx_opt = Some(response_tx);
-                        }
+                        State::Processing => response_tx_opt = Some(response_tx),
                         State::Idle => {
-                            if let Some(res) = pending_result.take() {
-                                let _ = response_tx.send(res);
-                            } else {
-                                let _ = response_tx.send("".to_string());
-                            }
+                            let _ = response_tx.send(pending_result.take().unwrap_or_default());
                         }
                     }
                 }
                 Command::Cancel => {
                     info!("Command: CANCEL");
+                    if state == State::Processing {
+                        job_id += 1;
+                        if let Some(tx) = response_tx_opt.take() {
+                            let _ = tx.send("ERROR: transcripción cancelada".to_string());
+                        }
+                    }
                     state = State::Idle;
                     audio_buffer.clear();
                     response_tx_opt = None;
                     pending_result = None;
                 }
                 Command::GetStatus { response_tx } => {
-                    let status_resp = {
-                        let s = daemon_state.read().await;
-                        StatusResponse {
-                            active: true,
-                            pid: std::process::id(),
-                            model_id: s.stt_config.model_id.clone(),
-                            model_kind: s.stt_config.model_kind.clone(),
-                            model_path: s.stt_config.model_path.clone(),
-                            endpoint: s.stt_config.endpoint.clone(),
-                            language: s.stt_config.language.clone(),
-                            max_recording_seconds: s.stt_config.max_recording_seconds,
-                            state: match state {
-                                State::Idle => "Idle".to_string(),
-                                State::Recording => "Recording".to_string(),
-                                State::Processing => "Processing".to_string(),
-                            },
-                            engine: s.engine.status_label(),
-                        }
-                    };
-                    let _ = response_tx.send(status_resp);
+                    let s = daemon_state.read().await;
+                    let _ = response_tx.send(StatusResponse {
+                        active: true,
+                        pid: std::process::id(),
+                        model_id: s.stt_config.model_id.clone(),
+                        model_kind: s.stt_config.model_kind.clone(),
+                        model_path: s.stt_config.model_path.clone(),
+                        endpoint: s.stt_config.endpoint.clone(),
+                        language: s.stt_config.language.clone(),
+                        max_recording_seconds: s.stt_config.max_recording_seconds,
+                        state: match state {
+                            State::Idle => "Idle".to_string(),
+                            State::Recording => "Recording".to_string(),
+                            State::Processing => "Processing".to_string(),
+                        },
+                        engine: s.engine.status_label(),
+                    });
                 }
-                Command::ReloadConfig {
-                    new_config,
-                    response_tx,
-                } => {
-                    info!(
-                        "Command: REFRESH (model_kind={} model_id={})",
-                        new_config.model_kind, new_config.model_id
-                    );
-                    // Atomicity contract (issue #93): the engine
-                    // swap and the `stt_config` mutation commit
-                    // together under the same `RwLock` write guard.
-                    // Cheap path (no model change) commits the
-                    // config delta inline; needs-reload path
-                    // `tokio::spawn`s the rebuild so the main loop
-                    // keeps ticking through the multi-second /
-                    // multi-minute engine load.
-                    let needs_reload = {
-                        let s = daemon_state.read().await;
-                        new_config.model_id != s.stt_config.model_id
-                            || new_config.model_kind != s.stt_config.model_kind
-                            || !matches!(s.engine, Engine::Ready(_))
-                    };
-                    if !needs_reload {
-                        // No engine swap needed, but other fields
-                        // (language, max_recording_seconds) still
-                        // need to take effect. The new config is
-                        // safe to commit because no engine load
-                        // happened.
-                        let mut s = daemon_state.write().await;
-                        s.stt_config = new_config;
-                        info!("Configuration updated (no model change).");
-                        let _ = response_tx.send(Ok(()));
-                    } else {
-                        // Hand the rebuild off to a spawned task so
-                        // the event loop keeps draining commands
-                        // (STATUS / START / STOP) while the new
-                        // engine loads. The `oneshot::Sender`
-                        // survives the move — it is `Send + 'static`
-                        // — so the socket handler's `rx.await` sees
-                        // the result when this task eventually fires
-                        // `.send(Ok(()))` or drops the sender.
-                        let daemon_state_bg = Arc::clone(&daemon_state);
-                        let voxora_cache_bg = voxora_cache.clone();
-                        // `args.minimax_env_file` is owned by
-                        // `Args` on the main stack; REFRESH runs on
-                        // a spawned task, so clone the
-                        // `Option<PathBuf>` and reduce to a
-                        // borrowed view inside the task.
-                        let minimax_env_file_bg = args.minimax_env_file.clone();
-                        tokio::spawn(async move {
-                            // Clone `new_config` so we can both
-                            // commit the metadata under the lock
-                            // and use the original to build the
-                            // new engine.
-                            let new_config_for_build = new_config.clone();
-
-                            // Drop the old engine before building the new
-                            // one so both never sit in (V)RAM at once.
-                            {
-                                let mut s = daemon_state_bg.write().await;
-                                s.engine = Engine::Loading;
-                                s.stt_config = new_config;
-                            }
-
-                            // Step 2: build the new engine outside
-                            // the lock. This is the multi-second /
-                            // multi-minute await we used to do on
-                            // the event loop — now off-loaded to a
-                            // worker.
-                            match build_transcriber(
-                                &new_config_for_build,
-                                voxora_cache_bg,
-                                minimax_env_file_bg.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok((
-                                    new_transcriber,
-                                    resolved_model_id,
-                                    resolved_path,
-                                    resolved_endpoint,
-                                )) => {
-                                    let mut s = daemon_state_bg.write().await;
-                                    s.engine = Engine::Ready(new_transcriber);
-                                    // Closes #165 / #167: copy the
-                                    // engine's authoritative
-                                    // model_id / resolved_path /
-                                    // endpoint back so the
-                                    // REFRESHed status display
-                                    // matches what voxora actually
-                                    // loaded.
-                                    s.stt_config.model_id = resolved_model_id;
-                                    s.stt_config.model_path = resolved_path;
-                                    s.stt_config.endpoint = resolved_endpoint;
-                                    info!("Transcriber reloaded successfully.");
-                                    let _ = response_tx.send(Ok(()));
-                                }
-                                Err(e) => {
-                                    let msg = format!("{e:#}");
-                                    error!("Failed to reload transcriber: {msg}");
-                                    daemon_state_bg.write().await.engine =
-                                        Engine::Failed(msg.clone());
-                                    let _ = response_tx
-                                        .send(Err(anyhow::anyhow!("Failed to load model: {msg}")));
-                                }
-                            }
-                        });
-                    }
+                Command::ReloadConfig { new_config, response_tx } => {
+                    handle_reload(&daemon_state, new_config, response_tx, &voxora_cache, &args).await;
                 }
-            }
-        }
-
-        // Process Audio from RingBuffer
-        let available = consumer.len();
-        if available >= chunk_size {
-            for _ in 0..chunk_size {
-                if let Some(sample) = consumer.pop() {
-                    chunk_buf.push(sample);
+            },
+            Some((id, text)) = result_rx.recv() => {
+                if id != job_id {
+                    info!("Dropping result of cancelled transcription job {id}");
+                    continue;
                 }
-            }
-
-            // If Recording, save to buffer
-            if state == State::Recording {
-                // Safety limit: User-defined or default maximum time.
-                // Snapshot the limit under the read lock so a
-                // REFRESH that lands mid-recording doesn't race with
-                // the buffer-cap check.
-                let max_seconds = daemon_state.read().await.stt_config.max_recording_seconds;
-                if audio_buffer.len() < 16000 * max_seconds as usize {
-                    audio_buffer.extend_from_slice(&chunk_buf);
+                if let Some(tx) = response_tx_opt.take() {
+                    let _ = tx.send(text);
+                    pending_result = None;
                 } else {
-                    warn!(
-                        "Audio buffer limit reached ({}s). Stopping recording automatically.",
-                        max_seconds
-                    );
+                    pending_result = Some(text);
+                }
+                if state == State::Processing {
+                    state = State::Idle;
+                }
+            }
+            _ = audio_tick.tick() => {
+                if state != State::Recording {
+                    // Keep the ring buffer from filling while idle.
+                    while consumer.pop().is_some() {}
+                    continue;
+                }
+                let max_seconds = daemon_state.read().await.stt_config.max_recording_seconds;
+                let limit = 16000 * max_seconds as usize;
+                drain_audio(&mut consumer, &mut audio_buffer, limit);
+                if audio_buffer.len() >= limit {
+                    warn!("Audio buffer limit reached ({max_seconds}s). Stopping recording automatically.");
+                    job_id += 1;
+                    start_transcription(
+                        &daemon_state,
+                        std::mem::take(&mut audio_buffer),
+                        job_id,
+                        result_tx.clone(),
+                    )
+                    .await;
                     state = State::Processing;
-                    // Notify client to stop UI and request result
                     let control_sock = resolved_paths.control_sock.to_string_lossy().into_owned();
                     tokio::spawn(async move {
                         notify_client_auto_stop(&control_sock).await;
                     });
                 }
             }
-
-            chunk_buf.clear();
-        } else {
-            // Sleep briefly to avoid busy loop
-            sleep(Duration::from_millis(5)).await;
-        }
-
-        // Processing State
-        if state == State::Processing {
-            info!("Processing {} samples...", audio_buffer.len());
-
-            let text = if audio_buffer.is_empty() {
-                warn!("Audio buffer empty, skipping transcription.");
-                "".to_string()
-            } else {
-                let s = daemon_state.read().await;
-                match &s.engine {
-                    Engine::Ready(t) => {
-                        match t.transcribe(&audio_buffer, Some(&s.stt_config.language)) {
-                            Ok(text) => text,
-                            Err(e) => {
-                                error!("Transcription failed: {}", e);
-                                format!("ERROR: {}", e)
-                            }
-                        }
-                    }
-                    other => {
-                        let reason = other
-                            .unavailable_reason()
-                            .unwrap_or_else(|| "modelo no disponible".to_string());
-                        error!("Recording discarded: {reason}");
-                        format!("ERROR: {reason}")
-                    }
-                }
-            };
-
-            if let Some(tx) = response_tx_opt.take() {
-                let _ = tx.send(text);
-                pending_result = None;
-            } else {
-                pending_result = Some(text);
-            }
-
-            state = State::Idle;
-            audio_buffer.clear();
         }
     }
 
     info!("Telora daemon stopped cleanly");
     Ok(())
+}
+
+/// REFRESH: swap the engine when the model changed (or is not loaded),
+/// otherwise just apply the new settings.
+async fn handle_reload(
+    daemon_state: &Arc<RwLock<DaemonState>>,
+    new_config: SttConfig,
+    response_tx: oneshot::Sender<Result<()>>,
+    voxora_cache: &std::path::Path,
+    args: &Args,
+) {
+    info!(
+        "Command: REFRESH (model_kind={} model_id={})",
+        new_config.model_kind, new_config.model_id
+    );
+    // Atomicity contract (issue #93): the engine
+    // swap and the `stt_config` mutation commit
+    // together under the same `RwLock` write guard.
+    // Cheap path (no model change) commits the
+    // config delta inline; needs-reload path
+    // `tokio::spawn`s the rebuild so the main loop
+    // keeps ticking through the multi-second /
+    // multi-minute engine load.
+    let needs_reload = {
+        let s = daemon_state.read().await;
+        new_config.model_id != s.stt_config.model_id
+            || new_config.model_kind != s.stt_config.model_kind
+            || !matches!(s.engine, Engine::Ready(_))
+    };
+    if !needs_reload {
+        // No engine swap needed, but other fields
+        // (language, max_recording_seconds) still
+        // need to take effect. The new config is
+        // safe to commit because no engine load
+        // happened.
+        let mut s = daemon_state.write().await;
+        s.stt_config = new_config;
+        info!("Configuration updated (no model change).");
+        let _ = response_tx.send(Ok(()));
+    } else {
+        // Hand the rebuild off to a spawned task so
+        // the event loop keeps draining commands
+        // (STATUS / START / STOP) while the new
+        // engine loads. The `oneshot::Sender`
+        // survives the move — it is `Send + 'static`
+        // — so the socket handler's `rx.await` sees
+        // the result when this task eventually fires
+        // `.send(Ok(()))` or drops the sender.
+        let daemon_state_bg = Arc::clone(daemon_state);
+        let voxora_cache_bg = voxora_cache.to_path_buf();
+        // `args.minimax_env_file` is owned by
+        // `Args` on the main stack; REFRESH runs on
+        // a spawned task, so clone the
+        // `Option<PathBuf>` and reduce to a
+        // borrowed view inside the task.
+        let minimax_env_file_bg = args.minimax_env_file.clone();
+        tokio::spawn(async move {
+            // Clone `new_config` so we can both
+            // commit the metadata under the lock
+            // and use the original to build the
+            // new engine.
+            let new_config_for_build = new_config.clone();
+
+            // Drop the old engine before building the new
+            // one so both never sit in (V)RAM at once.
+            {
+                let mut s = daemon_state_bg.write().await;
+                s.engine = Engine::Loading;
+                s.stt_config = new_config;
+            }
+
+            // Step 2: build the new engine outside
+            // the lock. This is the multi-second /
+            // multi-minute await we used to do on
+            // the event loop — now off-loaded to a
+            // worker.
+            match build_transcriber(
+                &new_config_for_build,
+                voxora_cache_bg,
+                minimax_env_file_bg.as_deref(),
+            )
+            .await
+            {
+                Ok((new_transcriber, resolved_model_id, resolved_path, resolved_endpoint)) => {
+                    let mut s = daemon_state_bg.write().await;
+                    s.engine = Engine::Ready(new_transcriber);
+                    // Closes #165 / #167: copy the
+                    // engine's authoritative
+                    // model_id / resolved_path /
+                    // endpoint back so the
+                    // REFRESHed status display
+                    // matches what voxora actually
+                    // loaded.
+                    s.stt_config.model_id = resolved_model_id;
+                    s.stt_config.model_path = resolved_path;
+                    s.stt_config.endpoint = resolved_endpoint;
+                    info!("Transcriber reloaded successfully.");
+                    let _ = response_tx.send(Ok(()));
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    error!("Failed to reload transcriber: {msg}");
+                    daemon_state_bg.write().await.engine = Engine::Failed(msg.clone());
+                    let _ = response_tx.send(Err(anyhow::anyhow!("Failed to load model: {msg}")));
+                }
+            }
+        });
+    }
+}
+
+/// Move captured samples into `buffer`, stopping at `limit` samples.
+fn drain_audio(
+    consumer: &mut ringbuf::Consumer<f32, Arc<HeapRb<f32>>>,
+    buffer: &mut Vec<f32>,
+    limit: usize,
+) {
+    while buffer.len() < limit {
+        match consumer.pop() {
+            Some(sample) => buffer.push(sample),
+            None => break,
+        }
+    }
+}
+
+/// Transcribe `audio` on a blocking thread so the event loop keeps
+/// answering STATUS and CANCEL; the result arrives on `result_tx`.
+async fn start_transcription(
+    daemon_state: &Arc<RwLock<DaemonState>>,
+    audio: Vec<f32>,
+    job_id: u64,
+    result_tx: mpsc::Sender<(u64, String)>,
+) {
+    info!("Processing {} samples (job {job_id})...", audio.len());
+    let (engine, language) = {
+        let s = daemon_state.read().await;
+        let engine = match &s.engine {
+            Engine::Ready(t) => Ok(Arc::clone(t)),
+            other => Err(other
+                .unavailable_reason()
+                .unwrap_or_else(|| "modelo no disponible".to_string())),
+        };
+        (engine, s.stt_config.language.clone())
+    };
+    tokio::spawn(async move {
+        let text = match engine {
+            Err(reason) => {
+                error!("Recording discarded: {reason}");
+                format!("ERROR: {reason}")
+            }
+            Ok(_) if audio.is_empty() => {
+                warn!("Audio buffer empty, skipping transcription.");
+                String::new()
+            }
+            Ok(t) => {
+                let joined =
+                    tokio::task::spawn_blocking(move || t.transcribe(&audio, Some(&language)))
+                        .await;
+                match joined {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(e)) => {
+                        error!("Transcription failed: {e}");
+                        format!("ERROR: {e}")
+                    }
+                    Err(e) => {
+                        error!("Transcription task panicked: {e}");
+                        "ERROR: la transcripción falló inesperadamente".to_string()
+                    }
+                }
+            }
+        };
+        let _ = result_tx.send((job_id, text)).await;
+    });
 }
