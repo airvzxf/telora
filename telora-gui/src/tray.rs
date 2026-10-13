@@ -65,44 +65,27 @@ impl TrayState {
     fn tooltip_description(self) -> &'static str {
         match self {
             Self::Idle => {
-                "Speech-to-text assistant is ready.\n\
-                 Click to toggle TYPE mode (writes the transcription), \
-                 right-click for the menu."
+                "Listo para dictar.\n\
+                 Clic: grabar y copiar el texto al portapapeles. Clic derecho: menú."
             }
-            Self::Recording => {
-                "Recording audio \u{2014} speak now.\n\
-                 Click again or right-click \u{2192} Toggle TYPE to stop."
-            }
-            Self::Processing => {
-                "Transcribing audio. The result will be pasted or copied\n\
-                 automatically when the daemon finishes."
-            }
+            Self::Recording => "Grabando \u{2014} habla ahora.\nClic para detener.",
+            Self::Processing => "Transcribiendo; el texto se copiará al portapapeles.",
             Self::Error => {
-                "The daemon is unreachable or returned an error.\n\
-                 Check `telora-daemon status` and the journal."
+                "El daemon no responde o devolvió un error.\n\
+                 Revisa `telora-daemon status` y el journal."
             }
         }
     }
 }
 
-/// Commands the user can trigger from the tray menu (or by clicking the
-/// tray icon). These map 1:1 to the strings the GTK loop already
-/// understands via the control server (`TOGGLE_TYPE`, `TOGGLE_COPY`,
-/// `AUTO_STOP`, `CANCEL`) plus a new `STATUS` and `QUIT`.
+/// Actions the user can trigger from the tray icon or its menu.
 #[derive(Debug, Clone)]
 pub enum TrayCommand {
-    /// Left-click on the icon — same as the `TOGGLE_TYPE` hotkey.
-    ToggleType,
-    /// Right-click \u{2192} "Toggle TYPE mode".
-    MenuToggleType,
-    /// Right-click \u{2192} "Toggle COPY mode".
-    MenuToggleCopy,
-    /// Right-click \u{2192} "Cancel recording".
+    /// Left-click on the icon, or the "Grabar / detener" menu item.
+    Toggle,
     MenuCancel,
-    /// Right-click \u{2192} "Show status" \u{2192} triggers an OSD flash.
+    MenuCopyLast,
     MenuStatus,
-    /// Right-click \u{2192} "Quit" \u{2192} ends the GUI cleanly so
-    /// `systemd --user` restarts it on next login / crash.
     MenuQuit,
 }
 
@@ -166,62 +149,36 @@ impl ksni::Tray for TeloraTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
+        let item = |label: &str, icon: &str, cmd: TrayCommand| -> MenuItem<Self> {
+            StandardItem {
+                label: label.to_string(),
+                icon_name: icon.to_string(),
+                activate: Box::new(move |tray: &mut Self| dispatch(tray, cmd.clone())),
+                ..Default::default()
+            }
+            .into()
+        };
         vec![
-            StandardItem {
-                label: "Toggle TYPE mode".to_string(),
-                icon_name: "input-keyboard".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    dispatch(tray, TrayCommand::MenuToggleType);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Toggle COPY mode".to_string(),
-                icon_name: "edit-copy".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    dispatch(tray, TrayCommand::MenuToggleCopy);
-                }),
-                ..Default::default()
-            }
-            .into(),
+            item("Grabar / detener", "media-record", TrayCommand::Toggle),
+            item(
+                "Cancelar grabación",
+                "process-stop",
+                TrayCommand::MenuCancel,
+            ),
             MenuItem::Separator,
-            StandardItem {
-                label: "Cancel recording".to_string(),
-                icon_name: "process-stop".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    dispatch(tray, TrayCommand::MenuCancel);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Show status".to_string(),
-                icon_name: "dialog-information".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    dispatch(tray, TrayCommand::MenuStatus);
-                }),
-                ..Default::default()
-            }
-            .into(),
+            item(
+                "Copiar última transcripción",
+                "edit-copy",
+                TrayCommand::MenuCopyLast,
+            ),
+            item("Estado", "dialog-information", TrayCommand::MenuStatus),
             MenuItem::Separator,
-            StandardItem {
-                label: "Quit".to_string(),
-                icon_name: "application-exit".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    dispatch(tray, TrayCommand::MenuQuit);
-                }),
-                ..Default::default()
-            }
-            .into(),
+            item("Salir", "application-exit", TrayCommand::MenuQuit),
         ]
     }
 
-    /// Left-click on the icon. KDE Plasma 6 shows the menu on right-
-    /// click and calls `activate` on left-click, so we route the most
-    /// common action (Toggle TYPE) through this entry point.
     fn activate(&mut self, _x: i32, _y: i32) {
-        dispatch(self, TrayCommand::ToggleType);
+        dispatch(self, TrayCommand::Toggle);
     }
 }
 

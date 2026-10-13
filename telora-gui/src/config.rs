@@ -1,135 +1,56 @@
 use log::{info, warn};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Runtime configuration for the GUI client (`telora-gui`).
-///
-/// Resolved once at startup from `~/.config/telora/gui.toml`. If the file is
-/// missing or malformed the defaults are used; in either case the GUI keeps
-/// working with a sensible baseline.
+/// GUI settings from `~/.config/telora/gui.toml`. A missing or invalid
+/// file falls back to the defaults.
 #[derive(Debug, Clone)]
 pub struct GuiConfig {
-    pub paste_shortcut: String,
-    pub paste_shortcut_by_app: HashMap<String, String>,
-    /// Whether to spawn the freedesktop StatusNotifierItem (SNI) tray
-    /// icon. `true` (default) shows a status icon in KDE Plasma 6,
-    /// GNOME, Cinnamon, LXQt and any other SNI-compliant watcher.
-    /// Set to `false` to run the OSD-only legacy mode (closes #193).
+    /// Show the StatusNotifierItem tray icon.
     pub enable_tray: bool,
 }
 
 impl Default for GuiConfig {
     fn default() -> Self {
-        let mut map = HashMap::new();
-        map.insert("Alacritty".to_string(), "shift+insert".to_string());
-        map.insert("kitty".to_string(), "ctrl+shift+v".to_string());
-        map.insert("foot".to_string(), "ctrl+shift+v".to_string());
-        map.insert("wezterm".to_string(), "ctrl+shift+v".to_string());
-        map.insert("konsole".to_string(), "ctrl+shift+v".to_string());
-        map.insert("org.gnome.Terminal".to_string(), "ctrl+shift+v".to_string());
-        map.insert("xfce4-terminal".to_string(), "ctrl+shift+v".to_string());
-        Self {
-            paste_shortcut: "ctrl+v".to_string(),
-            paste_shortcut_by_app: map,
-            enable_tray: true,
-        }
+        Self { enable_tray: true }
     }
 }
 
-/// On-disk representation. The `paste_shortcut_by_app` map can be overridden
-/// entirely from the TOML file; defaults are merged at load time.
 #[derive(Debug, Deserialize, Default)]
 struct RawGuiConfig {
-    paste_shortcut: Option<String>,
-    paste_shortcut_by_app: Option<HashMap<String, String>>,
     enable_tray: Option<bool>,
 }
 
 impl GuiConfig {
-    /// Load the user configuration. Never panics: missing files, missing
-    /// fields, or parse errors all fall back to [`GuiConfig::default`].
     pub fn load() -> Self {
         let Some(path) = config_path() else {
             info!("No config path resolved; using built-in defaults");
             return Self::default();
         };
-
-        if !path.exists() {
-            info!(
-                "Config file {} not found; using built-in defaults",
-                path.display()
-            );
-            return Self::default();
-        }
-
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("Config file {} not found; using defaults", path.display());
+                return Self::default();
+            }
             Err(e) => {
-                warn!(
-                    "Could not read config {} ({}); using defaults",
-                    path.display(),
-                    e
-                );
+                warn!("Could not read {} ({e}); using defaults", path.display());
                 return Self::default();
             }
         };
+        Self::parse(&text).unwrap_or_else(|e| {
+            warn!("{} is not valid TOML ({e}); using defaults", path.display());
+            Self::default()
+        })
+    }
 
-        let raw: RawGuiConfig = match toml::from_str(&text) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    "Config {} is not valid TOML ({}); using defaults",
-                    path.display(),
-                    e
-                );
-                return Self::default();
-            }
-        };
-
+    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let raw: RawGuiConfig = toml::from_str(text)?;
         let mut cfg = Self::default();
-
-        if let Some(s) = raw.paste_shortcut {
-            if !s.trim().is_empty() {
-                cfg.paste_shortcut = s;
-            } else {
-                warn!("paste_shortcut in config is empty; keeping default");
-            }
-        }
-
-        if let Some(map) = raw.paste_shortcut_by_app {
-            for (k, v) in map {
-                cfg.paste_shortcut_by_app.insert(k, v);
-            }
-        }
-
         if let Some(enable) = raw.enable_tray {
             cfg.enable_tray = enable;
         }
-
-        info!(
-            "Loaded config from {} (default shortcut: {}, {} per-app overrides, tray: {})",
-            path.display(),
-            cfg.paste_shortcut,
-            cfg.paste_shortcut_by_app.len(),
-            if cfg.enable_tray {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-
-        cfg
-    }
-
-    /// Resolve which shortcut to use for the currently focused app.
-    pub fn resolve_paste_shortcut(&self, app_id: Option<&str>) -> String {
-        if let Some(id) = app_id
-            && let Some(s) = self.paste_shortcut_by_app.get(id)
-        {
-            return s.clone();
-        }
-        self.paste_shortcut.clone()
+        Ok(cfg)
     }
 }
 
@@ -150,4 +71,19 @@ fn config_path() -> Option<PathBuf> {
         );
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuiConfig;
+
+    /// gui.toml files written for the removed TYPE mode must keep loading.
+    #[test]
+    fn legacy_paste_shortcut_keys_are_ignored() {
+        let cfg = GuiConfig::parse(
+            "paste_shortcut = \"ctrl+v\"\nenable_tray = false\n[paste_shortcut_by_app]\nkitty = \"ctrl+shift+v\"\n",
+        )
+        .expect("legacy file parses");
+        assert!(!cfg.enable_tray);
+    }
 }

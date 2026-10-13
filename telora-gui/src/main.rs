@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -14,8 +15,6 @@ use log::{info, warn};
 mod clipboard;
 mod config;
 mod connection;
-mod focus;
-mod input;
 mod paths;
 mod session;
 mod text;
@@ -74,21 +73,16 @@ fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
 enum AppAction {
     Event(Event),
     QueryStatus,
+    CopyLast,
 }
 
 #[derive(Debug)]
 enum DaemonCommand {
-    Start {
-        response_tx: Sender<AppAction>,
-    },
-    Stop {
-        mode: String,
-        response_tx: Sender<AppAction>,
-    },
+    Start { response_tx: Sender<AppAction> },
+    Stop { response_tx: Sender<AppAction> },
     Cancel,
-    Status {
-        response_tx: Sender<AppAction>,
-    },
+    CopyLast { response_tx: Sender<AppAction> },
+    Status { response_tx: Sender<AppAction> },
 }
 
 fn main() {
@@ -201,7 +195,6 @@ fn main() {
         // Start Tokio Runtime in a separate thread
         // This happens AFTER GTK confirms we're the primary instance
         let tx_clone = tx.clone();
-        let cfg_for_tokio = gui_config.clone();
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async {
@@ -213,7 +206,7 @@ fn main() {
                             log::error!("Control server failed: {}", e);
                         }
                     }
-                    _ = handle_daemon_commands(daemon_rx, cfg_for_tokio, resolved_for_client) => {}
+                    _ = handle_daemon_commands(daemon_rx, resolved_for_client) => {}
                 }
             });
         });
@@ -238,7 +231,14 @@ fn main() {
         let tx_for_tray_thread = tx.clone();
         let tray_cmd_rx_for_thread = tray_cmd_rx.clone();
 
+        if !gui_config.enable_tray {
+            info!("Tray disabled by gui.toml (enable_tray = false)");
+        }
+        let enable_tray = gui_config.enable_tray;
         thread::spawn(move || {
+            if !enable_tray {
+                return;
+            }
             let rt = Runtime::new().expect("Failed to create tray tokio runtime");
             rt.block_on(async move {
                 match tray::spawn_tray(tray_cmd_tx).await {
@@ -253,15 +253,9 @@ fn main() {
                         info!("Tray command dispatcher started; awaiting menu events");
                         while let Ok(cmd) = tray_cmd_rx_for_thread.recv().await {
                             let action = match cmd {
-                                TrayCommand::ToggleType | TrayCommand::MenuToggleType => {
-                                    AppAction::Event(Event::Toggle {
-                                        mode: "TYPE".to_string(),
-                                    })
-                                }
-                                TrayCommand::MenuToggleCopy => AppAction::Event(Event::Toggle {
-                                    mode: "COPY".to_string(),
-                                }),
+                                TrayCommand::Toggle => AppAction::Event(Event::Toggle),
                                 TrayCommand::MenuCancel => AppAction::Event(Event::Cancel),
+                                TrayCommand::MenuCopyLast => AppAction::CopyLast,
                                 TrayCommand::MenuStatus => AppAction::QueryStatus,
                                 TrayCommand::MenuQuit => {
                                     info!("Quit requested from tray menu");
@@ -315,6 +309,12 @@ fn main() {
                         });
                         continue;
                     }
+                    AppAction::CopyLast => {
+                        let _ = daemon_tx.send(DaemonCommand::CopyLast {
+                            response_tx: tx_back.clone(),
+                        });
+                        continue;
+                    }
                 };
                 for effect in session.handle(event) {
                     match effect {
@@ -323,9 +323,8 @@ fn main() {
                                 response_tx: tx_back.clone(),
                             });
                         }
-                        Effect::SendStop { mode } => {
+                        Effect::SendStop => {
                             let _ = daemon_tx.send(DaemonCommand::Stop {
-                                mode,
                                 response_tx: tx_back.clone(),
                             });
                         }
@@ -354,10 +353,12 @@ fn main() {
 
 async fn handle_daemon_commands(
     mut rx: mpsc::UnboundedReceiver<DaemonCommand>,
-    gui_config: GuiConfig,
     resolved_paths: Arc<ResolvedPaths>,
 ) {
     let daemon_sock: PathBuf = resolved_paths.daemon_sock.clone();
+    // Safety net: the last delivered text can be copied again from the tray
+    // or with `telora last` if the clipboard was overwritten meanwhile.
+    let mut last_text: Option<String> = None;
     while let Some(cmd) = rx.recv().await {
         match cmd {
             DaemonCommand::Start { response_tx } => {
@@ -374,9 +375,21 @@ async fn handle_daemon_commands(
                 };
                 let _ = response_tx.send(AppAction::Event(event)).await;
             }
-            DaemonCommand::Stop { mode, response_tx } => {
-                let event = stop_and_deliver(&daemon_sock, &mode, &gui_config).await;
+            DaemonCommand::Stop { response_tx } => {
+                let event = stop_and_deliver(&daemon_sock, &mut last_text).await;
                 let _ = response_tx.send(AppAction::Event(event)).await;
+            }
+            DaemonCommand::CopyLast { response_tx } => {
+                let message = match &last_text {
+                    None => "No hay transcripción previa".to_string(),
+                    Some(text) => match clipboard::copy(text) {
+                        Ok(()) => "Última transcripción copiada".to_string(),
+                        Err(reason) => format!("✘ {reason}"),
+                    },
+                };
+                let _ = response_tx
+                    .send(AppAction::Event(Event::Info(message)))
+                    .await;
             }
             DaemonCommand::Cancel => {
                 if let Err(e) = SocketClient::send_command("CANCEL", &daemon_sock).await {
@@ -397,9 +410,9 @@ async fn handle_daemon_commands(
     }
 }
 
-/// Run STOP and hand the text to the clipboard; the returned event says
+/// Run STOP and put the text on the clipboard; the returned event says
 /// what the user should see.
-async fn stop_and_deliver(daemon_sock: &Path, mode: &str, gui_config: &GuiConfig) -> Event {
+async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) -> Event {
     let raw_text = match SocketClient::send_command("STOP", daemon_sock).await {
         Ok(text) => text,
         Err(e) => {
@@ -420,19 +433,15 @@ async fn stop_and_deliver(daemon_sock: &Path, mode: &str, gui_config: &GuiConfig
         };
     }
     let cleaned = text::clean_transcription(&raw_text);
-    let paste_outcome = if mode == "TYPE" {
-        input::type_text(&cleaned, gui_config)
-    } else {
-        input::copy_text(&cleaned);
-        clipboard::PasteOutcome::Ok
-    };
-    let (message, color) = outcome_osd(&paste_outcome, mode == "TYPE");
-    let failed = paste_outcome.is_failure();
-    Event::Finished {
-        message,
-        color,
-        hold_secs: if failed { 3 } else { 1 },
-        error: failed,
+    *last_text = Some(cleaned.clone());
+    match clipboard::copy(&cleaned) {
+        Ok(()) => Event::Finished {
+            message: "Copiado".to_string(),
+            color: session::COLOR_OK.to_string(),
+            hold_secs: 1,
+            error: false,
+        },
+        Err(reason) => finished_error(&format!("{reason}; usa \"Copiar última transcripción\"")),
     }
 }
 
@@ -460,54 +469,6 @@ fn describe_status(reply: &str) -> String {
     format!("{model} · {engine} · {}", field("state"))
 }
 
-fn outcome_osd(outcome: &clipboard::PasteOutcome, is_type_mode: bool) -> (String, String) {
-    match outcome {
-        clipboard::PasteOutcome::Ok => {
-            if is_type_mode {
-                ("Escrito".to_string(), session::COLOR_OK.to_string())
-            } else {
-                ("Copiado".to_string(), session::COLOR_OK.to_string())
-            }
-        }
-        clipboard::PasteOutcome::Partial { skipped } => {
-            let count = skipped.len();
-            let label = if is_type_mode { "Escrito" } else { "Copiado" };
-            (
-                format!(
-                    "{label} ⚠ {count} tipo{plural} perdido{plural2}",
-                    plural = if count == 1 { "" } else { "s" },
-                    plural2 = if count == 1 { "" } else { "s" }
-                ),
-                // A Partial means the receiving app already got the text
-                // but lost fidelity on a few MIME types. It is not an
-                // error, just a degraded success — surface it in the same
-                // green as `Ok` so the colour does not suggest something
-                // went wrong; only the trailing '⚠ N tipos perdidos'
-                // tells the user that some clipboard content was dropped.
-                session::COLOR_OK.to_string(),
-            )
-        }
-        clipboard::PasteOutcome::FallbackSingleMime { .. } => (
-            "⚠ Respaldo simple (formato único)".to_string(),
-            "orange".to_string(),
-        ),
-        clipboard::PasteOutcome::KeystrokeUnavailable { .. } => (
-            // The clipboard has the transcription but the focused app did
-            // not receive a paste keystroke (most commonly: `wtype` is
-            // not installed — typical for KDE Plasma 6 without
-            // wlroots-ecosystem tooling). Tell the user explicitly to
-            // press Ctrl+V so they can recover without having to dig
-            // through the logs.
-            "Copiado — pegue con Ctrl+V".to_string(),
-            "orange".to_string(),
-        ),
-        clipboard::PasteOutcome::Refused { .. } => (
-            "✘ Cancelado (portapapeles protegido)".to_string(),
-            "gray".to_string(),
-        ),
-    }
-}
-
 async fn run_control_server(
     tx: Sender<AppAction>,
     resolved_paths: Arc<ResolvedPaths>,
@@ -521,37 +482,33 @@ async fn run_control_server(
     info!("Control server listening on {}...", control_sock.display());
 
     loop {
-        match server.next_command().await {
-            Ok(cmd) => {
-                info!("Control command: {}", cmd);
-                match cmd.as_str() {
-                    "TOGGLE_TYPE" => {
-                        let _ = tx
-                            .send(AppAction::Event(Event::Toggle {
-                                mode: "TYPE".to_string(),
-                            }))
-                            .await;
-                    }
-                    "TOGGLE_COPY" => {
-                        let _ = tx
-                            .send(AppAction::Event(Event::Toggle {
-                                mode: "COPY".to_string(),
-                            }))
-                            .await;
-                    }
-                    "CANCEL" => {
-                        let _ = tx.send(AppAction::Event(Event::Cancel)).await;
-                    }
-                    "AUTO_STOP" => {
-                        let _ = tx.send(AppAction::Event(Event::AutoStop)).await;
-                    }
-                    _ => {}
-                }
-            }
+        let (cmd, mut stream) = match server.next_command().await {
+            Ok(pair) => pair,
             Err(e) => {
-                log::error!("Control server error: {}", e);
+                log::error!("Control server error: {e}");
+                continue;
             }
-        }
+        };
+        info!("Control command: {cmd}");
+        let action = match cmd.as_str() {
+            "TOGGLE" | "TOGGLE_COPY" => Some(AppAction::Event(Event::Toggle)),
+            "CANCEL" => Some(AppAction::Event(Event::Cancel)),
+            "AUTO_STOP" => Some(AppAction::Event(Event::AutoStop)),
+            "LAST" => Some(AppAction::CopyLast),
+            _ => None,
+        };
+        let reply = match action {
+            Some(action) => {
+                let _ = tx.send(action).await;
+                "OK".to_string()
+            }
+            None if cmd == "TOGGLE_TYPE" => {
+                "ERROR: el modo TYPE se eliminó; usa `telora toggle-copy`".to_string()
+            }
+            None => format!("ERROR: comando desconocido: {cmd}"),
+        };
+        // The daemon's AUTO_STOP sender does not read replies; ignore EPIPE.
+        let _ = stream.write_all(reply.as_bytes()).await;
     }
 }
 
