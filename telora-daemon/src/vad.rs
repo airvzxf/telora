@@ -104,14 +104,21 @@ mod tests {
 
     const RATE: usize = 16_000;
 
-    /// Deterministic white noise of the given RMS.
+    /// Deterministic noise around the given RMS. Like the measured
+    /// room, its loudest 30 ms frame is about 1.75 times its quietest.
     fn noise(samples: usize, rms: f32) -> Vec<f32> {
-        let amplitude = rms * 3f32.sqrt();
         let mut state: u32 = 0x1234_5678;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state as f32 / u32::MAX as f32
+        };
+        let mut gain = 1.0;
         (0..samples)
-            .map(|_| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * amplitude
+            .map(|i| {
+                if i % FRAME == 0 {
+                    gain = 0.75 + 0.55 * next();
+                }
+                (next() * 2.0 - 1.0) * rms * gain * 3f32.sqrt()
             })
             .collect()
     }
@@ -161,6 +168,24 @@ mod tests {
             speech_span(&audio),
             Some(40 * 480 - ms(300)..80 * 480 + ms(500))
         );
+    }
+
+    // A dictation that starts right after START and ends right before
+    // STOP is mostly speech; its median frame is a word, not the floor.
+    #[test]
+    fn a_recording_that_is_mostly_quiet_speech_is_speech() {
+        let mut audio = room_noise(ms(2000));
+        voice(&mut audio, ms(200)..ms(1800), 0.01);
+        assert!(speech_span(&audio).is_some());
+    }
+
+    // Over a near-silent floor a distant sound is many times louder than
+    // the floor, and still not something to dictate.
+    #[test]
+    fn a_faint_sound_in_a_very_quiet_room_is_not_speech() {
+        let mut audio = noise(ms(3000), 0.0002);
+        voice(&mut audio, ms(1000)..ms(1300), 0.002);
+        assert_eq!(speech_span(&audio), None);
     }
 
     #[test]
