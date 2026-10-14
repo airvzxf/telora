@@ -26,6 +26,7 @@ pub mod socket;
 mod audio;
 mod resample;
 mod transcriber;
+mod vad;
 
 // Re-export the deserialisable config types from `socket` so external
 // callers (and `main.rs`) do not need to know about the internal

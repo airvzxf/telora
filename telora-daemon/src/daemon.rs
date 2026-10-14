@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::socket::{AudioConfig, Command, DaemonConfig, PathsConfig, StatusResponse, SttConfig};
 use crate::transcriber::{Transcriber, validate_stt_config};
-use telora_common::protocol::{Error as ProtocolError, ErrorCode};
+use telora_common::protocol::{Error as ProtocolError, ErrorCode, Transcript};
 
 /// Samples per second the engines expect and the buffer is sized for.
-const SAMPLE_RATE: usize = 16_000;
+pub(crate) const SAMPLE_RATE: usize = 16_000;
 
 /// Where captured samples come from. Capture runs only between `start`
 /// and `stop`.
@@ -76,7 +76,7 @@ pub type LoadResult = Result<(Arc<dyn Transcriber>, String), String>;
 pub type RefreshReply = oneshot::Sender<Result<String, ProtocolError>>;
 
 /// A transcription, or why there is none.
-pub type TextResult = Result<String, ProtocolError>;
+pub type TextResult = Result<Transcript, ProtocolError>;
 
 pub enum Event {
     Command(Command),
@@ -255,7 +255,10 @@ impl<A: AudioSource> Daemon<A> {
                         Vec::new()
                     }
                     Phase::Idle => {
-                        let result = self.unclaimed_result.take().unwrap_or(Ok(String::new()));
+                        let result = self
+                            .unclaimed_result
+                            .take()
+                            .unwrap_or(Ok(Transcript::Text(String::new())));
                         let _ = response_tx.send(result);
                         Vec::new()
                     }
@@ -322,7 +325,7 @@ impl<A: AudioSource> Daemon<A> {
         match &self.engine {
             Engine::Ready(_) if audio.is_empty() => {
                 warn!("Audio buffer empty, skipping transcription.");
-                self.finish(Ok(String::new()));
+                self.finish(Ok(Transcript::NoSpeech));
                 None
             }
             Engine::Ready(engine) => Some(Effect::Transcribe {
@@ -515,11 +518,12 @@ fn execute(effect: Effect, hooks: &Hooks, done_tx: &mpsc::Sender<Event>) {
         } => {
             let done_tx = done_tx.clone();
             tokio::spawn(async move {
-                let joined =
-                    tokio::task::spawn_blocking(move || engine.transcribe(&audio, Some(&language)))
-                        .await;
+                let joined = tokio::task::spawn_blocking(move || {
+                    crate::vad::transcribe_speech(engine.as_ref(), &audio, &language)
+                })
+                .await;
                 let result = match joined {
-                    Ok(Ok(text)) => Ok(text),
+                    Ok(Ok(transcript)) => Ok(transcript),
                     Ok(Err(e)) => {
                         error!("Transcription failed: {e:#}");
                         Err(ProtocolError::new(
@@ -584,10 +588,15 @@ mod tests {
     struct FakeMic(Arc<Mutex<MicState>>);
 
     impl FakeMic {
+        /// Speech-level audio.
         fn capture(&self, samples: usize) {
+            self.capture_level(samples, 0.1);
+        }
+
+        fn capture_level(&self, samples: usize, level: f32) {
             let mut m = self.0.lock().unwrap();
             if m.open {
-                m.queue.extend(std::iter::repeat_n(0.1, samples));
+                m.queue.extend(std::iter::repeat_n(level, samples));
             }
         }
 
@@ -658,6 +667,10 @@ mod tests {
             paths: PathsConfig::default(),
             audio: AudioConfig::default(),
         }
+    }
+
+    fn text(s: &str) -> TextResult {
+        Ok(Transcript::Text(s.to_string()))
     }
 
     fn loaded(path: &str) -> LoadResult {
@@ -773,19 +786,19 @@ mod tests {
 
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("hola".to_string()),
+            result: text("hola"),
         });
-        assert_eq!(rx.try_recv().unwrap(), Ok("hola".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), text("hola"));
         assert_eq!(d.phase(), Phase::Idle);
     }
 
     #[test]
-    fn stop_with_no_audio_answers_empty_without_transcribing() {
+    fn stop_with_no_audio_is_no_speech_without_transcribing() {
         let (mut d, _mic) = ready_daemon();
         start(&mut d).unwrap();
         let (mut rx, effects) = stop(&mut d);
         assert!(effects.is_empty());
-        assert_eq!(rx.try_recv().unwrap(), Ok("".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), Ok(Transcript::NoSpeech));
         assert_eq!(d.phase(), Phase::Idle);
     }
 
@@ -812,16 +825,16 @@ mod tests {
         let (job, _) = transcribe_job(&d.handle(Event::Tick));
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("dictado largo".to_string()),
+            result: text("dictado largo"),
         });
         assert_eq!(d.phase(), Phase::Idle);
 
         let (mut rx, _) = stop(&mut d);
-        assert_eq!(rx.try_recv().unwrap(), Ok("dictado largo".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), text("dictado largo"));
         let (mut rx, _) = stop(&mut d);
         assert_eq!(
             rx.try_recv().unwrap(),
-            Ok(String::new()),
+            text(""),
             "the result is handed out once"
         );
     }
@@ -837,9 +850,9 @@ mod tests {
         assert!(effects.is_empty(), "no second transcription");
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("listo".to_string()),
+            result: text("listo"),
         });
-        assert_eq!(rx.try_recv().unwrap(), Ok("listo".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), text("listo"));
     }
 
     #[test]
@@ -857,9 +870,9 @@ mod tests {
         );
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("texto".to_string()),
+            result: text("texto"),
         });
-        assert_eq!(second.try_recv().unwrap(), Ok("texto".to_string()));
+        assert_eq!(second.try_recv().unwrap(), text("texto"));
     }
 
     #[test]
@@ -952,12 +965,12 @@ mod tests {
 
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("tarde".to_string()),
+            result: text("tarde"),
         });
         let (mut rx, _) = stop(&mut d);
         assert_eq!(
             rx.try_recv().unwrap(),
-            Ok(String::new()),
+            text(""),
             "the cancelled text must not leak"
         );
     }
@@ -970,11 +983,11 @@ mod tests {
         let (job, _) = transcribe_job(&d.handle(Event::Tick));
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("olvidado".to_string()),
+            result: text("olvidado"),
         });
         d.handle(Event::Command(Command::Cancel));
         let (mut rx, _) = stop(&mut d);
-        assert_eq!(rx.try_recv().unwrap(), Ok("".to_string()));
+        assert_eq!(rx.try_recv().unwrap(), text(""));
     }
 
     #[test]
@@ -1041,9 +1054,9 @@ mod tests {
 
         d.handle(Event::TranscriptionDone {
             job,
-            result: Ok("ok".to_string()),
+            result: text("ok"),
         });
-        assert_eq!(stop_rx.try_recv().unwrap(), Ok("ok".to_string()));
+        assert_eq!(stop_rx.try_recv().unwrap(), text("ok"));
     }
 
     #[test]
@@ -1297,17 +1310,17 @@ mod tests {
         let h = Harness::spawn();
         h.wait_until_ready().await;
         h.start().await.unwrap();
-        h.mic.capture(320);
+        h.mic.capture(SAMPLE_RATE);
         let mut result = h.stop().await;
 
         assert_eq!(h.status().await.state, "Processing");
         assert!(result.try_recv().is_err());
         h.release.send(()).unwrap();
-        let text = tokio::time::timeout(Duration::from_secs(1), result)
+        let transcript = tokio::time::timeout(Duration::from_secs(1), result)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(text, Ok("320 muestras".to_string()));
+        assert_eq!(transcript, text("16000 muestras"));
         assert_eq!(h.status().await.state, "Idle");
     }
 
@@ -1316,7 +1329,7 @@ mod tests {
         let h = Harness::spawn();
         h.wait_until_ready().await;
         h.start().await.unwrap();
-        h.mic.capture(100);
+        h.mic.capture(SAMPLE_RATE);
         let cancelled = h.stop().await;
         h.commands.send(Command::Cancel).await.unwrap();
         assert_eq!(
@@ -1327,7 +1340,24 @@ mod tests {
         h.release.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let late = h.stop().await;
-        assert_eq!(late.await.unwrap(), Ok(String::new()));
+        assert_eq!(late.await.unwrap(), text(""));
+    }
+
+    // The gate runs inside the job: the engine (blocked until released)
+    // is never reached, and STOP still gets an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_recording_is_answered_without_the_engine() {
+        let h = Harness::spawn();
+        h.wait_until_ready().await;
+        h.start().await.unwrap();
+        h.mic.capture_level(SAMPLE_RATE * 2, 0.0);
+        let result = h.stop().await;
+        let transcript = tokio::time::timeout(Duration::from_secs(1), result)
+            .await
+            .expect("must not wait for the engine")
+            .unwrap();
+        assert_eq!(transcript, Ok(Transcript::NoSpeech));
+        assert_eq!(h.status().await.state, "Idle");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

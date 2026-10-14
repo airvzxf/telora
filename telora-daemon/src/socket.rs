@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::path::{Path, PathBuf};
 use telora_common::protocol::{
-    Error as ProtocolError, ErrorCode, Reply, decode_request, encode_reply, read_message,
+    Error as ProtocolError, ErrorCode, Reply, Transcript, decode_request, encode_reply,
+    read_message,
 };
 use telora_common::socket_bind::{adopt_systemd_listener, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -153,9 +154,9 @@ pub enum Command {
     Start {
         response_tx: oneshot::Sender<Result<(), ProtocolError>>,
     },
-    /// Answered with the transcription, empty when there was no audio.
+    /// Answered with what the last recording produced.
     Stop {
-        response_tx: oneshot::Sender<Result<String, ProtocolError>>,
+        response_tx: oneshot::Sender<Result<Transcript, ProtocolError>>,
     },
     Cancel,
     GetStatus {
@@ -280,8 +281,8 @@ async fn dispatch(cmd: &str, cmd_tx: &mpsc::Sender<Command>) -> Reply {
             Ok(Map::new())
         }
         "stop" => {
-            let text = ask(cmd_tx, |response_tx| Command::Stop { response_tx }).await??;
-            Ok(fields("text", text))
+            let transcript = ask(cmd_tx, |response_tx| Command::Stop { response_tx }).await??;
+            Ok(transcript.into_fields())
         }
         "cancel" => {
             cmd_tx.send(Command::Cancel).await.map_err(|_| closing())?;

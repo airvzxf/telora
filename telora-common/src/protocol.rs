@@ -90,6 +90,48 @@ pub struct StatusResponse {
     pub engine: String,
 }
 
+/// `reason` of a STOP reply whose recording held no speech.
+pub const NO_SPEECH: &str = "no_speech";
+
+/// What a STOP produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transcript {
+    Text(String),
+    /// The recording held no speech, so it was not transcribed.
+    NoSpeech,
+}
+
+impl Transcript {
+    /// The STOP reply fields: `{"text":…}`, or `{"text":"","reason":"no_speech"}`.
+    pub fn into_fields(self) -> Map<String, Value> {
+        let mut fields = Map::new();
+        match self {
+            Transcript::Text(text) => {
+                fields.insert("text".into(), text.into());
+            }
+            Transcript::NoSpeech => {
+                fields.insert("text".into(), "".into());
+                fields.insert("reason".into(), NO_SPEECH.into());
+            }
+        }
+        fields
+    }
+
+    /// # Errors
+    ///
+    /// When the reply has no `text`.
+    pub fn from_fields(fields: &Map<String, Value>) -> Result<Self, String> {
+        if fields.get("reason").and_then(Value::as_str) == Some(NO_SPEECH) {
+            return Ok(Transcript::NoSpeech);
+        }
+        fields
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| Transcript::Text(text.to_string()))
+            .ok_or_else(|| "respuesta del daemon sin texto".to_string())
+    }
+}
+
 pub fn encode_request(cmd: &str) -> Vec<u8> {
     line(&serde_json::json!({ "v": VERSION, "cmd": cmd }))
 }
@@ -222,6 +264,33 @@ mod tests {
         fields.insert("text".into(), "ERROR: el código falla".into());
         let decoded = decode_reply(&encode_reply(&Ok(fields))).unwrap().unwrap();
         assert_eq!(decoded["text"], "ERROR: el código falla");
+    }
+
+    // An empty text alone cannot tell "no speech" from "the engine
+    // returned nothing"; the GUI shows them differently.
+    #[test]
+    fn no_speech_travels_as_its_own_reason() {
+        let fields = Transcript::NoSpeech.into_fields();
+        assert_eq!(
+            Value::Object(fields.clone()),
+            serde_json::json!({"text": "", "reason": "no_speech"})
+        );
+        assert_eq!(Transcript::from_fields(&fields), Ok(Transcript::NoSpeech));
+
+        let empty = Transcript::Text(String::new()).into_fields();
+        assert_eq!(
+            Value::Object(empty.clone()),
+            serde_json::json!({"text": ""})
+        );
+        assert_eq!(
+            Transcript::from_fields(&empty),
+            Ok(Transcript::Text(String::new()))
+        );
+    }
+
+    #[test]
+    fn a_stop_reply_without_text_is_rejected() {
+        assert!(Transcript::from_fields(&Map::new()).is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use telora_common::protocol::{self, Error, ErrorCode, Reply, StatusResponse};
+use telora_common::protocol::{self, Error, ErrorCode, Reply, StatusResponse, Transcript};
 use telora_daemon::{Command, SocketServer};
 
 /// Process-global mutex serialising every env-dependent test in
@@ -180,12 +180,25 @@ async fn a_transcription_that_starts_with_error_is_delivered_as_text() {
     let client = tokio::spawn(call(server.sock_path().to_path_buf(), "stop"));
     match cmd_rx.recv().await.expect("command") {
         Command::Stop { response_tx } => response_tx
-            .send(Ok("ERROR: no compila".to_string()))
+            .send(Ok(Transcript::Text("ERROR: no compila".to_string())))
             .unwrap(),
         other => panic!("expected Stop, got {other:?}"),
     }
     let fields = client.await.unwrap().expect("a successful reply");
     assert_eq!(fields["text"], "ERROR: no compila");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_recording_without_speech_says_so_on_the_wire() {
+    let (server, mut cmd_rx) = spawn_server();
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "stop"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Stop { response_tx } => response_tx.send(Ok(Transcript::NoSpeech)).unwrap(),
+        other => panic!("expected Stop, got {other:?}"),
+    }
+    let fields = client.await.unwrap().expect("a successful reply");
+    assert_eq!(fields["text"], "");
+    assert_eq!(fields["reason"], protocol::NO_SPEECH);
 }
 
 #[tokio::test(flavor = "current_thread")]
