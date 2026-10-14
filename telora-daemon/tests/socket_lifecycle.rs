@@ -52,18 +52,9 @@ fn make_env_restore() -> impl Drop {
     Restore(prev)
 }
 
-/// Bound server handle returned by [`spawn_server`] /
-/// [`spawn_server_at`]. Dropping the handle aborts the spawned
-/// `run()` task (which closes the listener FD) and unlinks the
-/// per-test socket file. The `Drop`-cleanup contract is
-/// unit-tested at `telora-daemon/src/socket.rs:444`; this struct
-/// is the integration-level mirror that the spawned-task path
-/// also releases the inode.
-///
-/// `_tmp` is `Some` for [`spawn_server`] (the helper owns the
-/// tempdir) and `None` for [`spawn_server_at`] (the caller owns
-/// the tempdir; see `second_bind_takes_over_the_path` and
-/// `lifecycle_resolve_picks_xdg_socket_dir`).
+/// A running [`SocketServer`]; dropping it aborts the server task,
+/// whose own `Drop` unlinks the socket. `_tmp` is `None` when the
+/// caller owns the directory.
 struct TestServer {
     _tmp: Option<TempDir>,
     join: JoinHandle<()>,
@@ -78,36 +69,16 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Abort the spawned `run()` task. The task is parked in
-        // `listener.accept().await`, so the abort fires at the
-        // next scheduler tick; dropping the `SocketServer`
-        // inside the task then runs its `Drop` impl and unlinks
-        // the socket file.
-        //
-        // We deliberately do NOT unlink the socket file here:
-        // doing so would race with `second_bind_takes_over_the_path`
-        // where a second `TestServer` has already taken over the
-        // path — the first server's `Drop` would unlink the
-        // second server's socket file. The `SocketServer`'s own
-        // `Drop` impl (unit-tested at
-        // `telora-daemon/src/socket.rs:444`) is the single
-        // source of truth for socket-file cleanup.
         self.join.abort();
     }
 }
 
-/// Bind a fresh [`SocketServer`] at `tempdir/daemon.sock` and
-/// spawn its `run()` task on the current tokio runtime.
-///
-/// Channel buffer is `1` because each test issues exactly one
-/// command and the server's `cmd_tx.send(...).await` only
-/// completes once the test pulls from `cmd_rx` — a larger
-/// buffer would just let the server race ahead and write the
-/// response before the test could inspect the dispatched
-/// [`Command`].
+/// Bind a [`SocketServer`] in a fresh directory and run it. The
+/// channel holds one command, so the server waits for the test to
+/// take it before answering.
 fn spawn_server() -> (TestServer, mpsc::Receiver<Command>) {
     let tmp = unique_tempdir();
-    let sock_path = tmp.path().join("daemon.sock");
+    let sock_path = tmp.path().join("telora/daemon.sock");
     let (cmd_tx, cmd_rx) = mpsc::channel(1);
     let server = SocketServer::bind(&sock_path, cmd_tx, false).expect("bind SocketServer");
     let join = tokio::spawn(async move {
@@ -123,11 +94,7 @@ fn spawn_server() -> (TestServer, mpsc::Receiver<Command>) {
     )
 }
 
-/// Like [`spawn_server`] but binds at a caller-supplied path.
-/// Used by [`second_bind_takes_over_the_path`] (same path twice)
-/// and [`lifecycle_resolve_picks_xdg_socket_dir`] (path from the
-/// resolver cascade); the caller is responsible for the tempdir's
-/// lifetime.
+/// Like [`spawn_server`], at a path whose directory the caller owns.
 fn spawn_server_at(sock_path: &Path) -> (TestServer, mpsc::Receiver<Command>) {
     let (cmd_tx, cmd_rx) = mpsc::channel(1);
     let server = SocketServer::bind(sock_path, cmd_tx, false).expect("bind SocketServer");
@@ -354,57 +321,26 @@ async fn a_request_split_across_writes_is_reassembled() {
     assert_eq!(client.await.unwrap(), b"{\"ok\":true}\n");
 }
 
-/// A second `SocketServer::bind` on the same path MUST succeed
-/// and take over the path. This is by design: the bind helper
-/// removes stale same-UID sockets before `bind(2)` (see
-/// `telora-common/src/socket_bind.rs:855-867`). The previous
-/// `concurrent_double_bind_only_one_wins` test asserted the
-/// OPPOSITE — it expected `EADDRINUSE` — but the bind is
-/// intentionally idempotent so a daemon restart (e.g. after a
-/// crash that left the socket file behind) does not require
-/// manual `rm` cleanup. This test pins the takeover semantic;
-/// if a future change makes the bind fail on `EADDRINUSE`,
-/// daemon restart will break and this test will catch it.
-///
-/// See `telora-common/src/socket_bind.rs::bind_is_idempotent_when_socket_already_owned`
-/// for the unit-level pin.
+// The old bind took over the path, leaving the running daemon unreachable.
 #[tokio::test(flavor = "current_thread")]
-async fn second_bind_takes_over_the_path() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let tmp = unique_tempdir();
-    let sock_path = tmp.path().join("daemon.sock");
-    // Bind server1 manually (no `TestServer` wrapper, no
-    // spawned run task). We only need the socket file to
-    // exist so server2's bind helper exercises the
-    // stale-socket removal path; we do not accept any
-    // connections on server1.
-    //
-    // We `mem::forget` server1 to prevent its
-    // `SocketServer::Drop` from running. The drop unlinks by
-    // path, and after server2 binds the path points to
-    // server2's inode — server1's drop would happily remove
-    // server2's socket file. Forgetting server1 lets the
-    // tempdir cleanup at end of test handle the inode.
-    let (cmd_tx1, _cmd_rx1) = mpsc::channel::<Command>(1);
-    let server1 = SocketServer::bind(&sock_path, cmd_tx1, false).expect("bind server1");
-    std::mem::forget(server1);
-    let (server2, mut cmd_rx2) = spawn_server_at(&sock_path);
-    let sock_path_for_client = sock_path.clone();
-    let client_task = tokio::spawn(call(sock_path_for_client, "start"));
-    match cmd_rx2.recv().await.expect("command") {
-        Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
-        other => panic!("expected Command::Start, got {other:?}"),
-    }
-    assert!(client_task.await.expect("client task").is_ok());
-    drop(server2);
+async fn a_second_daemon_is_rejected_and_the_first_keeps_serving() {
+    let (first, mut cmd_rx) = spawn_server();
+    let sock_path = first.sock_path().to_path_buf();
+    let (cmd_tx2, _cmd_rx2) = mpsc::channel::<Command>(1);
+    let err = SocketServer::bind(&sock_path, cmd_tx2, false)
+        .expect_err("a live socket must not be taken over");
+    assert!(
+        format!("{err:#}").contains("ya hay un telora-daemon"),
+        "{err:#}"
+    );
+
+    let client = tokio::spawn(call(sock_path, "cancel"));
+    assert!(matches!(cmd_rx.recv().await, Some(Command::Cancel)));
+    assert!(client.await.unwrap().is_ok());
 }
 
-/// Integration-level complement to the unit test at
-/// `telora-daemon/src/socket.rs:444`: when the spawned `run()`
-/// task is aborted (and its `SocketServer` is dropped as part
-/// of the abort), the socket file must be unlinked. Without
-/// this, a crashed or `Ctrl-C`'d daemon would leave debris
-/// under `$XDG_RUNTIME_DIR/telora/`.
+/// Aborting the server task drops the `SocketServer`, which must
+/// unlink the socket it bound.
 #[tokio::test(flavor = "current_thread")]
 async fn socket_file_is_unlinked_after_run_task_is_aborted() {
     let _ = env_logger::builder().is_test(true).try_init();

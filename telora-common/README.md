@@ -7,10 +7,11 @@ Shared library crate for the telora workspace.
 - **`paths`** — socket-path resolution and runtime directory helpers.
   - `PathsConfig`, `ResolvedPaths`, `resolve()` — the four-step cascade
     (`socket_dir` → `$XDG_RUNTIME_DIR/telora/` →
-    `/run/user/<uid>/telora/` → `/tmp/telora-<uid>/`) with the parent
-    directory created at mode `0o700`.
-  - `ensure_dir_0700()` — recursive `mkdir` plus a defensive
-    post-create `mode & 0o077 != 0` re-check.
+    `/run/user/<uid>/telora/` → `/tmp/telora-<uid>/`). Resolving does not
+    touch the disk.
+  - `ensure_dir_0700()` — creates missing directories at `0o700`; an
+    existing one is never chmod'ed and must already be the user's and
+    closed to group and others.
 - **`config`** — the `telora.toml` cascade every binary reads
   (`/etc/telora.toml` → `$XDG_CONFIG_HOME/telora/config.toml` →
   `--config` → `TELORA_*`), and `resolve_paths()` for the sockets.
@@ -22,7 +23,8 @@ Shared library crate for the telora workspace.
   GUI. In the daemon it adopts a validated systemd listener when
   `LISTEN_PID`/`LISTEN_FDS` are present; otherwise it uses the manual path.
   The manual path pins the Linux parent directory with `O_PATH | O_NOFOLLOW`,
-  removes only current-user stale sockets, rejects non-socket entries, and
+  replaces a current-user socket only when nothing answers on it (a second
+  instance fails instead of taking over), rejects non-socket entries, and
   applies `chmod 0o600` through the pinned directory without changing the
   process umask.
 - **`cache`** — Voxora model-cache resolution shared by `telora-daemon` and

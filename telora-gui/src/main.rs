@@ -150,7 +150,14 @@ fn main() {
         .application_id("io.github.telora.client")
         .build();
 
+    let activated = std::cell::Cell::new(false);
     app.connect_activate(move |app| {
+        // Launching telora-gui again makes GTK activate this instance a
+        // second time; setting up twice would add a second tray icon.
+        if activated.replace(true) {
+            info!("telora-gui ya está en ejecución; se ignora el nuevo arranque");
+            return;
+        }
         // Keep the app running even without visible windows
         let _hold_guard = app.hold();
 
