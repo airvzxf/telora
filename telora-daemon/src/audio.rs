@@ -18,6 +18,7 @@ const QUEUE_SAMPLES: usize = TARGET_RATE_HZ as usize * 30;
 
 /// The capture device, open only while recording so the desktop's
 /// microphone indicator is off the rest of the time.
+#[derive(Default)]
 pub struct Microphone {
     config: AudioConfig,
     capture: Option<Capture>,
@@ -29,16 +30,11 @@ struct Capture {
     queue: Consumer<f32, Arc<HeapRb<f32>>>,
 }
 
-impl Microphone {
-    pub fn new(config: AudioConfig) -> Self {
-        Self {
-            config,
-            capture: None,
-        }
-    }
-}
-
 impl AudioSource for Microphone {
+    fn set_config(&mut self, config: AudioConfig) {
+        self.config = config;
+    }
+
     fn start(&mut self) -> Result<(), String> {
         self.capture = None;
         let capture = open_capture(&self.config).map_err(|e| format!("{e:#}"))?;

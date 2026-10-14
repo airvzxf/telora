@@ -4,7 +4,7 @@ use log::{info, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use telora_common::cache::resolve_voxora_cache;
-use telora_common::config::Cascade;
+use telora_common::config::{Cascade, load_paths_config_from};
 use telora_daemon::daemon::{self, Daemon, Hooks};
 use telora_daemon::{
     BridgeTranscriber, DaemonConfig, Microphone, SocketServer, StatusResponse, SttConfig,
@@ -22,7 +22,7 @@ async fn notify_client_auto_stop(control_socket: &str) {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Telora Daemon - Background transcription service", long_about = None)]
 struct Args {
     #[command(subcommand)]
@@ -62,11 +62,13 @@ struct Args {
     voxora_cache: Option<PathBuf>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// Show daemon status and configuration
     Status,
-    /// Reload configuration and restart the model if needed
+    /// Make the running daemon re-read its own configuration (the files
+    /// and options it was started with) and reload the model if it
+    /// changed
     Refresh,
 }
 
@@ -96,50 +98,35 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
     Ok(cfg)
 }
 
-async fn run_refresh_client(config: SttConfig, socket_path: &str) -> Result<()> {
-    let mut stream = match UnixStream::connect(socket_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to connect to daemon at {}: {} (is the daemon running?)",
-                socket_path,
-                e
-            ));
-        }
-    };
+/// Socket of the running daemon, from the `[paths]` of the same cascade.
+fn daemon_socket(args: &Args) -> Result<String> {
+    let cascade = Cascade::standard(args.config.as_deref().map(Path::new));
+    let resolved = paths::resolve(&load_paths_config_from(&cascade)?)?;
+    Ok(resolved.daemon_sock.to_string_lossy().into_owned())
+}
 
-    let config_json = serde_json::to_string(&config)?;
-    let command = format!("REFRESH {}", config_json);
-
+/// The daemon's answer to REFRESH: `OK: …` or `ERROR: …`.
+async fn run_refresh_client(socket_path: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(socket_path).await.with_context(|| {
+        format!("no se pudo conectar con el daemon en {socket_path} (¿está corriendo?)")
+    })?;
     stream
-        .write_all(command.as_bytes())
+        .write_all(b"REFRESH")
         .await
         .context("Failed to send refresh command to daemon")?;
-
-    // Half-close the write side so the server's `read_to_end`
-    // (telora-daemon/src/socket.rs:200-203) reaches EOF and proceeds
-    // to write the response. Without this the daemon hangs forever
-    // waiting for our EOF; introduced by PR #132 (ed326d2). The
-    // `Refresh` subcommand would then block on `read_to_end` until
-    // the operator hit Ctrl-C, masking the reload as a hang.
+    // The daemon reads until EOF before answering.
     stream
         .shutdown()
         .await
         .context("Failed to half-close write side of daemon socket")?;
 
-    // Cap the response at 64 KiB to avoid an unbounded read if the
-    // daemon ever leaks a non-terminating stream.
     let mut buf = Vec::new();
     let mut limited = stream.take(64 * 1024);
     limited
         .read_to_end(&mut buf)
         .await
         .context("Failed to read response from daemon")?;
-
-    let response = String::from_utf8_lossy(&buf);
-    println!("{}", response);
-
-    Ok(())
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 async fn run_status_client(socket_path: &str) -> Result<()> {
@@ -327,32 +314,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(Commands::Status) = args.command {
-        // Status client best-effort: if config load fails we still
-        // try to reach the daemon through the resolver's default
-        // cascade (XDG_RUNTIME_DIR → /run/user/<uid>/ → /tmp/<uid>/).
-        // Both errors are surfaced on stderr.
-        let paths_cfg = match load_config(&args) {
-            Ok(c) => paths::PathsConfig {
-                socket_dir: c.paths.socket_dir.clone(),
-                daemon_socket: c.paths.daemon_socket.clone(),
-                control_socket: c.paths.control_socket.clone(),
-            },
-            Err(e) => {
-                eprintln!(
-                    "Error loading configuration: {}. Falling back to default socket resolver.",
-                    e
-                );
-                paths::PathsConfig::default()
-            }
-        };
-        let resolved = match paths::resolve(&paths_cfg) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Error resolving socket path: {}", e);
-                return Ok(());
-            }
-        };
-        let daemon_sock = resolved.daemon_sock.to_string_lossy().into_owned();
+        let daemon_sock = daemon_socket(&args)?;
         if let Err(e) = run_status_client(&daemon_sock).await {
             eprintln!("Error querying status: {}", e);
         }
@@ -360,25 +322,13 @@ async fn main() -> Result<()> {
     }
 
     if let Some(Commands::Refresh) = args.command {
-        let cfg = match load_config(&args) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error loading configuration: {}", e);
-                return Ok(());
-            }
-        };
-        let paths_cfg = paths::PathsConfig {
-            socket_dir: cfg.paths.socket_dir.clone(),
-            daemon_socket: cfg.paths.daemon_socket.clone(),
-            control_socket: cfg.paths.control_socket.clone(),
-        };
-        let resolved = paths::resolve(&paths_cfg).context("resolving daemon socket path")?;
-        let daemon_sock = resolved.daemon_sock.to_string_lossy().into_owned();
-        // Propagate failures so `telora-daemon refresh` exits non-zero
-        // on connection / write / read errors. Hotkey wrappers and CI
-        // jobs rely on the exit code to detect a successful refresh.
-        run_refresh_client(cfg.stt, &daemon_sock).await?;
-        return Ok(());
+        let reply = run_refresh_client(&daemon_socket(&args)?).await?;
+        if reply.starts_with("OK") {
+            println!("{reply}");
+            return Ok(());
+        }
+        eprintln!("{reply}");
+        std::process::exit(1);
     }
 
     let daemon_cfg = match load_config(&args) {
@@ -388,7 +338,6 @@ async fn main() -> Result<()> {
         }
     };
     let paths_config = daemon_cfg.paths.clone();
-    let stt_config = daemon_cfg.stt;
 
     // Resolve the voxora cache root. The explicit override and the
     // `VOXORA_CACHE_DIR` env var both pin a custom location; in
@@ -426,12 +375,11 @@ async fn main() -> Result<()> {
     secure_voxora_cache_dir(&voxora_cache);
 
     info!("Starting Telora Daemon...");
-    info!("Model kind: {}", stt_config.model_kind);
-    info!("Model id:   {}", stt_config.model_id);
-    info!("Language:   {}", stt_config.language);
+    info!("Model kind: {}", daemon_cfg.stt.model_kind);
+    info!("Model id:   {}", daemon_cfg.stt.model_id);
+    info!("Language:   {}", daemon_cfg.stt.language);
 
-    let microphone = Microphone::new(daemon_cfg.audio.clone());
-    let (daemon, initial_load) = Daemon::new(microphone, stt_config);
+    let (daemon, initial_load) = Daemon::new(Microphone::default(), daemon_cfg);
 
     // Socket
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -495,6 +443,9 @@ async fn main() -> Result<()> {
                     .map_err(|e| format!("{e:#}"))
             })
         }),
+        // REFRESH re-reads with the daemon's own options and environment,
+        // not the client's.
+        read_config: Box::new(move || load_config(&args).map_err(|e| format!("{e:#}"))),
         notify_auto_stop: Box::new(move || {
             let control_sock = control_sock.clone();
             tokio::spawn(async move { notify_client_auto_stop(&control_sock).await });

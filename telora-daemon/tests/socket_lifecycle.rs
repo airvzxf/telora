@@ -7,7 +7,7 @@
 //! previous incarnation of this file (issue #73) bound with a raw
 //! `UnixListener` and hand-echoed the `START` response, leaving
 //! every other branch of `SocketServer::run` (STOP round-trip,
-//! STATUS serialisation, REFRESH parsing, the dropped-oneshot and
+//! STATUS serialisation, REFRESH, the dropped-oneshot and
 //! closed-channel error paths, and the bind-takeover semantic)
 //! untested.
 //!
@@ -46,7 +46,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use telora_daemon::{Command, SocketServer, StatusResponse, SttConfig};
+use telora_daemon::{Command, SocketServer, StatusResponse};
 
 /// Process-global mutex serialising every env-dependent test in
 /// this file. Dispatch tests do not touch env vars and can run
@@ -320,148 +320,56 @@ async fn status_returns_serialised_status_response() {
     assert_eq!(parsed.engine, "loading");
 }
 
-/// `REFRESH {json}` must parse the JSON, dispatch
-/// [`Command::ReloadConfig`] carrying the parsed [`SttConfig`],
-/// and forward `Ok(())` from the event loop as `OK: Config
-/// reloaded`. Asserts on `new_config.model_id` to confirm the
-/// server actually parsed the JSON (a `{}` payload would
-/// silently parse and leave `model_id` empty — this assertion
-/// catches that).
+/// A bare `REFRESH` reaches the event loop and its answer goes back
+/// as `OK: …`.
 #[tokio::test(flavor = "current_thread")]
-async fn refresh_parses_json_and_dispatches_reload_config() {
+async fn refresh_is_dispatched_and_its_answer_forwarded() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (server, mut cmd_rx) = spawn_server();
     let sock_path = server.sock_path().to_path_buf();
-    let new_config = SttConfig {
-        model_id: "Qwen/Qwen3-ASR-0.6B".to_string(),
-        model_kind: "qwen3-asr".to_string(),
-        model_path: String::new(),
-        language: "en".to_string(),
-        max_recording_seconds: 300,
+    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"REFRESH").await });
+    let response_tx = match cmd_rx.recv().await.expect("command") {
+        Command::Refresh { response_tx } => response_tx,
+        other => panic!("expected Command::Refresh, got {other:?}"),
     };
-    let payload = format!("REFRESH {}", serde_json::to_string(&new_config).unwrap());
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, payload.as_bytes()).await });
-    let (received_config, response_tx) = match cmd_rx.recv().await.expect("command") {
-        Command::ReloadConfig {
-            new_config,
-            response_tx,
-        } => (new_config, response_tx),
-        other => panic!("expected Command::ReloadConfig, got {other:?}"),
-    };
-    assert_eq!(
-        received_config.model_id, new_config.model_id,
-        "server should have parsed the JSON and carried the model_id through"
-    );
-    assert_eq!(received_config.model_kind, new_config.model_kind);
-    response_tx.send(Ok(())).expect("send Ok(())");
+    response_tx
+        .send(Ok("configuración recargada".to_string()))
+        .expect("send Ok");
     let response = client_task.await.expect("client task");
-    assert_eq!(response, b"OK: Config reloaded");
+    assert_eq!(response, "OK: configuración recargada".as_bytes());
 }
 
-/// Regression test for the bug fixed by PR #132 (issue #114):
-/// `REFRESH` whose JSON is split across multiple read syscalls
-/// used to fail with a confusing `EOF while parsing a value` and
-/// the operator saw `ERROR: Invalid config JSON`. The fix lifted
-/// the read into `read_to_end` with a 64 KiB cap
-/// (`telora-daemon/src/socket.rs:200-203`). This test splits
-/// the payload into a `REFRESH ` prefix and the JSON body,
-/// yields between the two writes (so the server's
-/// `read_to_end` observes them as separate reads), and verifies
-/// the full dispatch.
+/// The daemon re-reads its own configuration; a client cannot push one.
 #[tokio::test(flavor = "current_thread")]
-async fn refresh_split_across_two_writes_is_reassembled() {
+async fn refresh_with_a_payload_is_rejected_without_dispatch() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (server, mut cmd_rx) = spawn_server();
     let sock_path = server.sock_path().to_path_buf();
-    let new_config = SttConfig {
-        model_id: "split/model.bin".to_string(),
-        model_kind: "whisper".to_string(),
-        model_path: String::new(),
-        language: "es".to_string(),
-        max_recording_seconds: 600,
-    };
-    let json = serde_json::to_string(&new_config).unwrap();
-    let client_task = tokio::spawn(async move {
-        let mut client = UnixStream::connect(&sock_path).await.expect("connect");
-        client.write_all(b"REFRESH ").await.expect("write prefix");
-        // Yield so the server's `read_to_end` observes the two
-        // writes as separate reads — the bug was that the
-        // pre-#132 server read a fixed-size prefix and tripped
-        // the JSON parser's "unexpected EOF" branch on the
-        // split.
-        tokio::task::yield_now().await;
-        client.write_all(json.as_bytes()).await.expect("write JSON");
-        client.shutdown().await.expect("half-close");
-        let mut buf = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf))
-            .await
-            .expect("server failed to respond within 2s");
-        read.expect("read_to_end");
-        buf
-    });
-    let (received_config, response_tx) = match cmd_rx.recv().await.expect("command") {
-        Command::ReloadConfig {
-            new_config,
-            response_tx,
-        } => (new_config, response_tx),
-        other => panic!("expected Command::ReloadConfig, got {other:?}"),
-    };
-    assert_eq!(received_config.model_id, "split/model.bin");
-    response_tx.send(Ok(())).expect("send Ok(())");
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"OK: Config reloaded");
-}
-
-/// Malformed JSON in `REFRESH` must be reported as
-/// `ERROR: Invalid config JSON: <serde error>` BEFORE the
-/// command is dispatched. The server must not consume the
-/// `ReloadConfig` slot for a malformed payload.
-#[tokio::test(flavor = "current_thread")]
-async fn refresh_with_malformed_json_reports_parse_error() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task =
-        tokio::spawn(async move { round_trip(&sock_path, b"REFRESH {garbage}").await });
-    let response = client_task.await.expect("client task");
+    let response = round_trip(&sock_path, br#"REFRESH {"model_id":"org/repo/x.bin"}"#).await;
+    let response = String::from_utf8_lossy(&response);
     assert!(
-        response.starts_with(b"ERROR: Invalid config JSON"),
-        "expected parse error, got: {:?}",
-        String::from_utf8_lossy(&response)
+        response.starts_with("ERROR: REFRESH no lleva argumentos"),
+        "{response}"
     );
-    // The command was never dispatched, so the channel must be
-    // empty. A 100 ms timeout is enough for any spurious
-    // dispatch to surface; if it does not, the test passes by
-    // omission (the assert below).
     let spurious = tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv()).await;
     assert!(
         spurious.is_err(),
-        "malformed REFRESH must not dispatch a command"
+        "a REFRESH with a payload must not dispatch"
     );
 }
 
-/// When the event loop's reload handler returns an error (e.g.
-/// the voxora engine failed to load), the server must forward it
-/// verbatim: `ERROR: <message>`. The test sends a valid config,
-/// then sends `Err(anyhow!("boom"))` through the `response_tx`
-/// oneshot and asserts the wire reply.
 #[tokio::test(flavor = "current_thread")]
 async fn refresh_error_from_event_loop_is_forwarded() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (server, mut cmd_rx) = spawn_server();
     let sock_path = server.sock_path().to_path_buf();
-    let new_config = SttConfig {
-        model_id: "err/model.bin".to_string(),
-        ..SttConfig::default()
-    };
-    let payload = format!("REFRESH {}", serde_json::to_string(&new_config).unwrap());
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, payload.as_bytes()).await });
+    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"REFRESH").await });
     let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::ReloadConfig { response_tx, .. } => response_tx,
-        other => panic!("expected Command::ReloadConfig, got {other:?}"),
+        Command::Refresh { response_tx } => response_tx,
+        other => panic!("expected Command::Refresh, got {other:?}"),
     };
     response_tx
-        .send(Err(anyhow::anyhow!("boom")))
+        .send(Err("boom".to_string()))
         .expect("send reload error");
     let response = client_task.await.expect("client task");
     assert_eq!(response, b"ERROR: boom");

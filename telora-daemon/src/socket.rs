@@ -55,7 +55,7 @@ pub struct SttConfig {
 /// `[paths]` section of `telora.toml`. All fields are optional; an
 /// empty section (or its absence) falls back to the resolver in
 /// [`crate::paths`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct PathsConfig {
     #[serde(default)]
@@ -172,11 +172,11 @@ pub enum Command {
     GetStatus {
         response_tx: oneshot::Sender<StatusResponse>,
     },
-    /// Apply a new STT configuration, reloading the model if it changed.
-    /// A model change is refused while a recording is in progress.
-    ReloadConfig {
-        new_config: SttConfig,
-        response_tx: oneshot::Sender<Result<()>>,
+    /// Re-read the daemon's own configuration and apply it, reloading
+    /// the model if it changed. Answered with the `OK:` text or the
+    /// reason it was refused.
+    Refresh {
+        response_tx: oneshot::Sender<Result<String, String>>,
     },
 }
 
@@ -248,19 +248,12 @@ impl SocketServer {
                         // from `stream`, and the spawned future must
                         // own all of its captured state).
                         let (mut read_half, mut write_half) = stream.split();
-                        // Read the full payload rather than a fixed
-                        // 2 KiB slice. A REFRESH whose JSON is split
-                        // across multiple read syscalls (common on
-                        // Unix sockets with `MSG_DONTWAIT` /
-                        // segmentation) used to fail with a confusing
-                        // `EOF while parsing` and the operator saw
-                        // `ERROR: Invalid config JSON: …`. The cap at
-                        // 64 KiB protects against a flood that would
-                        // otherwise grow the buffer up to the kernel
-                        // `SO_RCVBUF` ceiling.
-                        const REFRESH_MAX_BYTES: u64 = 64 * 1024;
+                        // A command ends at the client's half-close; the
+                        // cap keeps a flood from growing the buffer
+                        // without bound.
+                        const MAX_COMMAND_BYTES: u64 = 64 * 1024;
                         let mut buf = Vec::new();
-                        let mut limited = (&mut read_half).take(REFRESH_MAX_BYTES);
+                        let mut limited = (&mut read_half).take(MAX_COMMAND_BYTES);
                         match limited.read_to_end(&mut buf).await {
                             Ok(_) if buf.is_empty() => {
                                 let _ = write_half.write_all(b"ERROR: empty command").await;
@@ -268,56 +261,6 @@ impl SocketServer {
                             Ok(_) => {
                                 let command_str = String::from_utf8_lossy(&buf).trim().to_string();
                                 info!("Received command: {}", command_str);
-
-                                if command_str.starts_with("REFRESH") {
-                                    let json_part =
-                                        command_str.strip_prefix("REFRESH").unwrap_or("").trim();
-                                    match serde_json::from_str::<SttConfig>(json_part) {
-                                        Ok(new_config) => {
-                                            let (tx, rx) = oneshot::channel();
-                                            if let Err(e) = cmd_tx
-                                                .send(Command::ReloadConfig {
-                                                    new_config,
-                                                    response_tx: tx,
-                                                })
-                                                .await
-                                            {
-                                                error!("Failed to send reload command: {}", e);
-                                                let _ = stream
-                                                    .write_all(b"ERROR: Internal channel error")
-                                                    .await;
-                                            } else {
-                                                match rx.await {
-                                                    Ok(Ok(())) => {
-                                                        let _ = stream
-                                                            .write_all(b"OK: Config reloaded")
-                                                            .await;
-                                                    }
-                                                    Ok(Err(e)) => {
-                                                        let _ = stream
-                                                            .write_all(
-                                                                format!("ERROR: {}", e).as_bytes(),
-                                                            )
-                                                            .await;
-                                                    }
-                                                    Err(_) => {
-                                                        let _ = write_half.write_all(b"ERROR: Reload cancelled or failed").await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to parse config JSON: {}", e);
-                                            let _ = stream
-                                                .write_all(
-                                                    format!("ERROR: Invalid config JSON: {}", e)
-                                                        .as_bytes(),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                    return;
-                                }
 
                                 match command_str.as_str() {
                                     "START" => {
@@ -387,6 +330,33 @@ impl SocketServer {
                                                 }
                                             }
                                         }
+                                    }
+                                    "REFRESH" => {
+                                        let (tx, rx) = oneshot::channel();
+                                        let reply = if let Err(e) =
+                                            cmd_tx.send(Command::Refresh { response_tx: tx }).await
+                                        {
+                                            error!("Failed to send refresh command: {}", e);
+                                            "ERROR: Internal channel error".to_string()
+                                        } else {
+                                            match rx.await {
+                                                Ok(Ok(message)) => format!("OK: {message}"),
+                                                Ok(Err(reason)) => format!("ERROR: {reason}"),
+                                                Err(_) => {
+                                                    "ERROR: Reload cancelled or failed".to_string()
+                                                }
+                                            }
+                                        };
+                                        let _ = write_half.write_all(reply.as_bytes()).await;
+                                    }
+                                    other if other.starts_with("REFRESH") => {
+                                        let _ = write_half
+                                            .write_all(
+                                                "ERROR: REFRESH no lleva argumentos; el daemon \
+                                                 relee su propia configuración"
+                                                    .as_bytes(),
+                                            )
+                                            .await;
                                     }
                                     _ => {
                                         let _ =
