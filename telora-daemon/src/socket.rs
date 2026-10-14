@@ -8,25 +8,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
 /// Status payload returned to clients over the unix socket.
-///
-/// `model_kind` is the voxora engine family (`whisper`,
-/// `qwen3-asr`, or `minimax`). `model_id` is the engine's
-/// authoritative label after build — the Hugging Face id for
-/// Whisper / Qwen3-ASR, or voxora's `DEFAULT_MODEL = "asr-1.0"`
-/// (or the operator's TOML override) for MiniMax.
-///
-/// `model_path` is the resolved local file or directory the
-/// on-disk engines loaded from (e.g.
-/// `/home/wolf/.cache/voxora/models/huggingface/.../ggml-base.bin`).
-/// `endpoint` is the API endpoint URL the hosted engine posts
-/// audio to (e.g. `https://api.minimax.io/v1/speech_to_text`).
-/// Exactly one of the two is non-empty for any given engine
-/// (closes #167), and the display logic in `run_status_client`
-/// picks the matching label — `Resolved Path:` for on-disk,
-/// `Endpoint:` for hosted. The two-field split replaced the
-/// previous single `model_path` field that overloaded both
-/// meanings and surfaced `hosted://…` URLs under a
-/// filesystem-path-shaped heading.
+/// `model_path` is the on-disk file or directory the engine loaded.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub active: bool,
@@ -34,7 +16,6 @@ pub struct StatusResponse {
     pub model_id: String,
     pub model_kind: String,
     pub model_path: String,
-    pub endpoint: String,
     pub language: String,
     pub max_recording_seconds: u32,
     pub state: String,
@@ -49,13 +30,6 @@ pub struct StatusResponse {
 /// `model_kind` is a free-form string at the JSON layer so we can
 /// pass it verbatim over the socket; the daemon validates it via
 /// [`voxora_bridge::EngineFamily::from_config`].
-///
-/// **No secrets live here.** The MiniMax bearer token (or any
-/// other operator secret) belongs in a `mode 0600` `.env` file
-/// at `$XDG_CONFIG_HOME/telora/.env` (default
-/// `~/.config/telora/.env`) or `/etc/telora/.env`, never in this
-/// TOML. The daemon reads the file via
-/// [`telora_common::resolve_minimax_api_key`] (closes #166).
 ///
 /// `Default` is derived so a flattened top-level field can supply
 /// an empty `SttConfig` when the user's `telora.toml` omits every
@@ -72,12 +46,6 @@ pub struct SttConfig {
     pub model_kind: String,
     #[serde(default)]
     pub model_path: String,
-    /// Resolved API endpoint URL for hosted engines (closes #167).
-    /// Empty for the on-disk engines (Whisper / Qwen3-ASR).
-    /// The status display branches on this being non-empty to
-    /// pick `Endpoint:` over `Resolved Path:`.
-    #[serde(default)]
-    pub endpoint: String,
     #[serde(default)]
     pub language: String,
     #[serde(default)]
@@ -186,7 +154,6 @@ pub fn default_stt_config() -> SttConfig {
         model_id: "ggerganov/whisper.cpp/ggml-base.bin".to_string(),
         model_kind: "whisper".to_string(),
         model_path: String::new(),
-        endpoint: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
     }

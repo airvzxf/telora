@@ -12,7 +12,6 @@ voxora-hf        = "0.6"
 voxora-bridge    = "0.6"
 voxora-registry  = "0.6"
 voxora-traits    = "0.6"
-voxora-minimax   = "0.6"
 libsystemd      = "0.7"
 telora-common    = { path = "telora-common" }
 
