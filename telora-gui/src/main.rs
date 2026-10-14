@@ -24,7 +24,7 @@ use config::GuiConfig;
 use connection::ControlServer;
 use session::{Effect, Event, Session};
 use telora_common::paths::ResolvedPaths;
-use telora_common::protocol::{self, ErrorCode, Reply};
+use telora_common::protocol::{self, ErrorCode, Reply, Transcript};
 use tray::{TrayCommand, TrayHandle, TrayState};
 use ui::Osd;
 
@@ -402,7 +402,15 @@ async fn handle_daemon_commands(
 async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) -> Event {
     let raw_text = match protocol::call(daemon_sock, "stop").await {
         Ok(reply) => match transcription(reply) {
-            Ok(text) => text,
+            Ok(Transcript::Text(text)) => text,
+            Ok(Transcript::NoSpeech) => {
+                return Event::Finished {
+                    message: "No se detectó voz".to_string(),
+                    color: session::COLOR_NEUTRAL.to_string(),
+                    hold_secs: 2,
+                    error: false,
+                };
+            }
             Err(reason) => {
                 log::error!("Daemon error: {reason}");
                 return finished_error(&session::short_error(&reason));
@@ -434,14 +442,9 @@ async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) ->
     }
 }
 
-/// The text of a STOP reply, or why there is none.
-fn transcription(reply: Reply) -> Result<String, String> {
-    let fields = reply.map_err(|e| e.message)?;
-    fields
-        .get("text")
-        .and_then(|t| t.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "respuesta del daemon sin texto".to_string())
+/// What a STOP reply carries, or why it failed.
+fn transcription(reply: Reply) -> Result<Transcript, String> {
+    Transcript::from_fields(&reply.map_err(|e| e.message)?)
 }
 
 fn finished_error(reason: &str) -> Event {
@@ -526,7 +529,7 @@ fn control_action(cmd: &str) -> Result<AppAction, protocol::Error> {
 #[cfg(test)]
 mod tests {
     use super::{describe_status, transcription};
-    use telora_common::protocol::{Error, ErrorCode};
+    use telora_common::protocol::{Error, ErrorCode, Transcript};
 
     fn fields(json: &str) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_str(json).unwrap()
@@ -553,7 +556,16 @@ mod tests {
     #[test]
     fn a_dictation_that_starts_with_error_is_kept() {
         let reply = Ok(fields(r#"{"text":"ERROR: no compila"}"#));
-        assert_eq!(transcription(reply).unwrap(), "ERROR: no compila");
+        assert_eq!(
+            transcription(reply).unwrap(),
+            Transcript::Text("ERROR: no compila".to_string())
+        );
+    }
+
+    #[test]
+    fn a_recording_without_speech_is_not_an_empty_dictation() {
+        let reply = Ok(fields(r#"{"text":"","reason":"no_speech"}"#));
+        assert_eq!(transcription(reply).unwrap(), Transcript::NoSpeech);
     }
 
     #[test]
