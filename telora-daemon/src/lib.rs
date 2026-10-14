@@ -80,7 +80,7 @@ pub fn resolve_voxora_cache(
 // Re-export the items `main.rs` (the binary) needs from the
 // otherwise-private `audio` and `transcriber` modules. Tests do not
 // touch these; they are surfaced strictly for the binary wiring.
-pub use audio::AudioEngine;
+pub use audio::Microphone;
 pub use transcriber::{BridgeTranscriber, Transcriber};
 
 #[cfg(test)]

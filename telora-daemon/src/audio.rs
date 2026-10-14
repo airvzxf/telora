@@ -1,240 +1,168 @@
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info};
-use ringbuf::{HeapRb, Producer};
+use ringbuf::{Consumer, HeapRb, Producer};
 use std::sync::Arc;
 
+use crate::daemon::AudioSource;
 use crate::resample::MonoResampler;
 use crate::socket::AudioConfig;
 
-/// Sample rate the downstream ASR (voxora-bridge `AsrEngine::transcribe`)
-/// and the daemon's recording buffer are sized for. The capture stream
-/// may run at a different native rate (e.g. Fifine's 48 kHz via direct
-/// ALSA); the audio thread resamples to this rate so the ring buffer
-/// always holds audio at the rate the rest of the pipeline expects.
-///
-/// Per `voxora-traits/src/engine.rs`: "Transcribe a buffer of mono PCM
-/// samples at the engine's expected sample rate (typically 16 kHz, f32
-/// in [-1.0, 1.0])". The daemon's recording cap (`16000 *
-/// max_recording_seconds`) also assumes this rate, so the buffer MUST
-/// hold samples at this rate regardless of capture rate.
-const WHISPER_RATE_HZ: u32 = 16000;
+/// Rate the engines expect and the recording buffer is sized for; the
+/// capture runs at whatever the device offers and is resampled to this.
+const TARGET_RATE_HZ: u32 = 16000;
 
-pub struct AudioEngine {
-    stream: Option<cpal::Stream>,
+/// Samples the capture callback can queue before the daemon drains them
+/// (it drains every 20 ms).
+const QUEUE_SAMPLES: usize = TARGET_RATE_HZ as usize * 30;
+
+/// The capture device, open only while recording so the desktop's
+/// microphone indicator is off the rest of the time.
+pub struct Microphone {
+    config: AudioConfig,
+    capture: Option<Capture>,
 }
 
-impl AudioEngine {
-    pub fn new() -> Result<Self> {
-        Ok(Self { stream: None })
+struct Capture {
+    // Dropping the stream closes the device.
+    _stream: cpal::Stream,
+    queue: Consumer<f32, Arc<HeapRb<f32>>>,
+}
+
+impl Microphone {
+    pub fn new(config: AudioConfig) -> Self {
+        Self {
+            config,
+            capture: None,
+        }
+    }
+}
+
+impl AudioSource for Microphone {
+    fn start(&mut self) -> Result<(), String> {
+        self.capture = None;
+        let capture = open_capture(&self.config).map_err(|e| format!("{e:#}"))?;
+        self.capture = Some(capture);
+        Ok(())
     }
 
-    pub fn start(
-        &mut self,
-        mut producer: Producer<f32, Arc<HeapRb<f32>>>,
-        config: &AudioConfig,
-    ) -> Result<u32> {
-        let host = cpal::default_host();
+    fn stop(&mut self) {
+        self.capture = None;
+    }
 
-        let device = select_input_device(&host, config).context("no usable input device")?;
-
-        info!(
-            "Using input device: {}",
-            device.name().unwrap_or("Unknown".to_string())
-        );
-
-        // Pick a sane mono config from `supported_input_configs()`.
-        // The naive `default_input_config()` lies on hosts where ALSA
-        // "default" routes through the PipeWire ALSA plugin (returns
-        // 2 ch / 44100 Hz / F32 even for a mono USB mic, and Fifine
-        // then rejects the 2-channel negotiation — `stream.play()`
-        // hangs forever). Walk a deterministic preference list:
-        // signed / wider sample formats first (Fifine is s24le,
-        // surfaced as I32 by cpal's ALSA backend because 24-bit audio
-        // is stored in 32-bit containers), 48000 Hz first (Fifine's
-        // HW-native rate via ALSA), then common alternates. Only fall
-        // back to `default_input_config()` when no mono config exists
-        // at all.
-        const RATE_PREFERENCE_HZ: &[u32] = &[48000, 44100, 32000, 22050, 16000];
-        const FORMAT_PREFERENCE: &[cpal::SampleFormat] = &[
-            cpal::SampleFormat::I32,
-            cpal::SampleFormat::I16,
-            cpal::SampleFormat::F32,
-            cpal::SampleFormat::U8,
-        ];
-
-        let supported_configs: Vec<cpal::SupportedStreamConfigRange> = device
-            .supported_input_configs()
-            .context("Failed to enumerate supported input configs")?
-            .collect();
-
-        let pick_mono = |fmt: cpal::SampleFormat| -> Option<&cpal::SupportedStreamConfigRange> {
-            supported_configs
-                .iter()
-                .find(|c| c.channels() == 1 && c.sample_format() == fmt)
+    fn drain_into(&mut self, buffer: &mut Vec<f32>, limit: usize) {
+        let Some(capture) = &mut self.capture else {
+            return;
         };
+        while buffer.len() < limit {
+            match capture.queue.pop() {
+                Some(sample) => buffer.push(sample),
+                None => break,
+            }
+        }
+    }
+}
 
-        let chosen = FORMAT_PREFERENCE
+fn open_capture(config: &AudioConfig) -> Result<Capture> {
+    let host = cpal::default_host();
+    let device = select_input_device(&host, config).context("no usable input device")?;
+    info!(
+        "Using input device: {}",
+        device.name().unwrap_or("Unknown".to_string())
+    );
+    let (stream_config, sample_format) = choose_stream_config(&device)?;
+    info!("Input config: {stream_config:?}, format {sample_format:?}");
+
+    let (producer, queue) = HeapRb::<f32>::new(QUEUE_SAMPLES).split();
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => build_stream(&device, &stream_config, producer, |s: f32| s),
+        cpal::SampleFormat::I16 => build_stream(&device, &stream_config, producer, |s: i16| {
+            f32::from(s) / f32::from(i16::MAX)
+        }),
+        // 24-bit devices (e.g. Fifine, s24le) arrive in 32-bit containers.
+        cpal::SampleFormat::I32 => build_stream(&device, &stream_config, producer, |s: i32| {
+            s as f32 / i32::MAX as f32
+        }),
+        cpal::SampleFormat::U16 => build_stream(&device, &stream_config, producer, |s: u16| {
+            (f32::from(s) - 32767.5) / 32767.5
+        }),
+        cpal::SampleFormat::U8 => build_stream(&device, &stream_config, producer, |s: u8| {
+            (f32::from(s) - 127.5) / 127.5
+        }),
+        other => Err(anyhow!("unsupported sample format {other:?}")),
+    }?;
+    stream.play().context("failed to start the audio stream")?;
+    Ok(Capture {
+        _stream: stream,
+        queue,
+    })
+}
+
+/// Pick a mono config from `supported_input_configs()`.
+///
+/// `default_input_config()` is not trusted: through the PipeWire ALSA
+/// plugin it reports 2 ch / 44.1 kHz even for a mono USB mic, and some
+/// mics (Fifine) then hang in `play()` on the 2-channel negotiation.
+fn choose_stream_config(device: &cpal::Device) -> Result<(cpal::StreamConfig, cpal::SampleFormat)> {
+    const RATE_PREFERENCE_HZ: &[u32] = &[48000, 44100, 32000, 22050, 16000];
+    const FORMAT_PREFERENCE: &[cpal::SampleFormat] = &[
+        cpal::SampleFormat::I32,
+        cpal::SampleFormat::I16,
+        cpal::SampleFormat::F32,
+        cpal::SampleFormat::U8,
+    ];
+
+    let supported: Vec<cpal::SupportedStreamConfigRange> = device
+        .supported_input_configs()
+        .context("failed to enumerate supported input configs")?
+        .collect();
+    let mono = FORMAT_PREFERENCE.iter().find_map(|&fmt| {
+        supported
             .iter()
-            .find_map(|&fmt| pick_mono(fmt).map(|cfg| (cfg, fmt)));
+            .find(|c| c.channels() == 1 && c.sample_format() == fmt)
+    });
 
-        let default_config = device
-            .default_input_config()
-            .context("Failed to get default input config")?;
-
-        let (actual_config, sample_format) = if let Some((cfg, _fmt)) = chosen {
-            let chosen_rate = RATE_PREFERENCE_HZ
-                .iter()
-                .copied()
-                .find(|&r| cfg.min_sample_rate().0 <= r && cfg.max_sample_rate().0 >= r)
-                .unwrap_or(cfg.max_sample_rate().0);
-            info!(
-                "Using mono device config (1 ch, {} Hz, format {:?}, range {}-{} Hz)...",
-                chosen_rate,
-                cfg.sample_format(),
-                cfg.min_sample_rate().0,
-                cfg.max_sample_rate().0,
-            );
-            let stream_cfg = cfg
-                .with_sample_rate(cpal::SampleRate(chosen_rate))
-                .config()
-                .clone();
-            (stream_cfg, cfg.sample_format())
-        } else {
-            info!("Using default device config (no mono config found, last resort)...");
-            (
-                default_config.config().clone(),
-                default_config.sample_format(),
-            )
-        };
-
-        let sample_rate = actual_config.sample_rate.0;
-        let channels = actual_config.channels;
-
-        info!("Input config: {:?}", actual_config);
-
-        // How many capture frames collapse into one ring-buffer sample.
-        // 48 kHz capture → factor 3 → 16 kHz buffer. 16 kHz capture →
-        // factor 1 (passthrough). Below 16 kHz capture is degenerate
-        // (would force factor 0); the config preference list keeps that
-        // from happening, but defend against it explicitly.
-        info!(
-            "Audio thread: capture {} Hz, resampling to {} Hz",
-            sample_rate, WHISPER_RATE_HZ
-        );
-
-        let err_fn = |err| error!("an error occurred on stream: {}", err);
-
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
-                device.build_input_stream(
-                    &actual_config,
-                    move |data: &[f32], _: &_| {
-                        // Downmix: si hay más de 1 canal, promediamos.
-                        for frame in data.chunks(channels as usize) {
-                            let sum: f32 = frame.iter().sum();
-                            let mono = sum / channels as f32;
-                            resampler.push(mono, |s| {
-                                let _ = producer.push(s);
-                            });
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
-            }
-            cpal::SampleFormat::I16 => {
-                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
-                device.build_input_stream(
-                    &actual_config,
-                    move |data: &[i16], _: &_| {
-                        for frame in data.chunks(channels as usize) {
-                            let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
-                            let mono = sum / channels as f32;
-                            resampler.push(mono, |s| {
-                                let _ = producer.push(s);
-                            });
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
-            }
-            cpal::SampleFormat::U16 => {
-                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
-                device.build_input_stream(
-                    &actual_config,
-                    move |data: &[u16], _: &_| {
-                        for frame in data.chunks(channels as usize) {
-                            let sum: f32 = frame
-                                .iter()
-                                .map(|&s| {
-                                    (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)
-                                })
-                                .sum();
-                            let mono = sum / channels as f32;
-                            resampler.push(mono, |s| {
-                                let _ = producer.push(s);
-                            });
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
-            }
-            cpal::SampleFormat::U8 => {
-                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
-                device.build_input_stream(
-                    &actual_config,
-                    move |data: &[u8], _: &_| {
-                        for frame in data.chunks(channels as usize) {
-                            let sum: f32 = frame
-                                .iter()
-                                .map(|&s| {
-                                    (s as f32 - u8::MAX as f32 / 2.0) / (u8::MAX as f32 / 2.0)
-                                })
-                                .sum();
-                            let mono = sum / channels as f32;
-                            resampler.push(mono, |s| {
-                                let _ = producer.push(s);
-                            });
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
-            }
-            cpal::SampleFormat::I32 => {
-                let mut resampler = MonoResampler::new(sample_rate, WHISPER_RATE_HZ)?;
-                device.build_input_stream(
-                    &actual_config,
-                    move |data: &[i32], _: &_| {
-                        // Fifine is s24le surfaced as I32 by cpal's ALSA
-                        // backend (24-bit audio stored in 32-bit
-                        // containers). Normalise against 2^31 to stay
-                        // inside f32's [-1.0, 1.0] range.
-                        for frame in data.chunks(channels as usize) {
-                            let sum: f32 = frame.iter().map(|&s| s as f32 / i32::MAX as f32).sum();
-                            let mono = sum / channels as f32;
-                            resampler.push(mono, |s| {
-                                let _ = producer.push(s);
-                            });
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
-            }
-            _ => return Err(anyhow!("Unsupported sample format")),
-        };
-
-        stream.play().context("Failed to start audio stream")?;
-
-        self.stream = Some(stream);
-
-        Ok(sample_rate)
+    if let Some(range) = mono {
+        let rate = RATE_PREFERENCE_HZ
+            .iter()
+            .copied()
+            .find(|&r| range.min_sample_rate().0 <= r && range.max_sample_rate().0 >= r)
+            .unwrap_or(range.max_sample_rate().0);
+        let config = range.with_sample_rate(cpal::SampleRate(rate));
+        return Ok((config.config(), config.sample_format()));
     }
+
+    info!("No mono input config; using the device default and downmixing");
+    let default = device
+        .default_input_config()
+        .context("failed to get the default input config")?;
+    Ok((default.config(), default.sample_format()))
+}
+
+/// Capture callback: downmix each frame to mono, resample to 16 kHz and
+/// queue it for the daemon.
+fn build_stream<T: cpal::SizedSample + Send + 'static>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut producer: Producer<f32, Arc<HeapRb<f32>>>,
+    to_f32: fn(T) -> f32,
+) -> Result<cpal::Stream> {
+    let channels = usize::from(config.channels);
+    let mut resampler = MonoResampler::new(config.sample_rate.0, TARGET_RATE_HZ)?;
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[T], _: &_| {
+            for frame in data.chunks(channels) {
+                let mono = frame.iter().map(|&s| to_f32(s)).sum::<f32>() / channels as f32;
+                resampler.push(mono, |s| {
+                    let _ = producer.push(s);
+                });
+            }
+        },
+        |err| error!("audio stream error: {err}"),
+        None,
+    )?;
+    Ok(stream)
 }
 
 /// Pick the capture device according to the operator's `[audio]`

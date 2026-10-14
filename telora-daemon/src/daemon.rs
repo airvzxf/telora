@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use ringbuf::{Consumer, HeapRb};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::socket::{Command, StatusResponse, SttConfig};
@@ -21,27 +20,15 @@ use crate::transcriber::Transcriber;
 /// Samples per second the engines expect and the buffer is sized for.
 const SAMPLE_RATE: usize = 16_000;
 
-/// Where captured samples come from.
-pub trait AudioSource: Send {
-    /// Throw away everything captured so far.
-    fn discard(&mut self);
+/// Where captured samples come from. Capture runs only between `start`
+/// and `stop`.
+pub trait AudioSource {
+    /// Begin a fresh capture, dropping anything from an earlier one.
+    fn start(&mut self) -> Result<(), String>;
+    /// End the capture and release the device.
+    fn stop(&mut self);
     /// Move captured samples into `buffer` until it holds `limit` samples.
     fn drain_into(&mut self, buffer: &mut Vec<f32>, limit: usize);
-}
-
-impl AudioSource for Consumer<f32, Arc<HeapRb<f32>>> {
-    fn discard(&mut self) {
-        while self.pop().is_some() {}
-    }
-
-    fn drain_into(&mut self, buffer: &mut Vec<f32>, limit: usize) {
-        while buffer.len() < limit {
-            match self.pop() {
-                Some(sample) => buffer.push(sample),
-                None => break,
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,11 +177,20 @@ impl<A: AudioSource> Daemon<A> {
                     let _ = response_tx.send(Err(reason));
                 } else {
                     // A START while recording restarts the capture.
-                    self.audio.discard();
                     self.buffer.clear();
                     self.unclaimed_result = None;
-                    self.phase = Phase::Recording;
-                    let _ = response_tx.send(Ok(()));
+                    match self.audio.start() {
+                        Ok(()) => {
+                            self.phase = Phase::Recording;
+                            let _ = response_tx.send(Ok(()));
+                        }
+                        Err(e) => {
+                            error!("Could not open the microphone: {e}");
+                            self.phase = Phase::Idle;
+                            let _ = response_tx
+                                .send(Err(format!("no se pudo abrir el micrófono: {e}")));
+                        }
+                    }
                 }
                 Vec::new()
             }
@@ -228,6 +224,7 @@ impl<A: AudioSource> Daemon<A> {
                         let _ = tx.send("ERROR: transcripción cancelada".to_string());
                     }
                 }
+                self.audio.stop();
                 self.phase = Phase::Idle;
                 self.buffer.clear();
                 self.unclaimed_result = None;
@@ -246,8 +243,6 @@ impl<A: AudioSource> Daemon<A> {
 
     fn tick(&mut self) -> Vec<Effect> {
         if self.phase != Phase::Recording {
-            // Keep the ring buffer from filling up while not recording.
-            self.audio.discard();
             return Vec::new();
         }
         let limit = self.sample_limit();
@@ -271,6 +266,7 @@ impl<A: AudioSource> Daemon<A> {
     /// Hand the recorded audio to the engine, or finish right away when
     /// there is nothing to transcribe.
     fn begin_transcription(&mut self) -> Option<Effect> {
+        self.audio.stop();
         self.job += 1;
         self.phase = Phase::Processing;
         let audio = std::mem::take(&mut self.buffer);
@@ -492,27 +488,55 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    /// Microphone whose samples the test pushes while the daemon owns it.
+    #[derive(Default)]
+    struct MicState {
+        queue: VecDeque<f32>,
+        open: bool,
+        broken: bool,
+    }
+
+    /// Microphone the test feeds while the daemon owns it. Like the real
+    /// device, it only produces samples while open.
     #[derive(Clone, Default)]
-    struct FakeMic(Arc<Mutex<VecDeque<f32>>>);
+    struct FakeMic(Arc<Mutex<MicState>>);
 
     impl FakeMic {
         fn capture(&self, samples: usize) {
-            self.0
-                .lock()
-                .unwrap()
-                .extend(std::iter::repeat_n(0.1, samples));
+            let mut m = self.0.lock().unwrap();
+            if m.open {
+                m.queue.extend(std::iter::repeat_n(0.1, samples));
+            }
+        }
+
+        fn is_open(&self) -> bool {
+            self.0.lock().unwrap().open
+        }
+
+        fn unplug(&self) {
+            self.0.lock().unwrap().broken = true;
         }
     }
 
     impl AudioSource for FakeMic {
-        fn discard(&mut self) {
-            self.0.lock().unwrap().clear();
+        fn start(&mut self) -> Result<(), String> {
+            let mut m = self.0.lock().unwrap();
+            m.queue.clear();
+            if m.broken {
+                m.open = false;
+                return Err("dispositivo desconectado".to_string());
+            }
+            m.open = true;
+            Ok(())
+        }
+        fn stop(&mut self) {
+            let mut m = self.0.lock().unwrap();
+            m.open = false;
+            m.queue.clear();
         }
         fn drain_into(&mut self, buffer: &mut Vec<f32>, limit: usize) {
-            let mut q = self.0.lock().unwrap();
+            let mut m = self.0.lock().unwrap();
             while buffer.len() < limit {
-                match q.pop_front() {
+                match m.queue.pop_front() {
                     Some(s) => buffer.push(s),
                     None => break,
                 }
@@ -742,11 +766,36 @@ mod tests {
     }
 
     #[test]
-    fn idle_ticks_keep_the_microphone_queue_empty() {
+    fn microphone_is_open_only_while_recording() {
         let (mut d, mic) = ready_daemon();
-        mic.capture(5000);
-        d.handle(Event::Tick);
-        assert!(mic.0.lock().unwrap().is_empty());
+        assert!(!mic.is_open(), "idle daemon must not hold the microphone");
+
+        start(&mut d).unwrap();
+        assert!(mic.is_open());
+        mic.capture(100);
+        let _pending = stop(&mut d);
+        assert!(!mic.is_open(), "closed on STOP");
+
+        let (mut d, mic) = ready_daemon();
+        start(&mut d).unwrap();
+        d.handle(Event::Command(Command::Cancel));
+        assert!(!mic.is_open(), "closed on CANCEL");
+
+        let (mut d, mic) = ready_daemon();
+        start(&mut d).unwrap();
+        mic.capture(SAMPLE_RATE * 2);
+        transcribe_job(&d.handle(Event::Tick));
+        assert!(!mic.is_open(), "closed on auto-stop");
+    }
+
+    #[test]
+    fn start_reports_a_microphone_that_cannot_open() {
+        let (mut d, mic) = ready_daemon();
+        mic.unplug();
+        let err = start(&mut d).unwrap_err();
+        assert!(err.contains("micrófono"), "{err}");
+        assert!(err.contains("desconectado"), "{err}");
+        assert_eq!(d.phase(), Phase::Idle);
     }
 
     #[test]
