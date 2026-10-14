@@ -54,6 +54,8 @@ use voxora_bridge::{
 };
 use voxora_registry::{ModelId, Registry, RegistryHfExt};
 
+use crate::socket::SttConfig;
+
 /// Internal transcription contract used by the daemon's main loop.
 ///
 /// `transcribe` takes `&self` (not `&mut self`) because the
@@ -280,42 +282,14 @@ impl BridgeTranscriber {
     pub fn model_kind(&self) -> EngineFamily {
         self.model_kind
     }
-
-    /// Translate the user-facing ISO 639-1 code into the engine-
-    /// specific spelling. Returns `None` if the code is not
-    /// recognised; callers should treat that as a user error.
-    fn map_language(&self, iso: &str) -> Option<String> {
-        match self.model_kind {
-            EngineFamily::Whisper => Some(iso.to_ascii_lowercase()),
-            EngineFamily::Qwen3Asr => iso_to_qwen_name(iso),
-            // `EngineFamily` is `#[non_exhaustive]`; anything else is
-            // reported to the user as an unsupported language.
-            _ => None,
-        }
-    }
 }
 
 impl Transcriber for BridgeTranscriber {
     fn transcribe(&self, audio_data: &[f32], language: Option<&str>) -> Result<String> {
-        let lang = match language {
-            Some(s) => self.map_language(s).ok_or_else(|| {
-                anyhow!(
-                    "language code {s:?} is not supported by {self_model_kind}; \
-                     see `voxora_bridge::known_languages` for the accepted set",
-                    self_model_kind = self.model_kind
-                )
-            })?,
-            None => match self.model_kind {
-                EngineFamily::Whisper => "auto".to_string(),
-                EngineFamily::Qwen3Asr => "auto".to_string(),
-                // `EngineFamily` is `#[non_exhaustive]`; anything
-                // else is a misconfigured engine and is unreachable
-                // because `from_id` already rejected it above.
-                _ => "auto".to_string(),
-            },
-        };
+        let lang =
+            engine_language(self.model_kind, language.unwrap_or("auto")).map_err(|e| anyhow!(e))?;
 
-        let opts = TranscribeOptions::new(Some(lang.clone()), false, true);
+        let opts = TranscribeOptions::new(lang.clone(), false, true);
         let result = self
             .engine
             .transcribe(audio_data, &opts)
@@ -330,6 +304,60 @@ impl Transcriber for BridgeTranscriber {
         Ok(result.text.trim().to_string())
     }
 }
+
+/// The engine family named by `model_kind`, if telora can run it.
+///
+/// # Errors
+///
+/// A message naming the rejected value.
+pub fn engine_family(model_kind: &str) -> Result<EngineFamily, String> {
+    EngineFamily::from_config(model_kind)
+        .filter(|k| matches!(k, EngineFamily::Whisper | EngineFamily::Qwen3Asr))
+        .ok_or_else(|| format!("motor no soportado: {model_kind:?}; usa `whisper` o `qwen3-asr`"))
+}
+
+/// The engine's spelling of the configured language; `None` (from
+/// `"auto"`) makes the engine detect it.
+fn engine_language(kind: EngineFamily, language: &str) -> Result<Option<String>, String> {
+    if language.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let code = language.to_ascii_lowercase();
+    let mapped = match kind {
+        EngineFamily::Whisper => voxora_whisper::validate_lang(&code).ok().map(|_| code),
+        EngineFamily::Qwen3Asr => iso_to_qwen_name(&code),
+        _ => None,
+    };
+    mapped.map(Some).ok_or_else(|| {
+        format!(
+            "idioma no soportado por {kind}: {language:?}; usa un código ISO 639-1 \
+             (por ejemplo \"es\") o \"auto\""
+        )
+    })
+}
+
+/// Reject a config the daemon could not run, before anything loads it.
+///
+/// # Errors
+///
+/// A message naming the offending field.
+pub fn validate_stt_config(config: &SttConfig) -> Result<(), String> {
+    let kind = engine_family(&config.model_kind)?;
+    if config.model_id.trim().is_empty() {
+        return Err("model_id está vacío".to_string());
+    }
+    engine_language(kind, &config.language)?;
+    if !(1..=MAX_RECORDING_SECONDS).contains(&config.max_recording_seconds) {
+        return Err(format!(
+            "max_recording_seconds debe estar entre 1 y {MAX_RECORDING_SECONDS} (es {})",
+            config.max_recording_seconds
+        ));
+    }
+    Ok(())
+}
+
+/// One hour; the whole recording is held in RAM (~230 MB at this cap).
+const MAX_RECORDING_SECONDS: u32 = 3600;
 
 /// Map an ISO 639-1 code (e.g. "en") to a Qwen3-ASR full English
 /// name (e.g. "english"). Returns `None` if the code is not in
@@ -539,5 +567,63 @@ mod tests {
     fn iso_to_qwen_is_case_insensitive() {
         assert_eq!(iso_to_qwen_name("EN").unwrap(), "english");
         assert_eq!(iso_to_qwen_name("ZH").unwrap(), "chinese");
+    }
+
+    fn stt(kind: &str, language: &str, seconds: u32) -> SttConfig {
+        SttConfig {
+            model_id: "org/modelo".to_string(),
+            model_kind: kind.to_string(),
+            model_path: String::new(),
+            language: language.to_string(),
+            max_recording_seconds: seconds,
+        }
+    }
+
+    #[test]
+    fn auto_language_asks_both_engines_to_detect() {
+        assert_eq!(engine_language(EngineFamily::Whisper, "auto"), Ok(None));
+        assert_eq!(engine_language(EngineFamily::Qwen3Asr, "AUTO"), Ok(None));
+    }
+
+    #[test]
+    fn languages_are_spelled_the_way_each_engine_expects() {
+        assert_eq!(
+            engine_language(EngineFamily::Whisper, "ES"),
+            Ok(Some("es".to_string()))
+        );
+        assert_eq!(
+            engine_language(EngineFamily::Qwen3Asr, "es"),
+            Ok(Some("spanish".to_string()))
+        );
+    }
+
+    #[test]
+    fn valid_configs_pass() {
+        for (kind, language) in [("whisper", "es"), ("whisper", "auto"), ("qwen3-asr", "en")] {
+            assert_eq!(validate_stt_config(&stt(kind, language, 1800)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn invalid_configs_name_the_problem() {
+        let cases = [
+            (stt("whisper", "xx", 60), "xx"),
+            (stt("qwen3-asr", "bn", 60), "bn"),
+            (stt("whisper", "", 60), "idioma"),
+            (stt("minimax", "es", 60), "minimax"),
+            (stt("whisper", "es", 0), "max_recording_seconds"),
+            (stt("whisper", "es", 3601), "max_recording_seconds"),
+            (
+                SttConfig {
+                    model_id: " ".to_string(),
+                    ..stt("whisper", "es", 60)
+                },
+                "model_id",
+            ),
+        ];
+        for (config, needle) in cases {
+            let err = validate_stt_config(&config).unwrap_err();
+            assert!(err.contains(needle), "{config:?}: {err}");
+        }
     }
 }

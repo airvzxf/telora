@@ -27,6 +27,8 @@ cudarc = { version = "0.19", optional = true }
 # through the bridge) because the bridge is a pure re-exporter
 # and won't expose the registry surface.
 voxora-registry = { workspace = true }
+# Whisper's own language table, to validate `language` at load time.
+voxora-whisper = { version = "0.6", default-features = false }
 
 cpal = "0.15"
 anyhow = "1.0"

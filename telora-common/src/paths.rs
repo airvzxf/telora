@@ -57,62 +57,6 @@ pub struct ResolvedPaths {
     pub control_sock: PathBuf,
 }
 
-/// Returns an empty [`PathsConfig`]. Surface kept for backwards
-/// compatibility with callers that read their overrides through a
-/// full daemon config and just need a blank default here.
-#[allow(dead_code)]
-pub fn default_paths_config() -> PathsConfig {
-    PathsConfig::default()
-}
-
-/// Convenience helper that returns the canonical daemon socket path
-/// using the same resolution cascade as [`resolve`]. Logs the error
-/// and falls back to the resolver's last-resort `/tmp/telora-<uid>/daemon.sock`
-/// rather than the pre-XDG global socket name — the shared cascade is the
-/// single source of truth.
-pub fn daemon_socket_path() -> PathBuf {
-    match resolve(&PathsConfig::default()) {
-        Ok(r) => r.daemon_sock,
-        Err(e) => {
-            log::error!("daemon_socket_path resolver failed: {e}");
-            last_resort_daemon_sock()
-        }
-    }
-}
-
-/// Convenience helper that returns the canonical GUI control socket
-/// path. Logs the resolver error and falls back to the resolver's
-/// last-resort `/tmp/telora-<uid>/control.sock`.
-pub fn control_socket_path() -> PathBuf {
-    match resolve(&PathsConfig::default()) {
-        Ok(r) => r.control_sock,
-        Err(e) => {
-            log::error!("control_socket_path resolver failed: {e}");
-            last_resort_control_sock()
-        }
-    }
-}
-
-fn last_resort_daemon_sock() -> PathBuf {
-    let dir = format!("/tmp/telora-{}", current_uid());
-    // Pre-create the parent at mode 0o700 so the GUI's
-    // `UnixStream::connect` does not race the daemon's bind-time
-    // `ensure_dir_0700`. Without this, a cold-boot GUI on a host
-    // with no XDG_RUNTIME_DIR and no writable `/run/user/<uid>/`
-    // would hit `ENOENT` until the daemon first started and
-    // `bind_unix_socket` materialised the directory.
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    PathBuf::from(dir).join("daemon.sock")
-}
-
-fn last_resort_control_sock() -> PathBuf {
-    let dir = format!("/tmp/telora-{}", current_uid());
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    PathBuf::from(dir).join("control.sock")
-}
-
 /// Resolve socket paths according to explicit systemd environment values,
 /// config overrides, and the runtime-directory cascade. Flat
 /// `TELORA_DAEMON_SOCKET` / `TELORA_CONTROL_SOCKET` values are the canonical
@@ -391,40 +335,6 @@ pub(crate) mod tests {
             0o700,
             "socket dir mode must be 0o700 (smoke test expectation)"
         );
-
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn daemon_socket_path_returns_resolver_cascade() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile_like();
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
-        }
-
-        let path = daemon_socket_path();
-        assert_eq!(path, tmp.join("telora").join("daemon.sock"));
-
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn control_socket_path_returns_resolver_cascade() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile_like();
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
-        }
-
-        let path = control_socket_path();
-        assert_eq!(path, tmp.join("telora").join("control.sock"));
 
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");

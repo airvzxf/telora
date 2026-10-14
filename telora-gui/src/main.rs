@@ -15,7 +15,6 @@ use log::{info, warn};
 mod clipboard;
 mod config;
 mod connection;
-mod paths;
 mod session;
 mod text;
 mod tray;
@@ -87,20 +86,10 @@ enum DaemonCommand {
 
 fn main() {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
-        // Print the resolved socket paths so the help text reflects
-        // whatever the runtime would actually bind/connect to.
-        // Resolves through the same `PathsConfig` cascade
-        // `telora-gui/src/paths::load_paths_config` uses (issue #64):
-        // `/etc/telora.toml` → `~/.config/telora/config.toml` →
-        // `TELORA_PATHS__*` env vars, falling back to the XDG
-        // cascade that the helper used to default to. Built with
-        // `format!` because the literal `println!("...")` form could
-        // not interpolate the dynamic paths.
-        let paths_cfg = paths::load_paths_config();
-        let resolved_paths = match telora_common::paths::resolve(&paths_cfg) {
+        let resolved_paths = match telora_common::config::resolve_paths() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Error resolving socket path: {}", e);
+                eprintln!("{e:#}");
                 std::process::exit(1);
             }
         };
@@ -147,20 +136,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Resolve the operator-supplied `[paths]` overrides once at
-    // startup. The resolved `PathBuf`s are cloned into the GTK
-    // activation closure and the tokio worker thread so both bind /
-    // connect against the same paths. `load_paths_config` never
-    // panics (missing files / malformed TOML / errored env source
-    // all fall back to `PathsConfig::default()`), so the resolver
-    // here can fail only when the XDG cascade itself is unwritable —
-    // which is exactly the same failure mode the pre-fix GUI hit on
-    // the `connect_activate` path. Issue #64.
-    let paths_cfg = paths::load_paths_config();
-    let resolved_paths = match telora_common::paths::resolve(&paths_cfg) {
+    let resolved_paths = match telora_common::config::resolve_paths() {
         Ok(r) => Arc::new(r),
         Err(e) => {
-            log::error!("Error resolving socket path: {}", e);
+            log::error!("{e:#}");
             std::process::exit(1);
         }
     };

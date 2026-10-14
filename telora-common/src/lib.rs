@@ -7,10 +7,8 @@
 //!     daemon, the GUI, and the CLI. Mirrors the four-step
 //!     `$XDG_RUNTIME_DIR/telora/` → `/run/user/<uid>/telora/` →
 //!     `/tmp/telora-<uid>/` precedence that `telora-daemon` shipped
-//!     pre-extraction. The convenience wrappers
-//!     [`paths::daemon_socket_path`] and [`paths::control_socket_path`]
-//!     give callers a single line of glue that resolves with the
-//!     full cascade and creation semantics.
+//!     pre-extraction.
+//!   * [`config`] — the `telora.toml` cascade every binary loads.
 //!   * [`env`] — the `config` 0.13 environment-source helper that
 //!     decodes `TELORA_PATHS__SOCKET_DIR`-style keys into nested
 //!     `paths.socket_dir` fields. Moved here from `telora-daemon` in
@@ -31,14 +29,12 @@
 //! `config` for the env-var cascade).
 
 pub mod cache;
+pub mod config;
 pub mod env;
 pub mod paths;
 pub mod socket_bind;
 
 pub use cache::{default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override};
 pub use env::telora_env_source;
-pub use paths::{
-    PathsConfig, ResolvedPaths, control_socket_path, daemon_socket_path, default_paths_config,
-    resolve,
-};
+pub use paths::{PathsConfig, ResolvedPaths, resolve};
 pub use socket_bind::{adopt_systemd_listener, bind_unix_socket, bind_unix_socket_manual};

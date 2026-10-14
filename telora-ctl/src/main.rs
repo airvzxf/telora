@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use telora_common::paths::control_socket_path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
@@ -26,7 +25,8 @@ enum Commands {
 }
 
 async fn send_control_command(cmd: &str) -> anyhow::Result<String> {
-    let mut stream = UnixStream::connect(control_socket_path())
+    let paths = telora_common::config::resolve_paths()?;
+    let mut stream = UnixStream::connect(&paths.control_sock)
         .await
         .context("Failed to connect to control socket (is telora-gui running?)")?;
     stream
