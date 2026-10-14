@@ -19,6 +19,9 @@ const FRAME: usize = 480;
 const OVER_FLOOR: f32 = 2.5;
 /// Quieter frames are never speech, even over digital silence.
 const MIN_SPEECH_RMS: f32 = 0.003;
+/// −100 dBFS: digital silence, not acoustic noise. A virtual source
+/// outputs it while nothing feeds it.
+const DIGITAL_SILENCE_RMS: f32 = 0.000_01;
 /// A floor above this comes from a recording with no pause at all, and
 /// must not lift the bar over its own words.
 const MAX_FLOOR_RMS: f32 = 0.01;
@@ -81,9 +84,14 @@ pub fn transcribe_speech(
 }
 
 /// Speech level for a recording whose frames have these RMS levels,
-/// taking its 10th percentile as the noise floor.
+/// taking the 10th percentile of its non-silent frames as the noise
+/// floor.
 fn threshold(levels: &[f32]) -> f32 {
-    let mut sorted = levels.to_vec();
+    let mut sorted: Vec<f32> = levels
+        .iter()
+        .copied()
+        .filter(|&level| level >= DIGITAL_SILENCE_RMS)
+        .collect();
     sorted.sort_unstable_by(f32::total_cmp);
     let floor = sorted.get(sorted.len() / 10).copied().unwrap_or(0.0);
     (floor.min(MAX_FLOOR_RMS) * OVER_FLOOR).max(MIN_SPEECH_RMS)
@@ -158,6 +166,16 @@ mod tests {
     #[test]
     fn the_noise_of_a_busy_machine_is_not_speech() {
         assert_eq!(speech_span(&busy_machine_noise(ms(4000))), None);
+    }
+
+    // A virtual PipeWire source outputs zeros while nothing feeds it;
+    // those zeros are not the room's noise floor.
+    #[test]
+    fn digital_silence_around_the_noise_does_not_lower_the_floor() {
+        let mut audio = vec![0.0; ms(400)];
+        audio.extend(busy_machine_noise(ms(4000)));
+        audio.extend(vec![0.0; ms(300)]);
+        assert_eq!(speech_span(&audio), None);
     }
 
     #[test]
