@@ -19,7 +19,7 @@ use crate::transcriber::{Transcriber, validate_stt_config};
 use telora_common::protocol::{Error as ProtocolError, ErrorCode, Transcript};
 
 /// Samples per second the engines expect and the buffer is sized for.
-const SAMPLE_RATE: usize = 16_000;
+pub(crate) const SAMPLE_RATE: usize = 16_000;
 
 /// Where captured samples come from. Capture runs only between `start`
 /// and `stop`.

@@ -8,14 +8,14 @@ use std::ops::Range;
 use log::info;
 use telora_common::protocol::Transcript;
 
+use crate::daemon::SAMPLE_RATE;
 use crate::transcriber::Transcriber;
 
-const RATE_HZ: usize = 16_000;
 /// 30 ms.
 const FRAME: usize = 480;
 /// Speech must stand this far (+8 dB) over the recording's own noise
-/// floor: on the reference host the floor moves 10 dB with the
-/// machine's load, so no fixed level separates noise from speech.
+/// floor: on the reference host the floor rose 10 dB within an hour, so
+/// no fixed level separates noise from speech.
 const OVER_FLOOR: f32 = 2.5;
 /// Quieter frames are never speech, even over digital silence.
 const MIN_SPEECH_RMS: f32 = 0.003;
@@ -25,11 +25,11 @@ const DIGITAL_SILENCE_RMS: f32 = 0.000_01;
 /// A floor above this comes from a recording with no pause at all, and
 /// must not lift the bar over its own words.
 const MAX_FLOOR_RMS: f32 = 0.01;
-/// A key click fills at most two frames; a vowel lasts longer.
+/// 90 ms: a 20 ms key click spans at most two frames.
 const MIN_RUN_FRAMES: usize = 3;
-/// Soft onsets and word endings stay under the threshold.
-const PAD_BEFORE: usize = RATE_HZ * 300 / 1000;
-const PAD_AFTER: usize = RATE_HZ * 500 / 1000;
+/// Room for soft onsets and word endings that stay under the threshold.
+const PAD_BEFORE: usize = SAMPLE_RATE * 300 / 1000;
+const PAD_AFTER: usize = SAMPLE_RATE * 500 / 1000;
 
 /// The part of `audio` (16 kHz mono) worth transcribing, or `None`
 /// when it holds no speech.
@@ -102,15 +102,13 @@ fn rms(frame: &[f32]) -> f32 {
 }
 
 fn seconds(samples: usize) -> f32 {
-    samples as f32 / RATE_HZ as f32
+    samples as f32 / SAMPLE_RATE as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
-
-    const RATE: usize = 16_000;
 
     /// Deterministic noise around the given RMS. Like the measured
     /// room, its loudest 30 ms frame is about 1.75 times its quietest.
@@ -148,12 +146,12 @@ mod tests {
         for (i, s) in audio[range].iter_mut().enumerate() {
             *s = rms
                 * 2f32.sqrt()
-                * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / RATE as f32).sin();
+                * (i as f32 * 2.0 * std::f32::consts::PI * 200.0 / SAMPLE_RATE as f32).sin();
         }
     }
 
     fn ms(ms: usize) -> usize {
-        RATE * ms / 1000
+        SAMPLE_RATE * ms / 1000
     }
 
     #[test]
