@@ -1,20 +1,21 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{Config, File};
-use log::{error, info, warn};
+use log::{info, warn};
 use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::sync::Arc;
 use telora_common::cache::resolve_voxora_cache;
 use telora_common::env::telora_env_source;
+use telora_daemon::daemon::{self, Daemon, Hooks};
 use telora_daemon::{
-    AudioEngine, BridgeTranscriber, Command, DaemonConfig, SocketServer, StatusResponse, SttConfig,
+    AudioEngine, BridgeTranscriber, DaemonConfig, SocketServer, StatusResponse, SttConfig,
     Transcriber, paths,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 async fn notify_client_auto_stop(control_socket: &str) {
@@ -69,67 +70,6 @@ enum Commands {
     Status,
     /// Reload configuration and restart the model if needed
     Refresh,
-}
-
-#[derive(PartialEq)]
-enum State {
-    Idle,
-    Recording,
-    Processing,
-}
-
-/// The model is loaded after the socket is ready, so the daemon can be
-/// up without a usable engine; every caller must check which case applies.
-enum Engine {
-    Loading,
-    Ready(Arc<dyn Transcriber>),
-    Failed(String),
-}
-
-impl Engine {
-    fn status_label(&self) -> String {
-        match self {
-            Engine::Loading => "loading".to_string(),
-            Engine::Ready(_) => "ready".to_string(),
-            Engine::Failed(e) => format!("failed: {e}"),
-        }
-    }
-
-    /// Why START cannot proceed, or `None` when the engine is usable.
-    fn unavailable_reason(&self) -> Option<String> {
-        match self {
-            Engine::Loading => Some("el modelo todavía se está cargando".to_string()),
-            Engine::Ready(_) => None,
-            Engine::Failed(e) => Some(format!("no se pudo cargar el modelo: {e}")),
-        }
-    }
-}
-
-struct DaemonState {
-    engine: Engine,
-    stt_config: SttConfig,
-}
-
-/// Load the engine in the background and publish the outcome into
-/// `state`. Copies the resolved model path into the config so STATUS
-/// shows what was actually loaded.
-fn spawn_engine_load(state: Arc<RwLock<DaemonState>>, config: SttConfig, voxora_cache: PathBuf) {
-    tokio::spawn(async move {
-        state.write().await.engine = Engine::Loading;
-        match build_transcriber(&config, voxora_cache).await {
-            Ok((transcriber, path)) => {
-                let mut s = state.write().await;
-                s.engine = Engine::Ready(transcriber);
-                s.stt_config.model_path = path;
-                info!("Model loaded; ready to transcribe.");
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                error!("Failed to load model: {msg}");
-                state.write().await.engine = Engine::Failed(msg);
-            }
-        }
-    });
 }
 
 /// Load and merge configuration from the four-tier cascade
@@ -545,22 +485,18 @@ async fn main() -> Result<()> {
     info!("Model id:   {}", stt_config.model_id);
     info!("Language:   {}", stt_config.language);
 
-    let daemon_state = Arc::new(RwLock::new(DaemonState {
-        engine: Engine::Loading,
-        stt_config: stt_config.clone(),
-    }));
-
     // Audio Engine initialization
     let rb = HeapRb::<f32>::new(16000 * 30); // 30 seconds buffer
-    let (producer, mut consumer) = rb.split();
+    let (producer, consumer) = rb.split();
 
     let mut audio_engine = AudioEngine::new().context("Failed to init audio engine")?;
     audio_engine
         .start(producer, &daemon_cfg.audio)
         .context("Failed to start audio engine")?;
+    let (daemon, initial_load) = Daemon::new(consumer, stt_config);
 
     // Socket
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
     // Resolve the socket location through the [paths] cascade
     // introduced in EPIC #27. EPIC #28 lifted the resolver into
     // `telora_common::paths` so the daemon, GUI, and CLI all share
@@ -592,10 +528,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    spawn_engine_load(Arc::clone(&daemon_state), stt_config, voxora_cache.clone());
-
     // Graceful shutdown on SIGTERM (systemd) and SIGINT (dev shell).
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
@@ -613,296 +547,33 @@ async fn main() -> Result<()> {
         resolved_paths.daemon_sock.display()
     );
 
-    let mut state = State::Idle;
-    let mut audio_buffer: Vec<f32> = Vec::new();
-    let mut response_tx_opt: Option<oneshot::Sender<String>> = None;
-    let mut pending_result: Option<String> = None;
-    // Transcription runs on a blocking thread; results carry the job id so
-    // a cancelled job's late result is dropped.
-    let (result_tx, mut result_rx) = mpsc::channel::<(u64, String)>(4);
-    let mut job_id: u64 = 0;
-    let mut audio_tick = tokio::time::interval(Duration::from_millis(20));
-    audio_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                info!("Shutdown requested; exiting event loop");
-                break;
-            }
-            Some(cmd) = cmd_rx.recv() => match cmd {
-                Command::Start { response_tx } => {
-                    info!("Command: START");
-                    let refusal = if state == State::Processing {
-                        Some("todavía se está transcribiendo la grabación anterior".to_string())
-                    } else {
-                        daemon_state.read().await.engine.unavailable_reason()
-                    };
-                    if let Some(reason) = refusal {
-                        warn!("START refused: {reason}");
-                        let _ = response_tx.send(Err(reason));
-                    } else {
-                        // Drop audio captured before START.
-                        while consumer.pop().is_some() {}
-                        state = State::Recording;
-                        audio_buffer.clear();
-                        pending_result = None;
-                        let _ = response_tx.send(Ok(()));
-                    }
-                }
-                Command::Stop { response_tx } => {
-                    info!("Command: STOP");
-                    match state {
-                        State::Recording => {
-                            drain_audio(&mut consumer, &mut audio_buffer, usize::MAX);
-                            response_tx_opt = Some(response_tx);
-                            job_id += 1;
-                            start_transcription(
-                                &daemon_state,
-                                std::mem::take(&mut audio_buffer),
-                                job_id,
-                                result_tx.clone(),
-                            )
-                            .await;
-                            state = State::Processing;
-                        }
-                        State::Processing => response_tx_opt = Some(response_tx),
-                        State::Idle => {
-                            let _ = response_tx.send(pending_result.take().unwrap_or_default());
-                        }
-                    }
-                }
-                Command::Cancel => {
-                    info!("Command: CANCEL");
-                    if state == State::Processing {
-                        job_id += 1;
-                        if let Some(tx) = response_tx_opt.take() {
-                            let _ = tx.send("ERROR: transcripción cancelada".to_string());
-                        }
-                    }
-                    state = State::Idle;
-                    audio_buffer.clear();
-                    response_tx_opt = None;
-                    pending_result = None;
-                }
-                Command::GetStatus { response_tx } => {
-                    let s = daemon_state.read().await;
-                    let _ = response_tx.send(StatusResponse {
-                        active: true,
-                        pid: std::process::id(),
-                        model_id: s.stt_config.model_id.clone(),
-                        model_kind: s.stt_config.model_kind.clone(),
-                        model_path: s.stt_config.model_path.clone(),
-                        language: s.stt_config.language.clone(),
-                        max_recording_seconds: s.stt_config.max_recording_seconds,
-                        state: match state {
-                            State::Idle => "Idle".to_string(),
-                            State::Recording => "Recording".to_string(),
-                            State::Processing => "Processing".to_string(),
-                        },
-                        engine: s.engine.status_label(),
-                    });
-                }
-                Command::ReloadConfig { new_config, response_tx } => {
-                    handle_reload(&daemon_state, new_config, response_tx, &voxora_cache).await;
-                }
-            },
-            Some((id, text)) = result_rx.recv() => {
-                if id != job_id {
-                    info!("Dropping result of cancelled transcription job {id}");
-                    continue;
-                }
-                if let Some(tx) = response_tx_opt.take() {
-                    let _ = tx.send(text);
-                    pending_result = None;
-                } else {
-                    pending_result = Some(text);
-                }
-                if state == State::Processing {
-                    state = State::Idle;
-                }
-            }
-            _ = audio_tick.tick() => {
-                if state != State::Recording {
-                    // Keep the ring buffer from filling while idle.
-                    while consumer.pop().is_some() {}
-                    continue;
-                }
-                let max_seconds = daemon_state.read().await.stt_config.max_recording_seconds;
-                let limit = 16000 * max_seconds as usize;
-                drain_audio(&mut consumer, &mut audio_buffer, limit);
-                if audio_buffer.len() >= limit {
-                    warn!("Audio buffer limit reached ({max_seconds}s). Stopping recording automatically.");
-                    job_id += 1;
-                    start_transcription(
-                        &daemon_state,
-                        std::mem::take(&mut audio_buffer),
-                        job_id,
-                        result_tx.clone(),
-                    )
-                    .await;
-                    state = State::Processing;
-                    let control_sock = resolved_paths.control_sock.to_string_lossy().into_owned();
-                    tokio::spawn(async move {
-                        notify_client_auto_stop(&control_sock).await;
-                    });
-                }
-            }
-        }
-    }
+    let control_sock = resolved_paths.control_sock.to_string_lossy().into_owned();
+    let hooks = Hooks {
+        load_engine: Box::new(move |config| {
+            let cache = voxora_cache.clone();
+            Box::pin(async move {
+                build_transcriber(&config, cache)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            })
+        }),
+        notify_auto_stop: Box::new(move || {
+            let control_sock = control_sock.clone();
+            tokio::spawn(async move { notify_client_auto_stop(&control_sock).await });
+        }),
+    };
+    daemon::run(
+        daemon,
+        initial_load,
+        cmd_rx,
+        shutdown_rx,
+        hooks,
+        Duration::from_millis(20),
+    )
+    .await;
 
     info!("Telora daemon stopped cleanly");
     Ok(())
-}
-
-/// REFRESH: swap the engine when the model changed (or is not loaded),
-/// otherwise just apply the new settings.
-async fn handle_reload(
-    daemon_state: &Arc<RwLock<DaemonState>>,
-    new_config: SttConfig,
-    response_tx: oneshot::Sender<Result<()>>,
-    voxora_cache: &std::path::Path,
-) {
-    info!(
-        "Command: REFRESH (model_kind={} model_id={})",
-        new_config.model_kind, new_config.model_id
-    );
-    // Atomicity contract (issue #93): the engine
-    // swap and the `stt_config` mutation commit
-    // together under the same `RwLock` write guard.
-    // Cheap path (no model change) commits the
-    // config delta inline; needs-reload path
-    // `tokio::spawn`s the rebuild so the main loop
-    // keeps ticking through the multi-second /
-    // multi-minute engine load.
-    let needs_reload = {
-        let s = daemon_state.read().await;
-        new_config.model_id != s.stt_config.model_id
-            || new_config.model_kind != s.stt_config.model_kind
-            || !matches!(s.engine, Engine::Ready(_))
-    };
-    if !needs_reload {
-        // No engine swap needed, but other fields
-        // (language, max_recording_seconds) still
-        // need to take effect. The new config is
-        // safe to commit because no engine load
-        // happened.
-        let mut s = daemon_state.write().await;
-        s.stt_config = new_config;
-        info!("Configuration updated (no model change).");
-        let _ = response_tx.send(Ok(()));
-    } else {
-        // Hand the rebuild off to a spawned task so
-        // the event loop keeps draining commands
-        // (STATUS / START / STOP) while the new
-        // engine loads. The `oneshot::Sender`
-        // survives the move — it is `Send + 'static`
-        // — so the socket handler's `rx.await` sees
-        // the result when this task eventually fires
-        // `.send(Ok(()))` or drops the sender.
-        let daemon_state_bg = Arc::clone(daemon_state);
-        let voxora_cache_bg = voxora_cache.to_path_buf();
-        tokio::spawn(async move {
-            // Clone `new_config` so we can both
-            // commit the metadata under the lock
-            // and use the original to build the
-            // new engine.
-            let new_config_for_build = new_config.clone();
-
-            // Drop the old engine before building the new
-            // one so both never sit in (V)RAM at once.
-            {
-                let mut s = daemon_state_bg.write().await;
-                s.engine = Engine::Loading;
-                s.stt_config = new_config;
-            }
-
-            // Step 2: build the new engine outside
-            // the lock. This is the multi-second /
-            // multi-minute await we used to do on
-            // the event loop — now off-loaded to a
-            // worker.
-            match build_transcriber(&new_config_for_build, voxora_cache_bg).await {
-                Ok((new_transcriber, resolved_path)) => {
-                    let mut s = daemon_state_bg.write().await;
-                    s.engine = Engine::Ready(new_transcriber);
-                    s.stt_config.model_path = resolved_path;
-                    info!("Transcriber reloaded successfully.");
-                    let _ = response_tx.send(Ok(()));
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    error!("Failed to reload transcriber: {msg}");
-                    daemon_state_bg.write().await.engine = Engine::Failed(msg.clone());
-                    let _ = response_tx.send(Err(anyhow::anyhow!("Failed to load model: {msg}")));
-                }
-            }
-        });
-    }
-}
-
-/// Move captured samples into `buffer`, stopping at `limit` samples.
-fn drain_audio(
-    consumer: &mut ringbuf::Consumer<f32, Arc<HeapRb<f32>>>,
-    buffer: &mut Vec<f32>,
-    limit: usize,
-) {
-    while buffer.len() < limit {
-        match consumer.pop() {
-            Some(sample) => buffer.push(sample),
-            None => break,
-        }
-    }
-}
-
-/// Transcribe `audio` on a blocking thread so the event loop keeps
-/// answering STATUS and CANCEL; the result arrives on `result_tx`.
-async fn start_transcription(
-    daemon_state: &Arc<RwLock<DaemonState>>,
-    audio: Vec<f32>,
-    job_id: u64,
-    result_tx: mpsc::Sender<(u64, String)>,
-) {
-    info!("Processing {} samples (job {job_id})...", audio.len());
-    let (engine, language) = {
-        let s = daemon_state.read().await;
-        let engine = match &s.engine {
-            Engine::Ready(t) => Ok(Arc::clone(t)),
-            other => Err(other
-                .unavailable_reason()
-                .unwrap_or_else(|| "modelo no disponible".to_string())),
-        };
-        (engine, s.stt_config.language.clone())
-    };
-    tokio::spawn(async move {
-        let text = match engine {
-            Err(reason) => {
-                error!("Recording discarded: {reason}");
-                format!("ERROR: {reason}")
-            }
-            Ok(_) if audio.is_empty() => {
-                warn!("Audio buffer empty, skipping transcription.");
-                String::new()
-            }
-            Ok(t) => {
-                let joined =
-                    tokio::task::spawn_blocking(move || t.transcribe(&audio, Some(&language)))
-                        .await;
-                match joined {
-                    Ok(Ok(text)) => text,
-                    Ok(Err(e)) => {
-                        error!("Transcription failed: {e}");
-                        format!("ERROR: {e}")
-                    }
-                    Err(e) => {
-                        error!("Transcription task panicked: {e}");
-                        "ERROR: la transcripción falló inesperadamente".to_string()
-                    }
-                }
-            }
-        };
-        let _ = result_tx.send((job_id, text)).await;
-    });
 }
 
 #[cfg(test)]

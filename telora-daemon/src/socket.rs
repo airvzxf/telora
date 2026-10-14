@@ -172,10 +172,8 @@ pub enum Command {
     GetStatus {
         response_tx: oneshot::Sender<StatusResponse>,
     },
-    /// Reload the STT configuration. Handled atomically: the new
-    /// `BridgeTranscriber` is built FIRST and the `stt_config`
-    /// mutation is committed only on success — see
-    /// `main::Command::ReloadConfig` for the failure semantics.
+    /// Apply a new STT configuration, reloading the model if it changed.
+    /// A model change is refused while a recording is in progress.
     ReloadConfig {
         new_config: SttConfig,
         response_tx: oneshot::Sender<Result<()>>,
