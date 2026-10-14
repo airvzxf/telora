@@ -1,28 +1,17 @@
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use std::path::{Path, PathBuf};
+use telora_common::protocol::{
+    Error as ProtocolError, ErrorCode, Reply, decode_request, encode_reply, read_message,
+};
 use telora_common::socket_bind::{adopt_systemd_listener, bind_unix_socket_manual};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-/// Status payload returned to clients over the unix socket.
-/// `model_path` is the on-disk file or directory the engine loaded.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StatusResponse {
-    pub active: bool,
-    pub pid: u32,
-    pub model_id: String,
-    pub model_kind: String,
-    pub model_path: String,
-    pub language: String,
-    pub max_recording_seconds: u32,
-    pub state: String,
-    /// `loading`, `ready` or `failed: <reason>`.
-    #[serde(default)]
-    pub engine: String,
-}
+pub use telora_common::protocol::StatusResponse;
 
 /// Configuration the daemon reads from `telora.toml` (or
 /// `TELORA_*` env vars).
@@ -161,12 +150,12 @@ pub fn default_stt_config() -> SttConfig {
 
 #[derive(Debug)]
 pub enum Command {
-    /// Answered with `Err(reason)` when no model is ready to transcribe.
     Start {
-        response_tx: oneshot::Sender<Result<(), String>>,
+        response_tx: oneshot::Sender<Result<(), ProtocolError>>,
     },
+    /// Answered with the transcription, empty when there was no audio.
     Stop {
-        response_tx: oneshot::Sender<String>,
+        response_tx: oneshot::Sender<Result<String, ProtocolError>>,
     },
     Cancel,
     GetStatus {
@@ -176,7 +165,7 @@ pub enum Command {
     /// the model if it changed. Answered with the `OK:` text or the
     /// reason it was refused.
     Refresh {
-        response_tx: oneshot::Sender<Result<String, String>>,
+        response_tx: oneshot::Sender<Result<String, ProtocolError>>,
     },
 }
 
@@ -239,139 +228,100 @@ impl SocketServer {
     pub async fn run(&self) {
         loop {
             match self.listener.accept().await {
-                Ok((mut stream, _addr)) => {
+                Ok((stream, _addr)) => {
                     let cmd_tx = self.cmd_tx.clone();
-                    tokio::spawn(async move {
-                        // Split the stream into independent read and
-                        // write halves inside the spawned task so the
-                        // halves satisfy `'static` (the split borrows
-                        // from `stream`, and the spawned future must
-                        // own all of its captured state).
-                        let (mut read_half, mut write_half) = stream.split();
-                        // A command ends at the client's half-close; the
-                        // cap keeps a flood from growing the buffer
-                        // without bound.
-                        const MAX_COMMAND_BYTES: u64 = 64 * 1024;
-                        let mut buf = Vec::new();
-                        let mut limited = (&mut read_half).take(MAX_COMMAND_BYTES);
-                        match limited.read_to_end(&mut buf).await {
-                            Ok(_) if buf.is_empty() => {
-                                let _ = write_half.write_all(b"ERROR: empty command").await;
-                            }
-                            Ok(_) => {
-                                let command_str = String::from_utf8_lossy(&buf).trim().to_string();
-                                info!("Received command: {}", command_str);
-
-                                match command_str.as_str() {
-                                    "START" => {
-                                        let (tx, rx) = oneshot::channel();
-                                        let reply = if let Err(e) =
-                                            cmd_tx.send(Command::Start { response_tx: tx }).await
-                                        {
-                                            error!("Failed to send start command: {}", e);
-                                            "ERROR: Internal channel error".to_string()
-                                        } else {
-                                            match rx.await {
-                                                Ok(Ok(())) => "STATUS: RECORDING".to_string(),
-                                                Ok(Err(reason)) => format!("ERROR: {reason}"),
-                                                Err(_) => "ERROR: Start cancelled".to_string(),
-                                            }
-                                        };
-                                        let _ = write_half.write_all(reply.as_bytes()).await;
-                                    }
-                                    "STOP" => {
-                                        let (tx, rx) = oneshot::channel();
-                                        if let Err(e) =
-                                            cmd_tx.send(Command::Stop { response_tx: tx }).await
-                                        {
-                                            error!("Failed to send stop command: {}", e);
-                                            let _ = stream
-                                                .write_all(b"ERROR: Internal channel error")
-                                                .await;
-                                        } else {
-                                            // Wait for the transcription result from the main loop
-                                            match rx.await {
-                                                Ok(text) => {
-                                                    let _ =
-                                                        write_half.write_all(text.as_bytes()).await;
-                                                }
-                                                Err(_) => {
-                                                    let _ = write_half.write_all(b"ERROR: Transcription cancelled or failed").await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "CANCEL" => {
-                                        let _ = cmd_tx.send(Command::Cancel).await;
-                                        let _ = write_half.write_all(b"STATUS: CANCELLED").await;
-                                    }
-                                    "STATUS" => {
-                                        let (tx, rx) = oneshot::channel();
-                                        if let Err(e) = cmd_tx
-                                            .send(Command::GetStatus { response_tx: tx })
-                                            .await
-                                        {
-                                            error!("Failed to send status command: {}", e);
-                                            let _ = stream
-                                                .write_all(b"ERROR: Internal channel error")
-                                                .await;
-                                        } else {
-                                            match rx.await {
-                                                Ok(status) => {
-                                                    let json = serde_json::to_string(&status)
-                                                        .unwrap_or_else(|_| "{}".to_string());
-                                                    let _ =
-                                                        write_half.write_all(json.as_bytes()).await;
-                                                }
-                                                Err(_) => {
-                                                    let _ = stream
-                                                        .write_all(b"ERROR: Failed to get status")
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "REFRESH" => {
-                                        let (tx, rx) = oneshot::channel();
-                                        let reply = if let Err(e) =
-                                            cmd_tx.send(Command::Refresh { response_tx: tx }).await
-                                        {
-                                            error!("Failed to send refresh command: {}", e);
-                                            "ERROR: Internal channel error".to_string()
-                                        } else {
-                                            match rx.await {
-                                                Ok(Ok(message)) => format!("OK: {message}"),
-                                                Ok(Err(reason)) => format!("ERROR: {reason}"),
-                                                Err(_) => {
-                                                    "ERROR: Reload cancelled or failed".to_string()
-                                                }
-                                            }
-                                        };
-                                        let _ = write_half.write_all(reply.as_bytes()).await;
-                                    }
-                                    other if other.starts_with("REFRESH") => {
-                                        let _ = write_half
-                                            .write_all(
-                                                "ERROR: REFRESH no lleva argumentos; el daemon \
-                                                 relee su propia configuración"
-                                                    .as_bytes(),
-                                            )
-                                            .await;
-                                    }
-                                    _ => {
-                                        let _ =
-                                            write_half.write_all(b"ERROR: Unknown command").await;
-                                    }
-                                };
-                            }
-                            Err(e) => error!("Failed to read from socket: {}", e),
-                        }
-                    });
+                    tokio::spawn(serve(stream, cmd_tx));
                 }
                 Err(e) => error!("Failed to accept connection: {}", e),
             }
         }
     }
+}
+
+/// Answer one request and close the connection.
+async fn serve(mut stream: UnixStream, cmd_tx: mpsc::Sender<Command>) {
+    let message = read_message(&mut stream).await;
+    let unread_input = message.is_err();
+    let reply = match message.and_then(|m| decode_request(&m)) {
+        Ok(cmd) => {
+            info!("Received command: {cmd}");
+            dispatch(&cmd, &cmd_tx).await
+        }
+        Err(e) => {
+            warn!("Rejected request: {e}");
+            Err(e)
+        }
+    };
+    if let Err(e) = stream.write_all(&encode_reply(&reply)).await {
+        warn!("Could not write the reply: {e}");
+    }
+    if unread_input {
+        discard_input(&mut stream).await;
+    }
+}
+
+/// Closing a Unix socket with unread input resets the connection, and
+/// the client would lose the reply; read what is left first, within
+/// bounds.
+async fn discard_input(stream: &mut UnixStream) {
+    let mut sink = tokio::io::sink();
+    let mut rest = (&mut *stream).take(1024 * 1024);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::io::copy(&mut rest, &mut sink),
+    )
+    .await;
+}
+
+async fn dispatch(cmd: &str, cmd_tx: &mpsc::Sender<Command>) -> Reply {
+    match cmd {
+        "start" => {
+            ask(cmd_tx, |response_tx| Command::Start { response_tx }).await??;
+            Ok(Map::new())
+        }
+        "stop" => {
+            let text = ask(cmd_tx, |response_tx| Command::Stop { response_tx }).await??;
+            Ok(fields("text", text))
+        }
+        "cancel" => {
+            cmd_tx.send(Command::Cancel).await.map_err(|_| closing())?;
+            Ok(Map::new())
+        }
+        "status" => {
+            let status = ask(cmd_tx, |response_tx| Command::GetStatus { response_tx }).await?;
+            let status = serde_json::to_value(status)
+                .map_err(|e| ProtocolError::new(ErrorCode::Internal, e.to_string()))?;
+            Ok(fields("status", status))
+        }
+        "refresh" => {
+            let message = ask(cmd_tx, |response_tx| Command::Refresh { response_tx }).await??;
+            Ok(fields("message", message))
+        }
+        other => Err(ProtocolError::new(
+            ErrorCode::UnknownCommand,
+            format!("comando desconocido: {other}"),
+        )),
+    }
+}
+
+/// Hand a command to the event loop and wait for its answer.
+async fn ask<T>(
+    cmd_tx: &mpsc::Sender<Command>,
+    command: impl FnOnce(oneshot::Sender<T>) -> Command,
+) -> Result<T, ProtocolError> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx.send(command(tx)).await.map_err(|_| closing())?;
+    rx.await.map_err(|_| closing())
+}
+
+fn closing() -> ProtocolError {
+    ProtocolError::new(ErrorCode::Internal, "el daemon se está cerrando")
+}
+
+fn fields(key: &str, value: impl Into<serde_json::Value>) -> Map<String, serde_json::Value> {
+    let mut map = Map::new();
+    map.insert(key.to_string(), value.into());
+    map
 }
 
 impl Drop for SocketServer {

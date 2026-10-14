@@ -1,40 +1,9 @@
-//! End-to-end socket lifecycle tests for telora-daemon.
+//! The daemon socket end to end: a real [`SocketServer`] and the
+//! shared protocol client, with the event loop played by the test.
 //!
-//! Drives a real [`SocketServer`] (with a real [`Command`] channel)
-//! instead of `std::os::unix::net::UnixListener` placeholders, so
-//! the server's dispatch, error responses, takeover semantics, and
-//! the client half-close contract are exercised end-to-end. The
-//! previous incarnation of this file (issue #73) bound with a raw
-//! `UnixListener` and hand-echoed the `START` response, leaving
-//! every other branch of `SocketServer::run` (STOP round-trip,
-//! STATUS serialisation, REFRESH, the dropped-oneshot and
-//! closed-channel error paths, and the bind-takeover semantic)
-//! untested.
-//!
-//! The dispatch tests use a `tempfile::tempdir()` socket path
-//! instead of `XDG_RUNTIME_DIR` plumbing so they are
-//! parallelisable and do not fight the resolver cascade. One
-//! env-dependent test — `lifecycle_resolve_picks_xdg_socket_dir`
-//! — keeps the regression coverage from issue #27 for the
-//! resolver cascade under `XDG_RUNTIME_DIR`.
-//!
-//! Every socket read is wrapped in [`tokio::time::timeout`] so a
-//! future protocol regression (like the #132 deadlock this suite
-//! also fixes) cannot hang the test process — the timeout fires
-//! and the test fails fast with a clear diagnostic.
-//!
-//! Run with:
-//!
-//! ```text
-//! cargo test -p telora-daemon --test socket_lifecycle
-//! ```
-//!
-//! The env-dependent test serialises on [`ENV_LOCK`] because
-//! `XDG_RUNTIME_DIR` is process-global. Holding the std
-//! `MutexGuard` across `.await` is intentional and warns under
-//! `clippy::await_holding_lock` — we suppress it for the whole
-//! file because the whole point of the lock is to keep
-//! `XDG_RUNTIME_DIR` stable across the async body.
+//! The env-dependent test serialises on [`ENV_LOCK`] and holds the
+//! guard across `.await` on purpose: `XDG_RUNTIME_DIR` must stay put
+//! for the whole async body.
 #![allow(clippy::await_holding_lock)]
 
 use std::path::{Path, PathBuf};
@@ -46,7 +15,8 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use telora_daemon::{Command, SocketServer, StatusResponse};
+use telora_common::protocol::{self, Error, ErrorCode, Reply, StatusResponse};
+use telora_daemon::{Command, SocketServer};
 
 /// Process-global mutex serialising every env-dependent test in
 /// this file. Dispatch tests do not touch env vars and can run
@@ -174,278 +144,214 @@ fn spawn_server_at(sock_path: &Path) -> (TestServer, mpsc::Receiver<Command>) {
     )
 }
 
-/// Connect a client, write `payload`, half-close the write side,
-/// then read the full response under a 2-second timeout. Returns
-/// the response bytes.
-///
-/// The half-close is REQUIRED under the current protocol because
-/// `SocketServer::run` reads the request with `read_to_end`
-/// (`telora-daemon/src/socket.rs:200-203`) — the server waits
-/// for the client's EOF before dispatching. PR #132 (`ed326d2`)
-/// introduced this requirement; the production clients in
-/// `telora-gui/src/connection.rs::SocketClient::send_command`
-/// and `telora-daemon/src/main.rs::{run_refresh_client,
-/// run_status_client}` now call `stream.shutdown().await`
-/// between write and read to satisfy it.
-async fn round_trip(sock_path: &Path, payload: &[u8]) -> Vec<u8> {
+/// Send raw bytes, optionally half-close, and decode the reply.
+async fn raw(sock_path: &Path, payload: &[u8], half_close: bool) -> Reply {
     let mut client = UnixStream::connect(sock_path).await.expect("connect");
     client.write_all(payload).await.expect("write");
-    client
-        .shutdown()
-        .await
-        .expect("half-close write side of daemon socket");
+    if half_close {
+        client.shutdown().await.expect("half-close");
+    }
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf))
+    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf))
         .await
-        .expect(
-            "server failed to respond within 2s; the half-close is missing \
-             or the server is stuck on `read_to_end`",
-        );
-    read.expect("read_to_end failed");
-    buf
+        .expect("the server must answer within 2 s")
+        .expect("read");
+    protocol::decode_reply(buf.strip_suffix(b"\n").expect("one line")).expect("a v1 reply")
 }
 
-/// `START` must dispatch [`Command::Start`] and reply
-/// `STATUS: RECORDING`. The previous placeholder test
-/// hand-echoed the response and never exercised the server's
-/// dispatch.
-#[tokio::test(flavor = "current_thread")]
-async fn start_dispatches_command_start_and_replies_recording() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
-    match cmd_rx.recv().await.expect("command") {
-        Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
-        other => panic!("expected Command::Start, got {other:?}"),
-    }
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"STATUS: RECORDING");
+async fn call(sock_path: PathBuf, cmd: &'static str) -> Reply {
+    tokio::time::timeout(Duration::from_secs(2), protocol::call(&sock_path, cmd))
+        .await
+        .expect("the server must answer within 2 s")
+        .expect("transport")
 }
 
-/// Catches the GUI showing "recording" while no model can transcribe:
-/// a refused START must reach the client as an `ERROR:` reply.
-#[tokio::test(flavor = "current_thread")]
-async fn start_refused_by_event_loop_replies_error() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
-    match cmd_rx.recv().await.expect("command") {
-        Command::Start { response_tx } => response_tx
-            .send(Err("el modelo todavía se está cargando".to_string()))
-            .expect("refuse start"),
-        other => panic!("expected Command::Start, got {other:?}"),
-    }
-    let response = client_task.await.expect("client task");
-    assert_eq!(
-        String::from_utf8(response).unwrap(),
-        "ERROR: el modelo todavía se está cargando"
+fn error_code(reply: Reply) -> ErrorCode {
+    reply.expect_err("expected an error reply").code
+}
+
+async fn no_dispatch(cmd_rx: &mut mpsc::Receiver<Command>) {
+    let spurious = tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv()).await;
+    assert!(
+        spurious.is_err(),
+        "the request must not reach the event loop"
     );
 }
 
-/// `CANCEL` must dispatch [`Command::Cancel`] and reply
-/// `STATUS: CANCELLED`. Like `START`, this exercises the
-/// non-oneshot dispatch path — the server sends the command and
-/// writes the response without waiting for a oneshot reply.
 #[tokio::test(flavor = "current_thread")]
-async fn cancel_dispatches_command_cancel_and_replies_cancelled() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn start_reaches_the_event_loop_and_its_answer_comes_back() {
     let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"CANCEL").await });
-    let cmd = cmd_rx.recv().await.expect("command");
-    assert!(matches!(cmd, Command::Cancel));
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"STATUS: CANCELLED");
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "start"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx.send(Ok(())).unwrap(),
+        other => panic!("expected Start, got {other:?}"),
+    }
+    assert!(client.await.unwrap().unwrap().is_empty());
 }
 
-/// `STOP` must round-trip the transcription text through the
-/// `response_tx` oneshot. The test sends the command, receives
-/// [`Command::Stop`] with its `response_tx`, sends a fixed
-/// string through the oneshot, and asserts the exact bytes come
-/// back over the socket. This pins the server's STOP →
-/// event-loop → wire-out path end-to-end.
 #[tokio::test(flavor = "current_thread")]
-async fn stop_round_trips_transcription_through_response_tx() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn a_refused_start_keeps_its_error_code() {
     let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"STOP").await });
-    let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::Stop { response_tx } => response_tx,
-        other => panic!("expected Command::Stop, got {other:?}"),
-    };
-    response_tx
-        .send("hola mundo".to_string())
-        .expect("send transcription result");
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"hola mundo");
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "start"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Start { response_tx } => response_tx
+            .send(Err(Error::new(ErrorCode::NoModel, "cargando")))
+            .unwrap(),
+        other => panic!("expected Start, got {other:?}"),
+    }
+    assert_eq!(
+        client.await.unwrap(),
+        Err(Error::new(ErrorCode::NoModel, "cargando"))
+    );
 }
 
-/// `STATUS` must serialise [`StatusResponse`] to JSON and write
-/// it back. `StatusResponse` has no `PartialEq` derive (and
-/// adding one just for tests would leak an unstable contract),
-/// so the test deserialises the response and asserts on the
-/// fields the STATUS command is contracted to populate.
+// The old protocol sent errors as text, so a dictation that began with
+// "ERROR:" was thrown away by the GUI.
 #[tokio::test(flavor = "current_thread")]
-async fn status_returns_serialised_status_response() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn a_transcription_that_starts_with_error_is_delivered_as_text() {
     let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"STATUS").await });
-    let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::GetStatus { response_tx } => response_tx,
-        other => panic!("expected Command::GetStatus, got {other:?}"),
-    };
-    let expected = StatusResponse {
-        active: true,
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "stop"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Stop { response_tx } => response_tx
+            .send(Ok("ERROR: no compila".to_string()))
+            .unwrap(),
+        other => panic!("expected Stop, got {other:?}"),
+    }
+    let fields = client.await.unwrap().expect("a successful reply");
+    assert_eq!(fields["text"], "ERROR: no compila");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_is_acknowledged() {
+    let (server, mut cmd_rx) = spawn_server();
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "cancel"));
+    assert!(matches!(cmd_rx.recv().await, Some(Command::Cancel)));
+    assert!(client.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn status_carries_the_status_object() {
+    let (server, mut cmd_rx) = spawn_server();
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "status"));
+    let status = StatusResponse {
         pid: 4242,
         model_id: "test/model.bin".to_string(),
         model_kind: "whisper".to_string(),
-        model_path: "/tmp/test/model.bin".to_string(),
+        model_path: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
         state: "Idle".to_string(),
         engine: "loading".to_string(),
     };
-    response_tx.send(expected).expect("send status");
-    let response = client_task.await.expect("client task");
-    let parsed: StatusResponse =
-        serde_json::from_slice(&response).expect("response should be valid StatusResponse JSON");
-    assert_eq!(parsed.model_id, "test/model.bin");
-    assert_eq!(parsed.state, "Idle");
-    assert_eq!(parsed.pid, 4242);
-    assert_eq!(parsed.language, "es");
-    assert_eq!(parsed.engine, "loading");
+    match cmd_rx.recv().await.expect("command") {
+        Command::GetStatus { response_tx } => response_tx.send(status.clone()).unwrap(),
+        other => panic!("expected GetStatus, got {other:?}"),
+    }
+    let mut fields = client.await.unwrap().unwrap();
+    let got: StatusResponse = serde_json::from_value(fields.remove("status").unwrap()).unwrap();
+    assert_eq!(got, status);
 }
 
-/// A bare `REFRESH` reaches the event loop and its answer goes back
-/// as `OK: …`.
 #[tokio::test(flavor = "current_thread")]
-async fn refresh_is_dispatched_and_its_answer_forwarded() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn refresh_answers_and_errors_are_forwarded() {
     let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"REFRESH").await });
-    let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::Refresh { response_tx } => response_tx,
-        other => panic!("expected Command::Refresh, got {other:?}"),
-    };
-    response_tx
-        .send(Ok("configuración recargada".to_string()))
-        .expect("send Ok");
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, "OK: configuración recargada".as_bytes());
+    let sock = server.sock_path().to_path_buf();
+    let client = tokio::spawn(call(sock.clone(), "refresh"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Refresh { response_tx } => response_tx.send(Ok("recargada".into())).unwrap(),
+        other => panic!("expected Refresh, got {other:?}"),
+    }
+    assert_eq!(client.await.unwrap().unwrap()["message"], "recargada");
+
+    let client = tokio::spawn(call(sock, "refresh"));
+    match cmd_rx.recv().await.expect("command") {
+        Command::Refresh { response_tx } => response_tx
+            .send(Err(Error::new(ErrorCode::InvalidConfig, "línea 2")))
+            .unwrap(),
+        other => panic!("expected Refresh, got {other:?}"),
+    }
+    assert_eq!(error_code(client.await.unwrap()), ErrorCode::InvalidConfig);
 }
 
-/// The daemon re-reads its own configuration; a client cannot push one.
 #[tokio::test(flavor = "current_thread")]
-async fn refresh_with_a_payload_is_rejected_without_dispatch() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn an_unanswered_command_is_an_internal_error() {
     let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let response = round_trip(&sock_path, br#"REFRESH {"model_id":"org/repo/x.bin"}"#).await;
-    let response = String::from_utf8_lossy(&response);
-    assert!(
-        response.starts_with("ERROR: REFRESH no lleva argumentos"),
-        "{response}"
-    );
-    let spurious = tokio::time::timeout(Duration::from_millis(100), cmd_rx.recv()).await;
-    assert!(
-        spurious.is_err(),
-        "a REFRESH with a payload must not dispatch"
-    );
+    let client = tokio::spawn(call(server.sock_path().to_path_buf(), "stop"));
+    drop(cmd_rx.recv().await.expect("command"));
+    assert_eq!(error_code(client.await.unwrap()), ErrorCode::Internal);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn refresh_error_from_event_loop_is_forwarded() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"REFRESH").await });
-    let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::Refresh { response_tx } => response_tx,
-        other => panic!("expected Command::Refresh, got {other:?}"),
-    };
-    response_tx
-        .send(Err("boom".to_string()))
-        .expect("send reload error");
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"ERROR: boom");
-}
-
-/// If the event loop drops the `Stop::response_tx` without
-/// sending (e.g. the loop exited while the socket task was
-/// waiting), the server must report
-/// `ERROR: Transcription cancelled or failed`. The test sends
-/// `STOP`, receives the command, and drops the oneshot sender
-/// without calling `.send`.
-#[tokio::test(flavor = "current_thread")]
-async fn dropped_stop_response_tx_reports_cancelled() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, mut cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"STOP").await });
-    let response_tx = match cmd_rx.recv().await.expect("command") {
-        Command::Stop { response_tx } => response_tx,
-        other => panic!("expected Command::Stop, got {other:?}"),
-    };
-    drop(response_tx); // Sender dropped without sending.
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"ERROR: Transcription cancelled or failed");
-}
-
-/// If the event loop's command channel is closed (e.g. the
-/// daemon's main loop exited), the server must report
-/// `ERROR: Internal channel error`. The test drops the
-/// `cmd_rx` before any client connects, so the server's
-/// `cmd_tx.send(...).await` returns `Err(SendError)` (the
-/// receiver is gone) and the server writes the error to the
-/// socket.
-#[tokio::test(flavor = "current_thread")]
-async fn closed_command_channel_reports_internal_error() {
-    let _ = env_logger::builder().is_test(true).try_init();
+async fn a_closed_event_loop_is_an_internal_error() {
     let (server, cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    drop(cmd_rx); // Close the channel.
-    let response = round_trip(&sock_path, b"START").await;
-    assert_eq!(response, b"ERROR: Internal channel error");
+    drop(cmd_rx);
+    let reply = call(server.sock_path().to_path_buf(), "start").await;
+    assert_eq!(error_code(reply), ErrorCode::Internal);
 }
 
-/// `AUTO_STOP` is a *control-socket* command — `telora-ctl`
-/// writes it to the GUI's `control.sock` (see
-/// `telora-daemon/src/main.rs::notify_client_auto_stop`) — NOT a
-/// daemon-socket command. The daemon-socket must reject it with
-/// `ERROR: Unknown command`. This test pins the boundary so a
-/// future refactor cannot accidentally route `AUTO_STOP` through
-/// the daemon socket.
+// AUTO_STOP belongs to the GUI's control socket, not to the daemon's.
 #[tokio::test(flavor = "current_thread")]
-async fn unknown_command_is_rejected() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, _cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let response = round_trip(&sock_path, b"AUTO_STOP").await;
-    assert_eq!(response, b"ERROR: Unknown command");
+async fn unknown_commands_are_rejected_without_dispatch() {
+    let (server, mut cmd_rx) = spawn_server();
+    let reply = call(server.sock_path().to_path_buf(), "auto_stop").await;
+    assert_eq!(error_code(reply), ErrorCode::UnknownCommand);
+    no_dispatch(&mut cmd_rx).await;
 }
 
-/// An empty payload (client connects and immediately
-/// half-closes) must be reported as `ERROR: empty command`. The
-/// server's `read_to_end` returns `Ok(0)` for an empty buffer
-/// and the empty-buffer branch writes this error.
 #[tokio::test(flavor = "current_thread")]
-async fn empty_payload_reports_empty_command() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, _cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let mut client = UnixStream::connect(&sock_path).await.expect("connect");
-    client.shutdown().await.expect("half-close (empty payload)");
-    let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf))
-        .await
-        .expect("server failed to respond within 2s");
-    read.expect("read_to_end");
-    assert_eq!(buf, b"ERROR: empty command");
+async fn malformed_requests_are_rejected_without_dispatch() {
+    let (server, mut cmd_rx) = spawn_server();
+    let sock = server.sock_path();
+    for (payload, code) in [
+        (&b""[..], ErrorCode::BadRequest),
+        (b"STATUS", ErrorCode::BadRequest),
+        (
+            b"{\"v\":2,\"cmd\":\"status\"}\n",
+            ErrorCode::UnsupportedVersion,
+        ),
+    ] {
+        assert_eq!(error_code(raw(sock, payload, true).await), code);
+    }
+    no_dispatch(&mut cmd_rx).await;
+}
+
+// The old server read up to 64 KiB, closed, and the client saw a reset.
+#[tokio::test(flavor = "current_thread")]
+async fn an_oversized_request_gets_an_error_reply() {
+    let (server, mut cmd_rx) = spawn_server();
+    let payload = vec![b' '; protocol::MAX_MESSAGE_BYTES * 2];
+    let reply = raw(server.sock_path(), &payload, true).await;
+    assert_eq!(error_code(reply), ErrorCode::BadRequest);
+    no_dispatch(&mut cmd_rx).await;
+}
+
+// The old server waited for EOF, so a client that kept its write side
+// open never got an answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_does_not_half_close_gets_its_reply() {
+    let (server, mut cmd_rx) = spawn_server();
+    let sock = server.sock_path().to_path_buf();
+    let client =
+        tokio::spawn(async move { raw(&sock, &protocol::encode_request("cancel"), false).await });
+    assert!(matches!(cmd_rx.recv().await, Some(Command::Cancel)));
+    assert!(client.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_split_across_writes_is_reassembled() {
+    let (server, mut cmd_rx) = spawn_server();
+    let sock = server.sock_path().to_path_buf();
+    let client = tokio::spawn(async move {
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        stream.write_all(b"{\"v\":1,").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stream.write_all(b"\"cmd\":\"cancel\"}\n").await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        buf
+    });
+    assert!(matches!(cmd_rx.recv().await, Some(Command::Cancel)));
+    assert_eq!(client.await.unwrap(), b"{\"ok\":true}\n");
 }
 
 /// A second `SocketServer::bind` on the same path MUST succeed
@@ -484,14 +390,12 @@ async fn second_bind_takes_over_the_path() {
     std::mem::forget(server1);
     let (server2, mut cmd_rx2) = spawn_server_at(&sock_path);
     let sock_path_for_client = sock_path.clone();
-    let client_task =
-        tokio::spawn(async move { round_trip(&sock_path_for_client, b"START").await });
+    let client_task = tokio::spawn(call(sock_path_for_client, "start"));
     match cmd_rx2.recv().await.expect("command") {
         Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
         other => panic!("expected Command::Start, got {other:?}"),
     }
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"STATUS: RECORDING");
+    assert!(client_task.await.expect("client task").is_ok());
     drop(server2);
 }
 
@@ -526,57 +430,6 @@ async fn socket_file_is_unlinked_after_run_task_is_aborted() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-/// Regression canary for PR #132 (issue #114): a client that
-/// writes the command and immediately reads to EOF — without
-/// half-closing the write side — must NOT receive a response
-/// under the current server protocol. This pins the half-close
-/// contract that the production clients now rely on.
-///
-/// Under the current server implementation
-/// (`SocketServer::run` reads with `read_to_end` and waits for
-/// the client EOF before dispatching), a non-half-closing client
-/// hangs forever. The 2-second timeout here catches the hang
-/// and the test asserts the timeout fired. If a future server
-/// change makes the protocol respond without requiring
-/// half-close, this test fails — the failure message points the
-/// reviewer at the contract that changed.
-///
-/// The production-side fix for the #132 deadlock lives in
-/// `telora-gui/src/connection.rs::SocketClient::send_command`
-/// and `telora-daemon/src/main.rs::{run_refresh_client,
-/// run_status_client}` — each now calls `stream.shutdown().await`
-/// between the write and the read. Without those `shutdown()`
-/// calls, every production client call would hang on the same
-/// `read_to_end` this test exercises.
-#[tokio::test(flavor = "current_thread")]
-async fn client_that_does_not_half_close_still_gets_a_response() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let (server, _cmd_rx) = spawn_server();
-    let sock_path = server.sock_path().to_path_buf();
-    let client_task = tokio::spawn(async move {
-        let mut client = UnixStream::connect(&sock_path).await.expect("connect");
-        client.write_all(b"START").await.expect("write");
-        // Deliberately NO `shutdown().await` here — we want to
-        // observe the server's behaviour when the client does
-        // not half-close. Under the current `read_to_end`
-        // protocol, the server parks forever and the timeout
-        // below fires.
-        let mut buf = Vec::new();
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf)).await;
-        (result, buf)
-    });
-    let (result, buf) = client_task.await.expect("client task");
-    assert!(
-        result.is_err(),
-        "server responded without half-close; the protocol contract \
-         (server reads to EOF and requires the client to half-close) \
-         has changed. Update this test to match the new contract. \
-         Got response: {:?}",
-        String::from_utf8_lossy(&buf)
-    );
 }
 
 /// Env-dependent regression test from issue #27: under
@@ -616,13 +469,12 @@ async fn lifecycle_resolve_picks_xdg_socket_dir() {
     // a full START round-trip through it.
     let (server, mut cmd_rx) = spawn_server_at(&resolved.daemon_sock);
     let sock_path = resolved.daemon_sock.clone();
-    let client_task = tokio::spawn(async move { round_trip(&sock_path, b"START").await });
+    let client_task = tokio::spawn(call(sock_path, "start"));
     match cmd_rx.recv().await.expect("command") {
         Command::Start { response_tx } => response_tx.send(Ok(())).expect("ack start"),
         other => panic!("expected Command::Start, got {other:?}"),
     }
-    let response = client_task.await.expect("client task");
-    assert_eq!(response, b"STATUS: RECORDING");
+    assert!(client_task.await.expect("client task").is_ok());
 
     drop(server);
     // `tmp` drops at end of scope and removes the tempdir

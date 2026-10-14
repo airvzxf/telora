@@ -5,20 +5,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use telora_common::cache::resolve_voxora_cache;
 use telora_common::config::{Cascade, load_paths_config_from};
+use telora_common::protocol;
 use telora_daemon::daemon::{self, Daemon, Hooks};
 use telora_daemon::{
     BridgeTranscriber, DaemonConfig, Microphone, SocketServer, StatusResponse, SttConfig,
     Transcriber, engine_family, paths, validate_stt_config,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-async fn notify_client_auto_stop(control_socket: &str) {
-    if let Ok(mut stream) = UnixStream::connect(control_socket).await {
-        let _ = stream.write_all(b"AUTO_STOP").await;
+async fn notify_client_auto_stop(control_socket: &Path) {
+    match protocol::call(control_socket, "auto_stop").await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!("The GUI rejected auto_stop: {e}"),
+        Err(e) => warn!("Could not tell the GUI about the auto-stop: {e:#}"),
     }
 }
 
@@ -99,108 +100,45 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
 }
 
 /// Socket of the running daemon, from the `[paths]` of the same cascade.
-fn daemon_socket(args: &Args) -> Result<String> {
+fn daemon_socket(args: &Args) -> Result<PathBuf> {
     let cascade = Cascade::standard(args.config.as_deref().map(Path::new));
-    let resolved = paths::resolve(&load_paths_config_from(&cascade)?)?;
-    Ok(resolved.daemon_sock.to_string_lossy().into_owned())
+    Ok(paths::resolve(&load_paths_config_from(&cascade)?)?.daemon_sock)
 }
 
-/// The daemon's answer to REFRESH: `OK: …` or `ERROR: …`.
-async fn run_refresh_client(socket_path: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(socket_path).await.with_context(|| {
-        format!("no se pudo conectar con el daemon en {socket_path} (¿está corriendo?)")
-    })?;
-    stream
-        .write_all(b"REFRESH")
-        .await
-        .context("Failed to send refresh command to daemon")?;
-    // The daemon reads until EOF before answering.
-    stream
-        .shutdown()
-        .await
-        .context("Failed to half-close write side of daemon socket")?;
-
-    let mut buf = Vec::new();
-    let mut limited = stream.take(64 * 1024);
-    limited
-        .read_to_end(&mut buf)
-        .await
-        .context("Failed to read response from daemon")?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-async fn run_status_client(socket_path: &str) -> Result<()> {
-    let mut stream = match UnixStream::connect(socket_path).await {
-        Ok(s) => s,
-        Err(_) => {
-            println!("Telora Daemon Status");
-            println!(
-                "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-                "ACTIVE", "PID", "KIND", "MODEL", "LANG", "MAX_SEC", "STATE"
-            );
-            println!(
-                "{:-<10} {:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
-                "", "", "", "", "", "", ""
-            );
-            println!(
-                "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-                "NO", "-", "-", "-", "-", "-", "STOPPED"
-            );
-            return Ok(());
-        }
+async fn run_status_client(socket: &Path) -> Result<()> {
+    const HEADER: [&str; 6] = ["PID", "KIND", "MODEL", "LANG", "MAX_SEC", "STATE"];
+    let row = |cells: [&str; 6]| {
+        println!(
+            "{:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+        );
     };
-
-    if let Err(e) = stream.write_all(b"STATUS").await {
-        eprintln!("Failed to send command to daemon: {}", e);
-        return Ok(());
-    }
-
-    // Half-close the write side so the server's `read_to_end`
-    // (telora-daemon/src/socket.rs:200-203) reaches EOF and proceeds
-    // to write the response. Without this the daemon hangs forever
-    // waiting for our EOF; introduced by PR #132 (ed326d2). The
-    // `Status` subcommand would then block on `read_to_end` and the
-    // operator would see `telora-daemon status` hang indefinitely.
-    if let Err(e) = stream.shutdown().await {
-        eprintln!("Failed to half-close write side of daemon socket: {}", e);
-        return Ok(());
-    }
-
-    let mut buf = Vec::new();
-    if let Err(e) = stream.read_to_end(&mut buf).await {
-        eprintln!("Failed to read response from daemon: {}", e);
-        return Ok(());
-    }
-
-    let response = String::from_utf8_lossy(&buf);
-
-    if response.trim().is_empty() {
-        eprintln!("Empty response from daemon.");
-        return Ok(());
-    }
-
-    if response.starts_with("ERROR") {
-        eprintln!("Daemon returned error: {}", response);
-        return Ok(());
-    }
-
-    let status: StatusResponse = match serde_json::from_str(&response) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to parse response: {} (Response: {})", e, response);
-            return Ok(());
-        }
-    };
-
     println!("Telora Daemon Status");
-    println!(
-        "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-        "ACTIVE", "PID", "KIND", "MODEL", "LANG", "MAX_SEC", "STATE"
-    );
-    println!(
-        "{:-<10} {:-<10} {:-<10} {:-<30} {:-<10} {:-<10} {:-<15}",
-        "", "", "", "", "", "", ""
-    );
+    row(HEADER);
+    row([
+        "-".repeat(10).as_str(),
+        &"-".repeat(10),
+        &"-".repeat(30),
+        &"-".repeat(10),
+        &"-".repeat(10),
+        &"-".repeat(15),
+    ]);
+
+    let reply = match protocol::call(socket, "status").await {
+        Ok(reply) => reply,
+        Err(e) => {
+            row(["-", "-", "-", "-", "-", "STOPPED"]);
+            eprintln!("\n{e:#}");
+            return Ok(());
+        }
+    };
+    let mut fields = reply.map_err(|e| anyhow::anyhow!("el daemon respondió: {e}"))?;
+    let status: StatusResponse = serde_json::from_value(
+        fields
+            .remove("status")
+            .context("respuesta de STATUS sin \"status\"")?,
+    )
+    .context("respuesta de STATUS mal formada")?;
 
     let model_display = if status.model_id.len() > 28 {
         format!(
@@ -210,31 +148,21 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
     } else {
         status.model_id.clone()
     };
-
+    row([
+        &status.pid.to_string(),
+        &status.model_kind,
+        &model_display,
+        &status.language,
+        &status.max_recording_seconds.to_string(),
+        &status.state,
+    ]);
     println!(
-        "{:<10} {:<10} {:<10} {:<30} {:<10} {:<10} {:<15}",
-        if status.active { "YES" } else { "NO" },
-        status.pid,
-        status.model_kind,
-        model_display,
-        status.language,
-        status.max_recording_seconds,
-        status.state
+        "\nFull Model Id:   {}\nEngine Kind:     {}\nModel State:     {}",
+        status.model_id, status.model_kind, status.engine
     );
-
-    if status.active {
-        println!(
-            "\nFull Model Id:   {}\nEngine Kind:     {}",
-            status.model_id, status.model_kind
-        );
-        if !status.engine.is_empty() {
-            println!("Model State:     {}", status.engine);
-        }
-        if !status.model_path.is_empty() {
-            println!("Resolved Path:   {}", status.model_path);
-        }
+    if !status.model_path.is_empty() {
+        println!("Resolved Path:   {}", status.model_path);
     }
-
     Ok(())
 }
 
@@ -314,21 +242,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(Commands::Status) = args.command {
-        let daemon_sock = daemon_socket(&args)?;
-        if let Err(e) = run_status_client(&daemon_sock).await {
-            eprintln!("Error querying status: {}", e);
-        }
-        return Ok(());
+        return run_status_client(&daemon_socket(&args)?).await;
     }
 
     if let Some(Commands::Refresh) = args.command {
-        let reply = run_refresh_client(&daemon_socket(&args)?).await?;
-        if reply.starts_with("OK") {
-            println!("{reply}");
-            return Ok(());
-        }
-        eprintln!("{reply}");
-        std::process::exit(1);
+        let mut fields = protocol::call(&daemon_socket(&args)?, "refresh")
+            .await?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let message = fields.remove("message").unwrap_or_default();
+        println!("{}", message.as_str().unwrap_or("configuración recargada"));
+        return Ok(());
     }
 
     let daemon_cfg = match load_config(&args) {
@@ -433,7 +356,7 @@ async fn main() -> Result<()> {
         resolved_paths.daemon_sock.display()
     );
 
-    let control_sock = resolved_paths.control_sock.to_string_lossy().into_owned();
+    let control_sock = resolved_paths.control_sock.clone();
     let hooks = Hooks {
         load_engine: Box::new(move |config| {
             let cache = voxora_cache.clone();

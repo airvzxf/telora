@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::socket::{AudioConfig, Command, DaemonConfig, PathsConfig, StatusResponse, SttConfig};
 use crate::transcriber::{Transcriber, validate_stt_config};
+use telora_common::protocol::{Error as ProtocolError, ErrorCode};
 
 /// Samples per second the engines expect and the buffer is sized for.
 const SAMPLE_RATE: usize = 16_000;
@@ -58,12 +59,13 @@ impl Engine {
     }
 
     /// Why a recording cannot start, or `None` when the engine is usable.
-    fn unavailable_reason(&self) -> Option<String> {
-        match self {
-            Engine::Loading => Some("el modelo todavía se está cargando".to_string()),
-            Engine::Ready(_) => None,
-            Engine::Failed(e) => Some(format!("no se pudo cargar el modelo: {e}")),
-        }
+    fn unavailable(&self) -> Option<ProtocolError> {
+        let reason = match self {
+            Engine::Loading => "el modelo todavía se está cargando".to_string(),
+            Engine::Ready(_) => return None,
+            Engine::Failed(e) => format!("no se pudo cargar el modelo: {e}"),
+        };
+        Some(ProtocolError::new(ErrorCode::NoModel, reason))
     }
 }
 
@@ -71,7 +73,10 @@ impl Engine {
 pub type LoadResult = Result<(Arc<dyn Transcriber>, String), String>;
 
 /// Answer to a REFRESH: the `OK:` text, or why it was refused.
-pub type RefreshReply = oneshot::Sender<Result<String, String>>;
+pub type RefreshReply = oneshot::Sender<Result<String, ProtocolError>>;
+
+/// A transcription, or why there is none.
+pub type TextResult = Result<String, ProtocolError>;
 
 pub enum Event {
     Command(Command),
@@ -79,7 +84,7 @@ pub enum Event {
     Tick,
     TranscriptionDone {
         job: u64,
-        text: String,
+        result: TextResult,
     },
     EngineLoaded {
         generation: u64,
@@ -123,9 +128,9 @@ pub struct Daemon<A: AudioSource> {
     /// Bumped on every transcription and on CANCEL, so a result from a
     /// cancelled job is recognised and dropped.
     job: u64,
-    stop_waiter: Option<oneshot::Sender<String>>,
+    stop_waiter: Option<oneshot::Sender<TextResult>>,
     /// A result nobody asked for yet (auto-stop finished before STOP).
-    unclaimed_result: Option<String>,
+    unclaimed_result: Option<TextResult>,
     /// Bumped on every model load, so a slower, older load cannot
     /// overwrite a newer one.
     load_generation: u64,
@@ -169,9 +174,9 @@ impl<A: AudioSource> Daemon<A> {
         match event {
             Event::Command(cmd) => self.handle_command(cmd),
             Event::Tick => self.tick(),
-            Event::TranscriptionDone { job, text } => {
+            Event::TranscriptionDone { job, result } => {
                 if job == self.job && self.phase == Phase::Processing {
-                    self.finish(text);
+                    self.finish(result);
                 } else {
                     info!("Dropping result of cancelled transcription job {job}");
                 }
@@ -188,7 +193,7 @@ impl<A: AudioSource> Daemon<A> {
                 Ok(config) => self.apply_config(config, response_tx).into_iter().collect(),
                 Err(e) => {
                     warn!("REFRESH refused: {e}");
-                    let _ = response_tx.send(Err(e));
+                    let _ = response_tx.send(Err(ProtocolError::new(ErrorCode::InvalidConfig, e)));
                     Vec::new()
                 }
             },
@@ -200,9 +205,12 @@ impl<A: AudioSource> Daemon<A> {
             Command::Start { response_tx } => {
                 info!("Command: START");
                 let refusal = if self.phase == Phase::Processing {
-                    Some("todavía se está transcribiendo la grabación anterior".to_string())
+                    Some(ProtocolError::new(
+                        ErrorCode::Busy,
+                        "todavía se está transcribiendo la grabación anterior",
+                    ))
                 } else {
-                    self.engine.unavailable_reason()
+                    self.engine.unavailable()
                 };
                 if let Some(reason) = refusal {
                     warn!("START refused: {reason}");
@@ -219,8 +227,10 @@ impl<A: AudioSource> Daemon<A> {
                         Err(e) => {
                             error!("Could not open the microphone: {e}");
                             self.phase = Phase::Idle;
-                            let _ = response_tx
-                                .send(Err(format!("no se pudo abrir el micrófono: {e}")));
+                            let _ = response_tx.send(Err(ProtocolError::new(
+                                ErrorCode::Microphone,
+                                format!("no se pudo abrir el micrófono: {e}"),
+                            )));
                         }
                     }
                 }
@@ -237,13 +247,16 @@ impl<A: AudioSource> Daemon<A> {
                     }
                     Phase::Processing => {
                         if let Some(previous) = self.stop_waiter.replace(response_tx) {
-                            let _ = previous
-                                .send("ERROR: otro cliente pidió el mismo resultado".to_string());
+                            let _ = previous.send(Err(ProtocolError::new(
+                                ErrorCode::Superseded,
+                                "otro cliente pidió el mismo resultado",
+                            )));
                         }
                         Vec::new()
                     }
                     Phase::Idle => {
-                        let _ = response_tx.send(self.unclaimed_result.take().unwrap_or_default());
+                        let result = self.unclaimed_result.take().unwrap_or(Ok(String::new()));
+                        let _ = response_tx.send(result);
                         Vec::new()
                     }
                 }
@@ -253,7 +266,10 @@ impl<A: AudioSource> Daemon<A> {
                 if self.phase == Phase::Processing {
                     self.job += 1;
                     if let Some(tx) = self.stop_waiter.take() {
-                        let _ = tx.send("ERROR: transcripción cancelada".to_string());
+                        let _ = tx.send(Err(ProtocolError::new(
+                            ErrorCode::Cancelled,
+                            "transcripción cancelada",
+                        )));
                     }
                 }
                 self.audio.stop();
@@ -306,7 +322,7 @@ impl<A: AudioSource> Daemon<A> {
         match &self.engine {
             Engine::Ready(_) if audio.is_empty() => {
                 warn!("Audio buffer empty, skipping transcription.");
-                self.finish(String::new());
+                self.finish(Ok(String::new()));
                 None
             }
             Engine::Ready(engine) => Some(Effect::Transcribe {
@@ -316,22 +332,22 @@ impl<A: AudioSource> Daemon<A> {
                 language: self.config.language.clone(),
             }),
             other => {
-                let reason = other
-                    .unavailable_reason()
-                    .unwrap_or_else(|| "modelo no disponible".to_string());
-                error!("Recording discarded: {reason}");
-                self.finish(format!("ERROR: {reason}"));
+                let error = other
+                    .unavailable()
+                    .unwrap_or_else(|| ProtocolError::new(ErrorCode::NoModel, "sin modelo"));
+                error!("Recording discarded: {error}");
+                self.finish(Err(error));
                 None
             }
         }
     }
 
-    fn finish(&mut self, text: String) {
+    fn finish(&mut self, result: TextResult) {
         match self.stop_waiter.take() {
             Some(tx) => {
-                let _ = tx.send(text);
+                let _ = tx.send(result);
             }
-            None => self.unclaimed_result = Some(text),
+            None => self.unclaimed_result = Some(result),
         }
         self.phase = Phase::Idle;
     }
@@ -348,15 +364,19 @@ impl<A: AudioSource> Daemon<A> {
         );
         if let Err(e) = validate_stt_config(&new_config) {
             warn!("REFRESH refused: {e}");
-            let _ = response_tx.send(Err(format!("configuración inválida: {e}")));
+            let _ = response_tx.send(Err(ProtocolError::new(
+                ErrorCode::InvalidConfig,
+                format!("configuración inválida: {e}"),
+            )));
             return None;
         }
         let same_model = new_config.model_id == self.config.model_id
             && new_config.model_kind == self.config.model_kind;
         if !same_model && self.phase != Phase::Idle {
-            let _ = response_tx.send(Err(
-                "hay una grabación en curso; vuelve a intentarlo al terminar".to_string(),
-            ));
+            let _ = response_tx.send(Err(ProtocolError::new(
+                ErrorCode::Busy,
+                "hay una grabación en curso; vuelve a intentarlo al terminar",
+            )));
             return None;
         }
 
@@ -382,7 +402,10 @@ impl<A: AudioSource> Daemon<A> {
             }
             _ => {
                 for (waiter, _) in self.reload_waiters.drain(..) {
-                    let _ = waiter.send(Err("reemplazado por un REFRESH posterior".to_string()));
+                    let _ = waiter.send(Err(ProtocolError::new(
+                        ErrorCode::Superseded,
+                        "reemplazado por un REFRESH posterior",
+                    )));
                 }
                 self.engine = Engine::Loading;
                 new_config.model_path = String::new();
@@ -416,18 +439,17 @@ impl<A: AudioSource> Daemon<A> {
             }
         };
         for (waiter, ok) in self.reload_waiters.drain(..) {
-            let _ = waiter.send(
-                reply
-                    .clone()
-                    .map(|()| ok)
-                    .map_err(|msg| format!("no se pudo cargar el modelo: {msg}")),
-            );
+            let _ = waiter.send(reply.clone().map(|()| ok).map_err(|msg| {
+                ProtocolError::new(
+                    ErrorCode::ModelLoad,
+                    format!("no se pudo cargar el modelo: {msg}"),
+                )
+            }));
         }
     }
 
     fn status(&self) -> StatusResponse {
         StatusResponse {
-            active: true,
             pid: std::process::id(),
             model_id: self.config.model_id.clone(),
             model_kind: self.config.model_kind.clone(),
@@ -496,18 +518,24 @@ fn execute(effect: Effect, hooks: &Hooks, done_tx: &mpsc::Sender<Event>) {
                 let joined =
                     tokio::task::spawn_blocking(move || engine.transcribe(&audio, Some(&language)))
                         .await;
-                let text = match joined {
-                    Ok(Ok(text)) => text,
+                let result = match joined {
+                    Ok(Ok(text)) => Ok(text),
                     Ok(Err(e)) => {
-                        error!("Transcription failed: {e}");
-                        format!("ERROR: {e}")
+                        error!("Transcription failed: {e:#}");
+                        Err(ProtocolError::new(
+                            ErrorCode::Transcription,
+                            format!("{e:#}"),
+                        ))
                     }
                     Err(e) => {
                         error!("Transcription task panicked: {e}");
-                        "ERROR: la transcripción falló inesperadamente".to_string()
+                        Err(ProtocolError::new(
+                            ErrorCode::Transcription,
+                            "la transcripción falló inesperadamente",
+                        ))
                     }
                 };
-                let _ = done_tx.send(Event::TranscriptionDone { job, text }).await;
+                let _ = done_tx.send(Event::TranscriptionDone { job, result }).await;
             });
         }
         Effect::LoadEngine { generation, config } => {
@@ -646,13 +674,13 @@ mod tests {
         (d, mic)
     }
 
-    fn start(d: &mut Daemon<FakeMic>) -> Result<(), String> {
+    fn start(d: &mut Daemon<FakeMic>) -> Result<(), ProtocolError> {
         let (tx, mut rx) = oneshot::channel();
         d.handle(Event::Command(Command::Start { response_tx: tx }));
         rx.try_recv().expect("START must be answered at once")
     }
 
-    fn stop(d: &mut Daemon<FakeMic>) -> (oneshot::Receiver<String>, Vec<Effect>) {
+    fn stop(d: &mut Daemon<FakeMic>) -> (oneshot::Receiver<TextResult>, Vec<Effect>) {
         let (tx, rx) = oneshot::channel();
         let effects = d.handle(Event::Command(Command::Stop { response_tx: tx }));
         (rx, effects)
@@ -662,7 +690,10 @@ mod tests {
     fn refresh_with(
         d: &mut Daemon<FakeMic>,
         cfg: DaemonConfig,
-    ) -> (oneshot::Receiver<Result<String, String>>, Vec<Effect>) {
+    ) -> (
+        oneshot::Receiver<Result<String, ProtocolError>>,
+        Vec<Effect>,
+    ) {
         let (tx, rx) = oneshot::channel();
         let effects = d.handle(Event::ConfigRead {
             result: Ok(cfg),
@@ -674,7 +705,10 @@ mod tests {
     fn refresh(
         d: &mut Daemon<FakeMic>,
         cfg: SttConfig,
-    ) -> (oneshot::Receiver<Result<String, String>>, Vec<Effect>) {
+    ) -> (
+        oneshot::Receiver<Result<String, ProtocolError>>,
+        Vec<Effect>,
+    ) {
         refresh_with(d, full(cfg))
     }
 
@@ -704,7 +738,8 @@ mod tests {
         let (mut d, effect) = Daemon::new(FakeMic::default(), full(config("modelo-a")));
         assert!(matches!(effect, Effect::LoadEngine { generation: 1, .. }));
         let err = start(&mut d).unwrap_err();
-        assert!(err.contains("cargando"), "{err}");
+        assert_eq!(err.code, ErrorCode::NoModel);
+        assert!(err.message.contains("cargando"), "{err}");
         assert_eq!(d.phase(), Phase::Idle);
     }
 
@@ -716,7 +751,7 @@ mod tests {
             result: Err("archivo corrupto".to_string()),
         });
         let err = start(&mut d).unwrap_err();
-        assert!(err.contains("archivo corrupto"), "{err}");
+        assert!(err.message.contains("archivo corrupto"), "{err}");
         assert_eq!(status(&mut d).engine, "failed: archivo corrupto");
     }
 
@@ -738,9 +773,9 @@ mod tests {
 
         d.handle(Event::TranscriptionDone {
             job,
-            text: "hola".to_string(),
+            result: Ok("hola".to_string()),
         });
-        assert_eq!(rx.try_recv().unwrap(), "hola");
+        assert_eq!(rx.try_recv().unwrap(), Ok("hola".to_string()));
         assert_eq!(d.phase(), Phase::Idle);
     }
 
@@ -750,7 +785,7 @@ mod tests {
         start(&mut d).unwrap();
         let (mut rx, effects) = stop(&mut d);
         assert!(effects.is_empty());
-        assert_eq!(rx.try_recv().unwrap(), "");
+        assert_eq!(rx.try_recv().unwrap(), Ok("".to_string()));
         assert_eq!(d.phase(), Phase::Idle);
     }
 
@@ -777,14 +812,18 @@ mod tests {
         let (job, _) = transcribe_job(&d.handle(Event::Tick));
         d.handle(Event::TranscriptionDone {
             job,
-            text: "dictado largo".to_string(),
+            result: Ok("dictado largo".to_string()),
         });
         assert_eq!(d.phase(), Phase::Idle);
 
         let (mut rx, _) = stop(&mut d);
-        assert_eq!(rx.try_recv().unwrap(), "dictado largo");
+        assert_eq!(rx.try_recv().unwrap(), Ok("dictado largo".to_string()));
         let (mut rx, _) = stop(&mut d);
-        assert_eq!(rx.try_recv().unwrap(), "", "the result is handed out once");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Ok(String::new()),
+            "the result is handed out once"
+        );
     }
 
     #[test]
@@ -798,9 +837,9 @@ mod tests {
         assert!(effects.is_empty(), "no second transcription");
         d.handle(Event::TranscriptionDone {
             job,
-            text: "listo".to_string(),
+            result: Ok("listo".to_string()),
         });
-        assert_eq!(rx.try_recv().unwrap(), "listo");
+        assert_eq!(rx.try_recv().unwrap(), Ok("listo".to_string()));
     }
 
     #[test]
@@ -812,12 +851,15 @@ mod tests {
         let (job, _) = transcribe_job(&effects);
         let (mut second, _) = stop(&mut d);
 
-        assert!(first.try_recv().unwrap().starts_with("ERROR:"));
+        assert_eq!(
+            first.try_recv().unwrap().unwrap_err().code,
+            ErrorCode::Superseded
+        );
         d.handle(Event::TranscriptionDone {
             job,
-            text: "texto".to_string(),
+            result: Ok("texto".to_string()),
         });
-        assert_eq!(second.try_recv().unwrap(), "texto");
+        assert_eq!(second.try_recv().unwrap(), Ok("texto".to_string()));
     }
 
     #[test]
@@ -827,7 +869,8 @@ mod tests {
         mic.capture(100);
         let _pending = stop(&mut d);
         let err = start(&mut d).unwrap_err();
-        assert!(err.contains("transcribiendo"), "{err}");
+        assert_eq!(err.code, ErrorCode::Busy);
+        assert!(err.message.contains("transcribiendo"), "{err}");
         assert_eq!(d.phase(), Phase::Processing);
     }
 
@@ -871,8 +914,9 @@ mod tests {
         let (mut d, mic) = ready_daemon();
         mic.unplug();
         let err = start(&mut d).unwrap_err();
-        assert!(err.contains("micrófono"), "{err}");
-        assert!(err.contains("desconectado"), "{err}");
+        assert_eq!(err.code, ErrorCode::Microphone);
+        assert!(err.message.contains("micrófono"), "{err}");
+        assert!(err.message.contains("desconectado"), "{err}");
         assert_eq!(d.phase(), Phase::Idle);
     }
 
@@ -900,17 +944,20 @@ mod tests {
         let (job, _) = transcribe_job(&effects);
 
         d.handle(Event::Command(Command::Cancel));
-        assert_eq!(rx.try_recv().unwrap(), "ERROR: transcripción cancelada");
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err().code,
+            ErrorCode::Cancelled
+        );
         assert_eq!(d.phase(), Phase::Idle);
 
         d.handle(Event::TranscriptionDone {
             job,
-            text: "tarde".to_string(),
+            result: Ok("tarde".to_string()),
         });
         let (mut rx, _) = stop(&mut d);
         assert_eq!(
             rx.try_recv().unwrap(),
-            "",
+            Ok(String::new()),
             "the cancelled text must not leak"
         );
     }
@@ -923,11 +970,11 @@ mod tests {
         let (job, _) = transcribe_job(&d.handle(Event::Tick));
         d.handle(Event::TranscriptionDone {
             job,
-            text: "olvidado".to_string(),
+            result: Ok("olvidado".to_string()),
         });
         d.handle(Event::Command(Command::Cancel));
         let (mut rx, _) = stop(&mut d);
-        assert_eq!(rx.try_recv().unwrap(), "");
+        assert_eq!(rx.try_recv().unwrap(), Ok("".to_string()));
     }
 
     #[test]
@@ -955,7 +1002,7 @@ mod tests {
         let (mut rx, effects) = refresh(&mut d, cfg);
         assert!(effects.is_empty(), "must not start loading");
         let err = rx.try_recv().unwrap().unwrap_err();
-        assert!(err.contains("klingon"), "{err}");
+        assert!(err.message.contains("klingon"), "{err}");
 
         let s = status(&mut d);
         assert_eq!(s.model_id, "modelo-a");
@@ -994,9 +1041,9 @@ mod tests {
 
         d.handle(Event::TranscriptionDone {
             job,
-            text: "ok".to_string(),
+            result: Ok("ok".to_string()),
         });
-        assert_eq!(stop_rx.try_recv().unwrap(), "ok");
+        assert_eq!(stop_rx.try_recv().unwrap(), Ok("ok".to_string()));
     }
 
     #[test]
@@ -1027,7 +1074,8 @@ mod tests {
             result: Err("no existe".to_string()),
         });
         let err = rx.try_recv().unwrap().unwrap_err();
-        assert!(err.contains("no existe"), "{err}");
+        assert_eq!(err.code, ErrorCode::ModelLoad);
+        assert!(err.message.contains("no existe"), "{err}");
         assert_eq!(status(&mut d).engine, "failed: no existe");
     }
 
@@ -1094,7 +1142,9 @@ mod tests {
             response_tx: tx,
         });
         assert!(effects.is_empty());
-        assert!(rx.try_recv().unwrap().unwrap_err().contains("line 2"));
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidConfig);
+        assert!(err.message.contains("line 2"), "{err}");
         let s = status(&mut d);
         assert_eq!(s.model_id, "modelo-a");
         assert_eq!(s.engine, "ready");
@@ -1201,7 +1251,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn start(&self) -> Result<(), String> {
+        async fn start(&self) -> Result<(), ProtocolError> {
             let (tx, rx) = oneshot::channel();
             self.commands
                 .send(Command::Start { response_tx: tx })
@@ -1210,7 +1260,7 @@ mod tests {
             rx.await.unwrap()
         }
 
-        async fn stop(&self) -> oneshot::Receiver<String> {
+        async fn stop(&self) -> oneshot::Receiver<TextResult> {
             let (tx, rx) = oneshot::channel();
             self.commands
                 .send(Command::Stop { response_tx: tx })
@@ -1219,7 +1269,7 @@ mod tests {
             rx
         }
 
-        async fn refresh(&self) -> Result<String, String> {
+        async fn refresh(&self) -> Result<String, ProtocolError> {
             let (tx, rx) = oneshot::channel();
             self.commands
                 .send(Command::Refresh { response_tx: tx })
@@ -1257,7 +1307,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(text, "320 muestras");
+        assert_eq!(text, Ok("320 muestras".to_string()));
         assert_eq!(h.status().await.state, "Idle");
     }
 
@@ -1269,12 +1319,15 @@ mod tests {
         h.mic.capture(100);
         let cancelled = h.stop().await;
         h.commands.send(Command::Cancel).await.unwrap();
-        assert_eq!(cancelled.await.unwrap(), "ERROR: transcripción cancelada");
+        assert_eq!(
+            cancelled.await.unwrap().unwrap_err().code,
+            ErrorCode::Cancelled
+        );
 
         h.release.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let late = h.stop().await;
-        assert_eq!(late.await.unwrap(), "");
+        assert_eq!(late.await.unwrap(), Ok(String::new()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

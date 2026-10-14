@@ -194,7 +194,7 @@ impl Session {
 /// Shorten a daemon error for the OSD; full text stays in the log.
 pub fn short_error(message: &str) -> String {
     const MAX_CHARS: usize = 120;
-    let trimmed = message.trim().trim_start_matches("ERROR:").trim();
+    let trimmed = message.trim();
     if trimmed.chars().count() <= MAX_CHARS {
         return trimmed.to_string();
     }
@@ -351,8 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn short_error_strips_prefix_and_truncates() {
-        assert_eq!(short_error("ERROR: sin modelo"), "sin modelo");
+    fn short_error_truncates() {
+        assert_eq!(short_error(" sin modelo "), "sin modelo");
         let long = "x".repeat(300);
         assert_eq!(short_error(&long).chars().count(), 120);
     }

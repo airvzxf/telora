@@ -1,49 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use telora_common::protocol;
 use telora_common::socket_bind::bind_unix_socket;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-pub struct SocketClient;
-
-impl SocketClient {
-    /// Send `cmd` to the daemon over its Unix socket and read back
-    /// the full response. The daemon socket path is plumbed in by
-    /// the caller (issue #64): the GUI resolves it once at startup
-    /// from the `[paths]` cascade and reuses the same `PathBuf`
-    /// across every command in a session, so ad-hoc `./telora-gui`
-    /// invocations honour `telora.toml [paths]` / `TELORA_PATHS__*`
-    /// for the first time.
-    pub async fn send_command(cmd: &str, daemon_sock: &Path) -> Result<String> {
-        let mut stream = UnixStream::connect(daemon_sock)
-            .await
-            .context("Failed to connect to daemon")?;
-        stream
-            .write_all(cmd.as_bytes())
-            .await
-            .context("Failed to send command")?;
-
-        // Half-close the write side so the server's `read_to_end`
-        // (telora-daemon/src/socket.rs:200-203) reaches EOF and
-        // proceeds to write the response. Without this the server
-        // hangs forever waiting for the client's EOF; introduced by
-        // PR #132 (ed326d2). Symptom: any `SocketClient::send_command`
-        // call blocks indefinitely after the write, and the user sees
-        // a frozen GUI / hotkey wrapper.
-        stream
-            .shutdown()
-            .await
-            .context("Failed to half-close write side of daemon socket")?;
-
-        // Wait for response
-        let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .context("Failed to read response from daemon")?;
-        Ok(String::from_utf8_lossy(&buf).to_string())
-    }
-}
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct ControlServer {
@@ -76,16 +38,25 @@ impl ControlServer {
         &self.socket_path
     }
 
-    /// Accept one client and read its command. The stream is returned so
-    /// the caller can write a reply.
-    pub async fn next_command(&self) -> Result<(String, UnixStream)> {
+    /// Accept one client and read its request. The stream is returned so
+    /// the caller can write the reply.
+    pub async fn next_request(&self) -> Result<(Result<String, protocol::Error>, UnixStream)> {
         let (mut stream, _) = self.listener.accept().await?;
-        let mut buf = [0; 1024];
-        let n = stream.read(&mut buf).await?;
-        Ok((
-            String::from_utf8_lossy(&buf[..n]).trim().to_string(),
-            stream,
-        ))
+        // Requests are served one at a time; a client that never sends
+        // must not block the hotkey.
+        let request = match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            protocol::read_message(&mut stream),
+        )
+        .await
+        {
+            Ok(message) => message.and_then(|m| protocol::decode_request(&m)),
+            Err(_) => Err(protocol::Error::new(
+                protocol::ErrorCode::BadRequest,
+                "la petición no llegó a tiempo",
+            )),
+        };
+        Ok((request, stream))
     }
 }
 
@@ -103,5 +74,42 @@ impl Drop for ControlServer {
                 e
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    // The old server did a single read of up to 1024 bytes, so a
+    // command that arrived in two writes was rejected as unknown.
+    #[tokio::test]
+    async fn a_request_split_across_writes_is_reassembled() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = ControlServer::bind(&dir.path().join("control.sock")).unwrap();
+        let path = server.socket_path().to_path_buf();
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            stream.write_all(b"{\"v\":1,\"cmd\":\"tog").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stream.write_all(b"gle_copy\"}\n").await.unwrap();
+            stream
+        });
+        let (request, _stream) = server.next_request().await.unwrap();
+        assert_eq!(request.unwrap(), "toggle_copy");
+        drop(client.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_does_not_block_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = ControlServer::bind(&dir.path().join("control.sock")).unwrap();
+        let _silent = UnixStream::connect(server.socket_path()).await.unwrap();
+        let (request, _stream) = tokio::time::timeout(REQUEST_TIMEOUT * 2, server.next_request())
+            .await
+            .expect("the server must give up on a silent client")
+            .unwrap();
+        assert_eq!(request.unwrap_err().code, protocol::ErrorCode::BadRequest);
     }
 }

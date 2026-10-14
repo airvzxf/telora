@@ -9,11 +9,15 @@ Shared library crate for the telora workspace.
     (`socket_dir` → `$XDG_RUNTIME_DIR/telora/` →
     `/run/user/<uid>/telora/` → `/tmp/telora-<uid>/`) with the parent
     directory created at mode `0o700`.
-  - `daemon_socket_path()`, `control_socket_path()` — convenience
-    wrappers around `resolve(&PathsConfig::default())` that the
-    `telora-ctl` CLI and GUI call.
   - `ensure_dir_0700()` — recursive `mkdir` plus a defensive
     post-create `mode & 0o077 != 0` re-check.
+- **`config`** — the `telora.toml` cascade every binary reads
+  (`/etc/telora.toml` → `$XDG_CONFIG_HOME/telora/config.toml` →
+  `--config` → `TELORA_*`), and `resolve_paths()` for the sockets.
+- **`protocol`** — the protocol of the daemon socket and the GUI control
+  socket: one JSON line per request (`{"v":1,"cmd":"stop"}`) and per reply
+  (`{"ok":true,…}` or `{"ok":false,"error":{"code":…,"message":…}}`), plus
+  the client every binary uses (`protocol::call`).
 - **`socket_bind`** — the Unix-socket bind helper shared by the daemon and
   GUI. In the daemon it adopts a validated systemd listener when
   `LISTEN_PID`/`LISTEN_FDS` are present; otherwise it uses the manual path.
@@ -43,16 +47,18 @@ directly.
 
 New shared types belong here only when they fit the leaf-crate boundary and
 serve more than one workspace consumer. If a repeated snippet is a candidate,
-first confirm that it belongs to one of the modules below; avoid pulling daemon
-protocol, GUI, audio, CUDA, or other binary-specific concerns into this crate.
+first confirm that it belongs to one of the modules below; avoid pulling GUI,
+audio, CUDA, or other binary-specific concerns into this crate.
 
 | Module        | Concern                                       |
 |---------------|-----------------------------------------------|
 | `paths`       | Filesystem paths and runtime-directory layout |
+| `config`      | The shared `telora.toml` cascade              |
+| `protocol`    | Socket messages and the client                |
 | `socket_bind` | Unix-socket creation and permissions          |
 | `cache`       | Voxora-cache resolution and sanitisation      |
 
 Keep the crate's dependency footprint small — it is on the critical
 path of every consumer's binary. Avoid `voxora-*`, GTK, audio, CUDA,
 or CLI-only dependencies. `dirs` is used only by the cache resolver;
-`nix` remains restricted to the `fs` and `user` features.
+`nix` remains restricted to the `fs`, `user` and `socket` features.

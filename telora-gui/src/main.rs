@@ -21,9 +21,10 @@ mod tray;
 mod ui;
 
 use config::GuiConfig;
-use connection::{ControlServer, SocketClient};
+use connection::ControlServer;
 use session::{Effect, Event, Session};
 use telora_common::paths::ResolvedPaths;
+use telora_common::protocol::{self, ErrorCode, Reply};
 use tray::{TrayCommand, TrayHandle, TrayState};
 use ui::Osd;
 
@@ -341,11 +342,11 @@ async fn handle_daemon_commands(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             DaemonCommand::Start { response_tx } => {
-                let event = match SocketClient::send_command("START", &daemon_sock).await {
-                    Ok(reply) if reply.starts_with("STATUS: RECORDING") => Event::StartAccepted,
-                    Ok(reply) => {
-                        log::error!("Daemon refused START: {reply}");
-                        Event::StartRejected(session::short_error(&reply))
+                let event = match protocol::call(&daemon_sock, "start").await {
+                    Ok(Ok(_)) => Event::StartAccepted,
+                    Ok(Err(e)) => {
+                        log::error!("Daemon refused START: {e}");
+                        Event::StartRejected(session::short_error(&e.message))
                     }
                     Err(e) => {
                         log::error!("Failed to reach daemon for START: {e:#}");
@@ -370,14 +371,14 @@ async fn handle_daemon_commands(
                     .send(AppAction::Event(Event::Info(message)))
                     .await;
             }
-            DaemonCommand::Cancel => {
-                if let Err(e) = SocketClient::send_command("CANCEL", &daemon_sock).await {
-                    log::error!("Failed to send CANCEL: {e:#}");
-                }
-            }
+            DaemonCommand::Cancel => match protocol::call(&daemon_sock, "cancel").await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => log::error!("Daemon refused CANCEL: {e}"),
+                Err(e) => log::error!("Failed to send CANCEL: {e:#}"),
+            },
             DaemonCommand::Status { response_tx } => {
-                let text = match SocketClient::send_command("STATUS", &daemon_sock).await {
-                    Ok(reply) => describe_status(&reply),
+                let text = match protocol::call(&daemon_sock, "status").await {
+                    Ok(reply) => describe_status(reply),
                     Err(e) => {
                         log::error!("Failed to reach daemon for STATUS: {e:#}");
                         "✘ Daemon no disponible".to_string()
@@ -392,17 +393,19 @@ async fn handle_daemon_commands(
 /// Run STOP and put the text on the clipboard; the returned event says
 /// what the user should see.
 async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) -> Event {
-    let raw_text = match SocketClient::send_command("STOP", daemon_sock).await {
-        Ok(text) => text,
+    let raw_text = match protocol::call(daemon_sock, "stop").await {
+        Ok(reply) => match transcription(reply) {
+            Ok(text) => text,
+            Err(reason) => {
+                log::error!("Daemon error: {reason}");
+                return finished_error(&session::short_error(&reason));
+            }
+        },
         Err(e) => {
             log::error!("Failed to get result from daemon: {e:#}");
             return finished_error("Daemon no disponible");
         }
     };
-    if raw_text.starts_with("ERROR:") {
-        log::error!("Daemon error: {raw_text}");
-        return finished_error(&session::short_error(&raw_text));
-    }
     if raw_text.trim().is_empty() {
         return Event::Finished {
             message: "Sin texto".to_string(),
@@ -424,6 +427,16 @@ async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) ->
     }
 }
 
+/// The text of a STOP reply, or why there is none.
+fn transcription(reply: Reply) -> Result<String, String> {
+    let fields = reply.map_err(|e| e.message)?;
+    fields
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "respuesta del daemon sin texto".to_string())
+}
+
 fn finished_error(reason: &str) -> Event {
     Event::Finished {
         message: format!("✘ {reason}"),
@@ -434,18 +447,21 @@ fn finished_error(reason: &str) -> Event {
 }
 
 /// One-line daemon summary for the tray's "Show status" item.
-fn describe_status(reply: &str) -> String {
-    let Ok(status) = serde_json::from_str::<serde_json::Value>(reply) else {
-        return format!("✘ {}", session::short_error(reply));
+fn describe_status(reply: Reply) -> String {
+    let status = match reply {
+        Ok(mut fields) => fields.remove("status"),
+        Err(e) => return format!("✘ {}", session::short_error(&e.message)),
     };
-    let field = |key: &str| status.get(key).and_then(|v| v.as_str()).unwrap_or("?");
-    let model = field("model_id").rsplit('/').next().unwrap_or("?");
-    let engine = match field("engine") {
-        "ready" => "listo".to_string(),
-        "loading" => "cargando modelo".to_string(),
-        other => other.to_string(),
+    let Some(Ok(status)) = status.map(serde_json::from_value::<protocol::StatusResponse>) else {
+        return "✘ respuesta de estado mal formada".to_string();
     };
-    format!("{model} · {engine} · {}", field("state"))
+    let model = status.model_id.rsplit('/').next().unwrap_or("?");
+    let engine = match status.engine.as_str() {
+        "ready" => "listo",
+        "loading" => "cargando modelo",
+        other => other,
+    };
+    format!("{model} · {engine} · {}", status.state)
 }
 
 async fn run_control_server(
@@ -461,54 +477,81 @@ async fn run_control_server(
     info!("Control server listening on {}...", control_sock.display());
 
     loop {
-        let (cmd, mut stream) = match server.next_command().await {
+        let (request, mut stream) = match server.next_request().await {
             Ok(pair) => pair,
             Err(e) => {
                 log::error!("Control server error: {e}");
                 continue;
             }
         };
-        info!("Control command: {cmd}");
-        let action = match cmd.as_str() {
-            "TOGGLE" | "TOGGLE_COPY" => Some(AppAction::Event(Event::Toggle)),
-            "CANCEL" => Some(AppAction::Event(Event::Cancel)),
-            "AUTO_STOP" => Some(AppAction::Event(Event::AutoStop)),
-            "LAST" => Some(AppAction::CopyLast),
-            _ => None,
-        };
-        let reply = match action {
-            Some(action) => {
+        let action = request.and_then(|cmd| {
+            info!("Control command: {cmd}");
+            control_action(&cmd)
+        });
+        let reply: Reply = match action {
+            Ok(action) => {
                 let _ = tx.send(action).await;
-                "OK".to_string()
+                Ok(Default::default())
             }
-            None if cmd == "TOGGLE_TYPE" => {
-                "ERROR: el modo TYPE se eliminó; usa `telora toggle-copy`".to_string()
+            Err(e) => {
+                warn!("Rejected control request: {e}");
+                Err(e)
             }
-            None => format!("ERROR: comando desconocido: {cmd}"),
         };
-        // The daemon's AUTO_STOP sender does not read replies; ignore EPIPE.
-        let _ = stream.write_all(reply.as_bytes()).await;
+        // The daemon's auto_stop sender may already be gone; ignore EPIPE.
+        let _ = stream.write_all(&protocol::encode_reply(&reply)).await;
+    }
+}
+
+fn control_action(cmd: &str) -> Result<AppAction, protocol::Error> {
+    match cmd {
+        "toggle_copy" => Ok(AppAction::Event(Event::Toggle)),
+        "cancel" => Ok(AppAction::Event(Event::Cancel)),
+        "auto_stop" => Ok(AppAction::Event(Event::AutoStop)),
+        "last" => Ok(AppAction::CopyLast),
+        other => Err(protocol::Error::new(
+            ErrorCode::UnknownCommand,
+            format!("comando desconocido: {other}"),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::describe_status;
+    use super::{describe_status, transcription};
+    use telora_common::protocol::{Error, ErrorCode};
+
+    fn fields(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
 
     #[test]
     fn status_summary_names_model_and_engine_state() {
-        let reply = r#"{"model_id":"ggerganov/whisper.cpp/ggml-large-v3.bin","engine":"loading","state":"Idle"}"#;
+        let reply = fields(
+            r#"{"status":{"pid":1,"model_id":"ggerganov/whisper.cpp/ggml-large-v3.bin","model_kind":"whisper","model_path":"","language":"es","max_recording_seconds":600,"engine":"loading","state":"Idle"}}"#,
+        );
         assert_eq!(
-            describe_status(reply),
+            describe_status(Ok(reply)),
             "ggml-large-v3.bin · cargando modelo · Idle"
         );
     }
 
     #[test]
     fn status_summary_surfaces_daemon_errors() {
-        assert_eq!(
-            describe_status("ERROR: Failed to get status"),
-            "✘ Failed to get status"
-        );
+        let error = Error::new(ErrorCode::Internal, "el daemon se está cerrando");
+        assert_eq!(describe_status(Err(error)), "✘ el daemon se está cerrando");
+    }
+
+    // The GUI used to drop any dictation that began with "ERROR:".
+    #[test]
+    fn a_dictation_that_starts_with_error_is_kept() {
+        let reply = Ok(fields(r#"{"text":"ERROR: no compila"}"#));
+        assert_eq!(transcription(reply).unwrap(), "ERROR: no compila");
+    }
+
+    #[test]
+    fn a_daemon_error_is_not_a_dictation() {
+        let reply = Err(Error::new(ErrorCode::NoModel, "sin modelo"));
+        assert_eq!(transcription(reply).unwrap_err(), "sin modelo");
     }
 }
