@@ -1,17 +1,10 @@
 //! Unix-socket bind helper shared by `telora-daemon` and `telora-gui`.
 //!
-//! The two callers used to open-code a near-identical routine (the
-//! daemon's lived in `socket.rs::SocketServer::bind`, the GUI's in
-//! `connection.rs::ControlServer::bind`). The shared helper now creates the
-//! parent directory with strict permissions, pins the Linux parent directory
-//! with `O_PATH | O_NOFOLLOW`, and applies `0600` relative to the pinned
-//! directory without changing the process-global umask.
-//! This module reconciles both: the parent-dir creation routes
-//! through [`paths::ensure_dir_0700`] (the daemon's stricter behaviour),
-//! and the bound socket is changed to mode `0o600` through its owned file
-//! descriptor. It deliberately avoids mutating the process-global umask, so
-//! concurrent audio, model-cache, and log file creation cannot inherit a
-//! bind-time permission mask.
+//! It creates a missing parent directory at `0700` (an existing one must
+//! already be private), pins the parent with `O_PATH | O_NOFOLLOW`,
+//! replaces a leftover socket only when nothing answers on it, and sets
+//! the socket to `0600` through the pinned directory without touching
+//! the process-global umask.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -258,7 +251,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// Remove a stale socket file at `path` if it is owned by the
-/// current UID. Non-socket entries are never removed automatically, and a
+/// current UID and nothing answers on it. Non-socket entries are never removed automatically, and a
 /// symlink is rejected so a bind cannot silently consume an attacker-planted
 /// path.
 fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
@@ -306,8 +299,14 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
         ));
     }
 
-    // File is owned by us — safe to remove. Tolerate ENOENT in case
-    // of a race with another process that just unlinked it.
+    if socket_is_live(path) {
+        return Err(anyhow::anyhow!(
+            "ya hay un {instance_name} escuchando en '{basename}'; detenlo antes de iniciar otro",
+        ));
+    }
+
+    // Nobody answers: a leftover from a run that did not clean up.
+    // Tolerate ENOENT in case another process just unlinked it.
     match std::fs::remove_file(path) {
         Ok(()) => {
             info!("Removed stale socket file: {basename}");
@@ -315,6 +314,23 @@ fn remove_stale_socket(path: &Path, instance_name: &str) -> Result<()> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("removing stale socket {basename}"))),
+    }
+}
+
+/// Whether something accepts connections at `path`. The connect does not
+/// block, so a live server with a full backlog counts as live.
+fn socket_is_live(path: &Path) -> bool {
+    let probe =
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).and_then(|sock| {
+            sock.set_nonblocking(true)?;
+            sock.connect(&socket2::SockAddr::unix(path)?)
+        });
+    match probe {
+        Ok(()) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
     }
 }
 
@@ -624,7 +640,7 @@ mod tests {
     fn bind_rejects_preexisting_symlink() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("telora");
-        std::fs::create_dir(&parent).expect("create parent");
+        private_dir(&parent);
         let socket_path = parent.join("daemon.sock");
         let target = tmp.path().join("target");
         std::os::unix::fs::symlink(&target, &socket_path).expect("create symlink");
@@ -647,7 +663,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_parent = tmp.path().join("real");
         let linked_parent = tmp.path().join("linked");
-        std::fs::create_dir(&real_parent).expect("create real parent");
+        private_dir(&real_parent);
         std::os::unix::fs::symlink(&real_parent, &linked_parent).expect("create parent symlink");
         let socket_path = linked_parent.join("daemon.sock");
 
@@ -665,7 +681,7 @@ mod tests {
     fn bind_rejects_preexisting_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("telora");
-        std::fs::create_dir_all(&parent).expect("create parent");
+        private_dir(&parent);
         let socket_path = parent.join("daemon.sock");
         std::fs::create_dir(&socket_path).expect("create target directory");
 
@@ -680,7 +696,7 @@ mod tests {
     fn bind_rejects_preexisting_regular_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let parent = tmp.path().join("telora");
-        std::fs::create_dir_all(&parent).expect("create parent");
+        private_dir(&parent);
         let socket_path = parent.join("daemon.sock");
         std::fs::write(&socket_path, b"not a socket").expect("create target file");
 
@@ -735,16 +751,14 @@ mod tests {
             let cfg = paths::PathsConfig::default();
             let resolved = paths::resolve(&cfg).expect("resolve should succeed");
 
-            // Smoke-test expectations:
             assert_eq!(resolved.daemon_sock, tmp.join("telora").join("daemon.sock"));
+            let _listener = bind_unix_socket(&resolved.daemon_sock, "telora-daemon")
+                .expect("bind should succeed");
             let dir_mode = std::fs::metadata(&resolved.socket_dir)
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(dir_mode & 0o777, 0o700, "socket dir mode must be 0o700");
-
-            let _listener = bind_unix_socket(&resolved.daemon_sock, "telora-daemon")
-                .expect("bind should succeed");
 
             let sock_mode = std::fs::metadata(&resolved.daemon_sock)
                 .unwrap()
@@ -777,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_is_idempotent_when_socket_already_owned() {
+    fn a_leftover_socket_is_replaced() {
         use std::os::unix::fs::PermissionsExt;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -786,12 +800,10 @@ mod tests {
         rt.block_on(async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let sock_path = tmp.path().join("telora/daemon.sock");
-            // First bind creates the socket.
+            // Dropping the listener leaves the file behind, as a crash would.
             let _listener1 = bind_unix_socket(&sock_path, "telora-daemon").expect("first bind");
             drop(_listener1);
 
-            // Second bind on the same path must succeed (removes our
-            // own stale socket first).
             let _listener2 =
                 bind_unix_socket(&sock_path, "telora-daemon").expect("second bind should succeed");
             let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
@@ -841,46 +853,10 @@ mod tests {
         });
     }
 
-    /// The bind helper's `paths::ensure_dir_0700` post-check
-    /// (`mode & 0o077 != 0` rejects mode-leaking dirs) is the
-    /// behaviour the GUI's pre-extraction `ensure_parent_dir_0700`
-    /// was missing. This test pins the check at the resolver level.
+    // The old bind deleted any socket of the same user, so a second
+    // daemon or GUI silently orphaned the one that was running.
     #[test]
-    fn paths_resolve_creates_dir_with_0700() {
-        use std::os::unix::fs::PermissionsExt;
-        let _guard = paths::tests::ENV_LOCK.lock().unwrap();
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path_str = tmp.path().to_str().unwrap().to_string();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &path_str) };
-
-        let resolved =
-            paths::resolve(&paths::PathsConfig::default()).expect("resolve should succeed");
-        let mode = std::fs::metadata(&resolved.socket_dir)
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700, "socket dir must be exactly 0o700");
-
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-    }
-
-    // The bind logic is intentionally idempotent: a stale socket
-    // owned by the current UID is removed before `bind(2)` is
-    // attempted, so the sequential second-bind scenario the spec
-    // sketches cannot reach the EADDRINUSE branch — the second
-    // bind succeeds and takes over the path. The test below is
-    // therefore `#[ignore]`d by default: re-enabling it would
-    // require either (a) running a separate UID (root-only
-    // `chown`) or (b) racing two concurrent binds. The error
-    // message asserted is the one that would be produced by
-    // `map_bind_error` if EADDRINUSE ever leaked out of
-    // `bind_unix_listener`, so this test stays as a canary for
-    // any future regression that breaks the idempotency or the
-    // error mapping.
-    #[test]
-    #[ignore = "bind is idempotent for same-UID socket; would require a second UID or a bind race"]
-    fn bind_returns_distinct_error_on_eaddrinuse() {
+    fn a_second_instance_is_rejected_and_the_first_keeps_its_socket() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -888,16 +864,20 @@ mod tests {
         rt.block_on(async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let sock_path = tmp.path().join("telora/daemon.sock");
+            let first = bind_unix_socket(&sock_path, "telora-daemon").expect("first bind");
 
-            // First bind holds the socket.
-            let _listener1 = bind_unix_socket(&sock_path, "telora-daemon").expect("first bind");
-            // Second bind must fail with EADDRINUSE-mapped message.
-            let err =
-                bind_unix_socket(&sock_path, "telora-daemon").expect_err("second bind should fail");
-            let msg = format!("{err}");
+            let err = bind_unix_socket(&sock_path, "telora-daemon")
+                .expect_err("a live socket must not be taken over");
             assert!(
-                msg.contains("already holds") || msg.contains("another telora-daemon"),
-                "expected EADDRINUSE-style message, got: {msg}"
+                format!("{err:#}").contains("ya hay un telora-daemon"),
+                "{err:#}"
+            );
+
+            let client = tokio::net::UnixStream::connect(&sock_path);
+            let (accepted, connected) = tokio::join!(first.accept(), client);
+            assert!(
+                accepted.is_ok() && connected.is_ok(),
+                "the first instance still serves"
             );
         });
     }
@@ -937,6 +917,15 @@ mod tests {
 
             drop(listener);
         });
+    }
+
+    fn private_dir(path: &std::path::Path) {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .expect("create private dir");
     }
 
     /// Create a tempdir without pulling in `tempfile` here as a

@@ -10,10 +10,8 @@
 //!   3. `/run/user/<uid>/telora/` (when that path exists and is writable).
 //!   4. `/tmp/telora-<uid>/` (last-resort fallback; logs a warning).
 //!
-//! The parent directory is created with mode 0o700 before any caller
-//! tries to bind. The post-creation `mode & 0o077 != 0` defensive
-//! re-check closes the silent umask-leak the GUI's pre-extraction
-//! `ensure_parent_dir_0700` did not perform.
+//! Resolving touches nothing on disk, so clients can call it freely;
+//! the directory is created (or checked) by whoever binds a socket.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -85,8 +83,6 @@ pub fn resolve(cfg: &PathsConfig) -> Result<ResolvedPaths> {
         .with_context(|| format!("validating daemon socket path {}", daemon_sock.display()))?;
     validate_unix_socket_path(&control_sock)
         .with_context(|| format!("validating control socket path {}", control_sock.display()))?;
-    ensure_dir_0700(&socket_dir)
-        .with_context(|| format!("creating socket directory {}", socket_dir.display()))?;
     Ok(ResolvedPaths {
         socket_dir,
         daemon_sock,
@@ -170,25 +166,48 @@ fn is_writable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create `p` (and any missing parents) with mode `0o700`. Refuses
-/// to continue if the resulting mode would leak to group or other.
+/// Create `p` (and any missing parents) with mode `0o700`, or check
+/// that an existing directory belongs to the user and is closed to
+/// everyone else. An existing directory is never chmod'ed: it may be one
+/// the user shares on purpose.
+///
+/// # Errors
+///
+/// When the directory cannot be created, is not the user's, or lets
+/// group or others in.
 pub fn ensure_dir_0700(p: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    builder
-        .create(p)
-        .with_context(|| format!("DirBuilder::create({})", p.display()))?;
-    let mut perms = std::fs::metadata(p)?.permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(p, perms)?;
-    // Defensive: confirm the mode is actually 0o700 after creation.
-    let mode = std::fs::metadata(p)?.permissions().mode();
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(p)
+                .with_context(|| format!("no se pudo crear {}", p.display()))?;
+            // The umask can only clear bits; make the owner's explicit.
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("no se pudo leer {}", p.display())),
+    }
+    check_private_dir(p)
+}
+
+fn check_private_dir(p: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(p).with_context(|| format!("no se pudo leer {}", p.display()))?;
+    if !meta.is_dir() {
+        bail!("{} no es un directorio", p.display());
+    }
+    if meta.uid() != current_uid() {
+        bail!("el directorio {} no es del usuario actual", p.display());
+    }
+    let mode = meta.mode() & 0o777;
     if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "socket directory {} has insecure mode {:o} (expected 0o700)",
+        bail!(
+            "el directorio {} tiene permisos {mode:o}: otros usuarios podrían usar los \
+             sockets de telora. Cámbialos con `chmod 700 {}` o elige otro socket_dir",
             p.display(),
-            mode & 0o777
+            p.display()
         );
     }
     Ok(())
@@ -224,12 +243,8 @@ pub(crate) mod tests {
             resolved.control_sock,
             tmp.join("telora").join("control.sock")
         );
-
-        let mode = std::fs::metadata(&resolved.socket_dir)
-            .expect("socket_dir should exist")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700, "socket_dir mode must be 0o700");
+        // Clients resolve too; only a bind may create the directory.
+        assert!(!resolved.socket_dir.exists());
 
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
@@ -293,52 +308,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ensure_dir_0700_sets_strict_mode() {
+    fn ensure_dir_0700_creates_missing_directories_closed() {
         let tmp = tempfile_like();
         let target = tmp.join("nested/dir");
         ensure_dir_0700(&target).expect("ensure_dir_0700 should succeed");
-
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
-
+        for dir in [tmp.join("nested"), target] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// End-to-end check that mirrors the prompt's smoke test:
-    /// set `XDG_RUNTIME_DIR` to a tempdir, run [`resolve`], and
-    /// confirm the resolver picks `$XDG_RUNTIME_DIR/telora/` and
-    /// that the directory exists with mode `0o700`. The actual
-    /// socket bind is exercised by `socket_bind::tests`.
+    // The old helper chmod'ed any directory it was pointed at, e.g. a
+    // `socket_dir` the user shares with other tools.
     #[test]
-    fn resolve_then_ensure_dir_matches_smoke_test_expectations() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn ensure_dir_0700_never_changes_an_existing_directory() {
         let tmp = tempfile_like();
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &tmp);
-        }
+        let shared = tmp.join("compartido");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let resolved = resolve(&PathsConfig::default()).expect("resolve should succeed");
+        let err = format!("{:#}", ensure_dir_0700(&shared).unwrap_err());
+        assert!(err.contains("chmod 700"), "{err}");
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the directory must be left alone");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
-        assert_eq!(resolved.socket_dir, tmp.join("telora"));
-        assert_eq!(resolved.daemon_sock, tmp.join("telora").join("daemon.sock"));
-        assert_eq!(
-            resolved.control_sock,
-            tmp.join("telora").join("control.sock")
-        );
-
-        let mode = std::fs::metadata(&resolved.socket_dir)
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o700,
-            "socket dir mode must be 0o700 (smoke test expectation)"
-        );
-
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
+    #[test]
+    fn ensure_dir_0700_accepts_an_existing_private_directory() {
+        let tmp = tempfile_like();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_dir_0700(&tmp).expect("a private directory is fine");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -363,8 +364,7 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         // Build a socket_dir whose joined `/daemon.sock` exceeds 108
         // bytes (Linux sun_path limit). The directory does not need
-        // to exist on disk — the sun_path check fires before the
-        // `ensure_dir_0700` step.
+        // to exist on disk.
         let too_long = format!("/{}/{}", "a".repeat(100), "b".repeat(50));
         let cfg = PathsConfig {
             socket_dir: Some(too_long),

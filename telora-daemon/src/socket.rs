@@ -369,7 +369,7 @@ mod tests {
 
         rt.block_on(async {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let manual_path = tmp.path().join("telora-daemon-manual.sock");
+            let manual_path = tmp.path().join("telora/manual.sock");
             let cmd_tx: mpsc::Sender<Command> = mpsc::channel(1).0;
 
             // allow_activation = false → manual path. The bound
@@ -392,7 +392,7 @@ mod tests {
             // NOT panic, NOT error, and returns a usable listener —
             // any future change that breaks either branch will surface
             // here before it ships.
-            let activation_path = tmp.path().join("telora-daemon-activation.sock");
+            let activation_path = tmp.path().join("telora/activation.sock");
             let activation = SocketServer::bind(&activation_path, cmd_tx, true)
                 .expect("activation-mode bind should succeed");
             assert!(
@@ -417,7 +417,7 @@ mod tests {
 
         rt.block_on(async {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let sock_path = tmp.path().join("telora-daemon-drop.sock");
+            let sock_path = tmp.path().join("telora/drop.sock");
             let cmd_tx: mpsc::Sender<Command> = mpsc::channel(1).0;
 
             {

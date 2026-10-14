@@ -87,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_split_across_writes_is_reassembled() {
         let dir = tempfile::tempdir().unwrap();
-        let server = ControlServer::bind(&dir.path().join("control.sock")).unwrap();
+        let server = ControlServer::bind(&dir.path().join("telora/control.sock")).unwrap();
         let path = server.socket_path().to_path_buf();
         let client = tokio::spawn(async move {
             let mut stream = UnixStream::connect(&path).await.unwrap();
@@ -104,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_client_does_not_block_the_server() {
         let dir = tempfile::tempdir().unwrap();
-        let server = ControlServer::bind(&dir.path().join("control.sock")).unwrap();
+        let server = ControlServer::bind(&dir.path().join("telora/control.sock")).unwrap();
         let _silent = UnixStream::connect(server.socket_path()).await.unwrap();
         let (request, _stream) = tokio::time::timeout(REQUEST_TIMEOUT * 2, server.next_request())
             .await
