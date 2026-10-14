@@ -304,7 +304,6 @@ async fn status_returns_serialised_status_response() {
         model_id: "test/model.bin".to_string(),
         model_kind: "whisper".to_string(),
         model_path: "/tmp/test/model.bin".to_string(),
-        endpoint: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
         state: "Idle".to_string(),
@@ -337,7 +336,6 @@ async fn refresh_parses_json_and_dispatches_reload_config() {
         model_id: "Qwen/Qwen3-ASR-0.6B".to_string(),
         model_kind: "qwen3-asr".to_string(),
         model_path: String::new(),
-        endpoint: String::new(),
         language: "en".to_string(),
         max_recording_seconds: 300,
     };
@@ -379,7 +377,6 @@ async fn refresh_split_across_two_writes_is_reassembled() {
         model_id: "split/model.bin".to_string(),
         model_kind: "whisper".to_string(),
         model_path: String::new(),
-        endpoint: String::new(),
         language: "es".to_string(),
         max_recording_seconds: 600,
     };

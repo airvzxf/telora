@@ -18,8 +18,7 @@ cuda-whisper = ["voxora-bridge/cuda-whisper"]
 cuda-qwen3asr = ["voxora-bridge/cuda-qwen3asr", "dep:cudarc"]
 
 [dependencies]
-# Default bridge features (whisper + qwen3asr) plus the hosted MiniMax engine.
-voxora-bridge = { workspace = true, features = ["minimax"] }
+voxora-bridge = { workspace = true }
 cudarc = { version = "0.19", optional = true }
 # voxora-registry 0.6.x owns the canonical resolution path
 # (`Registry::resolve(&ModelId::parse(id), &opts) -> ResolvedModel`)
@@ -65,33 +64,3 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 # test can import `RegistryHfExt` / `ModelId` without a private
 # re-export dance.
 voxora-registry = { workspace = true }
-# Closes #163 (MiniMax integration): the `minimax_live_jfk`
-# integration test below posts a JFK inaugural clip to the real
-# MiniMax `/v1/speech_to_text` endpoint and asserts the recognised
-# text. `voxora-minimax` is opt-in via the bridge's `minimax`
-# Cargo feature (re-exported as `voxora_bridge::MiniMaxEngine` for
-# production code); we list it as a direct dev-dependency so the
-# test compiles even when a slim consumer strips the bridge
-# features down to `whisper` only. The `[[test]]` entry below
-# re-gates compilation on the `minimax` feature so a slim build
-# does not pull `voxora-minimax` into the test target either.
-voxora-minimax = { workspace = true }
-
-# Closes #163: live end-to-end smoke for the MiniMax engine.
-# The single `#[test]` inside is `#[ignore]`-gated so it does not
-# run in `cargo test --workspace`; it requires `MINIMAX_API_KEY`
-# and posts a ~30 s JFK inaugural WAV to the real endpoint. Run
-# with:
-#
-#   MINIMAX_API_KEY=<key> \
-#     cargo test -p telora-daemon --test minimax_live_jfk \
-#       -- --ignored --nocapture
-#
-# We intentionally do NOT use `required-features = ["minimax"]`
-# (the voxora-bridge `cross_engine_parity` pattern) because the
-# daemon already enables `voxora-bridge/minimax` unconditionally
-# in the production `[dependencies]` line above; the `#[ignore]`
-# annotation is the real gate that keeps the live round-trip out
-# of `cargo test --workspace`.
-[[test]]
-name = "minimax_live_jfk"

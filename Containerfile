@@ -118,8 +118,7 @@ WORKDIR /app
 # small because target/, bin/, pkg/, models/, .git/, README, etc. are
 # excluded at the docker daemon level. The full source tree is
 # required here so `cargo chef prepare` sees every path any Cargo.toml
-# references (including `tests/minimax_live_jfk.rs`) and can serialise
-# the dep graph faithfully.
+# references and can serialise the dep graph faithfully.
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 

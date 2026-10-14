@@ -35,27 +35,13 @@ struct Args {
 
     /// Hugging Face model id (overrides config).
     /// Example: `Qwen/Qwen3-ASR-0.6B` or
-    /// `ggerganov/whisper.cpp/ggml-base.bin`. Ignored when
-    /// `model_kind = "minimax"` (MiniMax is a hosted API; the
-    /// bearer token comes from the env).
+    /// `ggerganov/whisper.cpp/ggml-base.bin`.
     #[arg(long)]
     model_id: Option<String>,
 
-    /// Engine family (`whisper`, `qwen3-asr`, or `minimax`);
-    /// overrides config. `minimax` requires `MINIMAX_API_KEY` (or
-    /// `VOXORA_MINIMAX_API_KEY`) in the daemon's environment.
+    /// Engine family (`whisper` or `qwen3-asr`); overrides config.
     #[arg(long)]
     model_kind: Option<String>,
-
-    /// Path to a `.env`-style file containing the MiniMax bearer
-    /// token (closes #166). Overrides the default discovery cascade
-    /// (`/etc/telora/.env` → `$XDG_CONFIG_HOME/telora/.env` →
-    /// `VOXORA_MINIMAX_API_KEY` → `MINIMAX_API_KEY`). Only
-    /// consulted when `model_kind = "minimax"`. Useful for CI
-    /// runners and one-off dev shells that keep their secret in
-    /// a project-local `.env`.
-    #[arg(long, value_name = "PATH")]
-    minimax_env_file: Option<PathBuf>,
 
     /// Language (ISO 639-1, e.g. "es", "en"); overrides config.
     #[arg(short, long)]
@@ -125,23 +111,16 @@ struct DaemonState {
 }
 
 /// Load the engine in the background and publish the outcome into
-/// `state`. Copies the engine's resolved id/path/endpoint back into the
-/// config so STATUS shows what was actually loaded.
-fn spawn_engine_load(
-    state: Arc<RwLock<DaemonState>>,
-    config: SttConfig,
-    voxora_cache: PathBuf,
-    minimax_env_file: Option<PathBuf>,
-) {
+/// `state`. Copies the resolved model path into the config so STATUS
+/// shows what was actually loaded.
+fn spawn_engine_load(state: Arc<RwLock<DaemonState>>, config: SttConfig, voxora_cache: PathBuf) {
     tokio::spawn(async move {
         state.write().await.engine = Engine::Loading;
-        match build_transcriber(&config, voxora_cache, minimax_env_file.as_deref()).await {
-            Ok((transcriber, model_id, path, endpoint)) => {
+        match build_transcriber(&config, voxora_cache).await {
+            Ok((transcriber, path)) => {
                 let mut s = state.write().await;
                 s.engine = Engine::Ready(transcriber);
-                s.stt_config.model_id = model_id;
                 s.stt_config.model_path = path;
-                s.stt_config.endpoint = endpoint;
                 info!("Model loaded; ready to transcribe.");
             }
             Err(e) => {
@@ -364,21 +343,12 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
     );
 
     if status.active {
-        // Closes #167: branch on whether the engine is hosted
-        // (`status.endpoint` non-empty) or on-disk
-        // (`status.model_path` non-empty). The two fields are
-        // mutually exclusive by construction — `build_transcriber`
-        // populates exactly one per engine — so printing both
-        // would only confuse operators.
         println!(
             "\nFull Model Id:   {}\nEngine Kind:     {}",
             status.model_id, status.model_kind
         );
         if !status.engine.is_empty() {
             println!("Model State:     {}", status.engine);
-        }
-        if !status.endpoint.is_empty() {
-            println!("Endpoint:        {}", status.endpoint);
         }
         if !status.model_path.is_empty() {
             println!("Resolved Path:   {}", status.model_path);
@@ -388,57 +358,29 @@ async fn run_status_client(socket_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Async constructor for a fresh [`BridgeTranscriber`] from an
-/// [`SttConfig`]. Centralised so the daemon's startup and
-/// `ReloadConfig` handler both go through the same path.
-///
-/// `minimax_env_file` (closes #166) is the optional `--minimax-env-file`
-/// CLI override; `None` falls back to the default discovery
-/// cascade (`/etc/telora/.env` → `$XDG_CONFIG_HOME/telora/.env`
-/// → env vars) inside `BridgeTranscriber::from_id`.
-///
-/// Returns `(transcriber, resolved_model_id, resolved_path,
-/// resolved_endpoint)` — all three are the engine's authoritative
-/// values after build (closes #165, #167). For Whisper / Qwen3-ASR
-/// `model_id` matches the operator's TOML input, `resolved_path`
-/// is the on-disk cache path, and `endpoint` is the empty string.
-/// For MiniMax `model_id` is voxora's `DEFAULT_MODEL = "asr-1.0"`
-/// (or the operator's TOML override), `resolved_path` is `""`,
-/// and `endpoint` is the API URL. The two callers (startup and
-/// REFRESH) copy them back into `stt_config` so the status display
-/// reflects what voxora actually loaded.
+/// Build a transcriber for `config`; shared by startup and REFRESH.
+/// Returns the engine and its on-disk model path.
 async fn build_transcriber(
     config: &SttConfig,
     voxora_cache: std::path::PathBuf,
-    minimax_env_file: Option<&std::path::Path>,
-) -> Result<(Arc<dyn Transcriber>, String, String, String)> {
-    let kind = voxora_bridge::EngineFamily::from_config(&config.model_kind).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown model_kind {:?}; expected one of `whisper`, `qwen3-asr`, or `minimax`",
-            config.model_kind
-        )
-    })?;
+) -> Result<(Arc<dyn Transcriber>, String)> {
+    use voxora_bridge::EngineFamily;
+    let kind = EngineFamily::from_config(&config.model_kind)
+        .filter(|k| matches!(k, EngineFamily::Whisper | EngineFamily::Qwen3Asr))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "motor no soportado: {:?}; usa `whisper` o `qwen3-asr`",
+                config.model_kind
+            )
+        })?;
     let token = std::env::var("HF_TOKEN")
         .ok()
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
 
-    let bridge = BridgeTranscriber::from_id(
-        &config.model_id,
-        kind,
-        Some(voxora_cache),
-        token,
-        minimax_env_file,
-    )
-    .await?;
-    let resolved_model_id = bridge.model_id().to_string();
+    let bridge =
+        BridgeTranscriber::from_id(&config.model_id, kind, Some(voxora_cache), token).await?;
     let resolved_path = bridge.resolved_path().to_string();
-    let resolved_endpoint = bridge.endpoint().to_string();
-    Ok((
-        Arc::new(bridge),
-        resolved_model_id,
-        resolved_path,
-        resolved_endpoint,
-    ))
+    Ok((Arc::new(bridge), resolved_path))
 }
 
 /// Enforce a `0o700` mode on the voxora model-cache root so other
@@ -650,12 +592,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    spawn_engine_load(
-        Arc::clone(&daemon_state),
-        stt_config,
-        voxora_cache.clone(),
-        args.minimax_env_file.clone(),
-    );
+    spawn_engine_load(Arc::clone(&daemon_state), stt_config, voxora_cache.clone());
 
     // Graceful shutdown on SIGTERM (systemd) and SIGINT (dev shell).
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -756,7 +693,6 @@ async fn main() -> Result<()> {
                         model_id: s.stt_config.model_id.clone(),
                         model_kind: s.stt_config.model_kind.clone(),
                         model_path: s.stt_config.model_path.clone(),
-                        endpoint: s.stt_config.endpoint.clone(),
                         language: s.stt_config.language.clone(),
                         max_recording_seconds: s.stt_config.max_recording_seconds,
                         state: match state {
@@ -768,7 +704,7 @@ async fn main() -> Result<()> {
                     });
                 }
                 Command::ReloadConfig { new_config, response_tx } => {
-                    handle_reload(&daemon_state, new_config, response_tx, &voxora_cache, &args).await;
+                    handle_reload(&daemon_state, new_config, response_tx, &voxora_cache).await;
                 }
             },
             Some((id, text)) = result_rx.recv() => {
@@ -826,7 +762,6 @@ async fn handle_reload(
     new_config: SttConfig,
     response_tx: oneshot::Sender<Result<()>>,
     voxora_cache: &std::path::Path,
-    args: &Args,
 ) {
     info!(
         "Command: REFRESH (model_kind={} model_id={})",
@@ -867,12 +802,6 @@ async fn handle_reload(
         // `.send(Ok(()))` or drops the sender.
         let daemon_state_bg = Arc::clone(daemon_state);
         let voxora_cache_bg = voxora_cache.to_path_buf();
-        // `args.minimax_env_file` is owned by
-        // `Args` on the main stack; REFRESH runs on
-        // a spawned task, so clone the
-        // `Option<PathBuf>` and reduce to a
-        // borrowed view inside the task.
-        let minimax_env_file_bg = args.minimax_env_file.clone();
         tokio::spawn(async move {
             // Clone `new_config` so we can both
             // commit the metadata under the lock
@@ -893,26 +822,11 @@ async fn handle_reload(
             // multi-minute await we used to do on
             // the event loop — now off-loaded to a
             // worker.
-            match build_transcriber(
-                &new_config_for_build,
-                voxora_cache_bg,
-                minimax_env_file_bg.as_deref(),
-            )
-            .await
-            {
-                Ok((new_transcriber, resolved_model_id, resolved_path, resolved_endpoint)) => {
+            match build_transcriber(&new_config_for_build, voxora_cache_bg).await {
+                Ok((new_transcriber, resolved_path)) => {
                     let mut s = daemon_state_bg.write().await;
                     s.engine = Engine::Ready(new_transcriber);
-                    // Closes #165 / #167: copy the
-                    // engine's authoritative
-                    // model_id / resolved_path /
-                    // endpoint back so the
-                    // REFRESHed status display
-                    // matches what voxora actually
-                    // loaded.
-                    s.stt_config.model_id = resolved_model_id;
                     s.stt_config.model_path = resolved_path;
-                    s.stt_config.endpoint = resolved_endpoint;
                     info!("Transcriber reloaded successfully.");
                     let _ = response_tx.send(Ok(()));
                 }
@@ -989,4 +903,37 @@ async fn start_transcription(
         };
         let _ = result_tx.send((job_id, text)).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn build_error(model_kind: &str) -> String {
+        let cache = tempfile::tempdir().unwrap();
+        let config = SttConfig {
+            model_kind: model_kind.to_string(),
+            model_id: "asr-1.0".to_string(),
+            ..telora_daemon::socket::default_stt_config()
+        };
+        match build_transcriber(&config, cache.path().to_path_buf()).await {
+            Ok(_) => panic!("model_kind {model_kind:?} must be rejected"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    // A telora.toml left over from the hosted-engine era must fail with
+    // a clear message instead of a confusing registry error.
+    #[tokio::test]
+    async fn removed_hosted_engine_is_rejected_by_name() {
+        let err = build_error("minimax").await;
+        assert!(err.contains("motor no soportado"), "{err}");
+        assert!(err.contains("minimax"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unknown_engine_is_rejected() {
+        let err = build_error("parakeet").await;
+        assert!(err.contains("motor no soportado"), "{err}");
+    }
 }

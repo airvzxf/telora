@@ -16,9 +16,8 @@ use crate::socket::AudioConfig;
 /// Per `voxora-traits/src/engine.rs`: "Transcribe a buffer of mono PCM
 /// samples at the engine's expected sample rate (typically 16 kHz, f32
 /// in [-1.0, 1.0])". The daemon's recording cap (`16000 *
-/// max_recording_seconds`) and MiniMax's WAV header also assume this
-/// rate, so the buffer MUST hold samples at this rate regardless of
-/// capture rate.
+/// max_recording_seconds`) also assumes this rate, so the buffer MUST
+/// hold samples at this rate regardless of capture rate.
 const WHISPER_RATE_HZ: u32 = 16000;
 
 pub struct AudioEngine {
