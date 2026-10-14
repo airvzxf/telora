@@ -14,7 +14,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::socket::{Command, StatusResponse, SttConfig};
+use crate::socket::{AudioConfig, Command, DaemonConfig, PathsConfig, StatusResponse, SttConfig};
 use crate::transcriber::{Transcriber, validate_stt_config};
 
 /// Samples per second the engines expect and the buffer is sized for.
@@ -23,6 +23,8 @@ const SAMPLE_RATE: usize = 16_000;
 /// Where captured samples come from. Capture runs only between `start`
 /// and `stop`.
 pub trait AudioSource {
+    /// Device settings for the next `start`.
+    fn set_config(&mut self, config: AudioConfig);
     /// Begin a fresh capture, dropping anything from an earlier one.
     fn start(&mut self) -> Result<(), String>;
     /// End the capture and release the device.
@@ -68,6 +70,9 @@ impl Engine {
 /// A loaded engine plus the on-disk model path, or why loading failed.
 pub type LoadResult = Result<(Arc<dyn Transcriber>, String), String>;
 
+/// Answer to a REFRESH: the `OK:` text, or why it was refused.
+pub type RefreshReply = oneshot::Sender<Result<String, String>>;
+
 pub enum Event {
     Command(Command),
     /// Periodic audio drain.
@@ -79,6 +84,11 @@ pub enum Event {
     EngineLoaded {
         generation: u64,
         result: LoadResult,
+    },
+    /// The daemon's configuration, re-read for a REFRESH.
+    ConfigRead {
+        result: Result<DaemonConfig, String>,
+        response_tx: RefreshReply,
     },
 }
 
@@ -96,6 +106,10 @@ pub enum Effect {
     /// The recording hit `max_recording_seconds`; the GUI must be told
     /// so it collects the result with STOP.
     NotifyAutoStop,
+    /// Re-read the configuration the daemon was started with.
+    ReadConfig {
+        response_tx: RefreshReply,
+    },
 }
 
 pub struct Daemon<A: AudioSource> {
@@ -103,6 +117,8 @@ pub struct Daemon<A: AudioSource> {
     phase: Phase,
     buffer: Vec<f32>,
     config: SttConfig,
+    /// The sockets are bound once, so `[paths]` cannot change later.
+    paths: PathsConfig,
     engine: Engine,
     /// Bumped on every transcription and on CANCEL, so a result from a
     /// cancelled job is recognised and dropped.
@@ -113,17 +129,22 @@ pub struct Daemon<A: AudioSource> {
     /// Bumped on every model load, so a slower, older load cannot
     /// overwrite a newer one.
     load_generation: u64,
-    reload_waiters: Vec<oneshot::Sender<anyhow::Result<()>>>,
+    /// REFRESH clients waiting for the current load, with the text
+    /// each gets on success.
+    reload_waiters: Vec<(RefreshReply, String)>,
 }
 
 impl<A: AudioSource> Daemon<A> {
     /// Returns the daemon plus the effect that loads the configured model.
-    pub fn new(audio: A, config: SttConfig) -> (Self, Effect) {
+    pub fn new(mut audio: A, config: DaemonConfig) -> (Self, Effect) {
+        audio.set_config(config.audio);
+        let stt = config.stt;
         let daemon = Self {
             audio,
             phase: Phase::Idle,
             buffer: Vec::new(),
-            config: config.clone(),
+            config: stt.clone(),
+            paths: config.paths,
             engine: Engine::Loading,
             job: 0,
             stop_waiter: None,
@@ -135,7 +156,7 @@ impl<A: AudioSource> Daemon<A> {
             daemon,
             Effect::LoadEngine {
                 generation: 1,
-                config,
+                config: stt,
             },
         )
     }
@@ -160,6 +181,17 @@ impl<A: AudioSource> Daemon<A> {
                 self.engine_loaded(generation, result);
                 Vec::new()
             }
+            Event::ConfigRead {
+                result,
+                response_tx,
+            } => match result {
+                Ok(config) => self.apply_config(config, response_tx).into_iter().collect(),
+                Err(e) => {
+                    warn!("REFRESH refused: {e}");
+                    let _ = response_tx.send(Err(e));
+                    Vec::new()
+                }
+            },
         }
     }
 
@@ -234,10 +266,10 @@ impl<A: AudioSource> Daemon<A> {
                 let _ = response_tx.send(self.status());
                 Vec::new()
             }
-            Command::ReloadConfig {
-                new_config,
-                response_tx,
-            } => self.reload(new_config, response_tx).into_iter().collect(),
+            Command::Refresh { response_tx } => {
+                info!("Command: REFRESH");
+                vec![Effect::ReadConfig { response_tx }]
+            }
         }
     }
 
@@ -304,56 +336,59 @@ impl<A: AudioSource> Daemon<A> {
         self.phase = Phase::Idle;
     }
 
-    fn reload(
-        &mut self,
-        mut new_config: SttConfig,
-        response_tx: oneshot::Sender<anyhow::Result<()>>,
-    ) -> Option<Effect> {
+    /// Apply a re-read configuration. A model change drops the current
+    /// engine before loading the new one, so a failed load leaves the
+    /// daemon without a model (visible in STATUS, START refused) instead
+    /// of holding two models in (V)RAM.
+    fn apply_config(&mut self, config: DaemonConfig, response_tx: RefreshReply) -> Option<Effect> {
+        let mut new_config = config.stt;
         info!(
-            "Command: REFRESH (model_kind={} model_id={})",
+            "Applying configuration (model_kind={} model_id={})",
             new_config.model_kind, new_config.model_id
         );
         if let Err(e) = validate_stt_config(&new_config) {
             warn!("REFRESH refused: {e}");
-            let _ = response_tx.send(Err(anyhow::anyhow!("configuración inválida: {e}")));
+            let _ = response_tx.send(Err(format!("configuración inválida: {e}")));
             return None;
         }
         let same_model = new_config.model_id == self.config.model_id
             && new_config.model_kind == self.config.model_kind;
-        // The client does not know where the model lives on disk.
+        if !same_model && self.phase != Phase::Idle {
+            let _ = response_tx.send(Err(
+                "hay una grabación en curso; vuelve a intentarlo al terminar".to_string(),
+            ));
+            return None;
+        }
+
+        let mut ok = "configuración recargada".to_string();
+        if config.paths != self.paths {
+            warn!("[paths] changed; the sockets stay where they are until a restart");
+            ok.push_str("; los cambios en [paths] requieren reiniciar el daemon");
+        }
+        self.audio.set_config(config.audio);
         new_config.model_path = std::mem::take(&mut self.config.model_path);
 
         match (&self.engine, same_model) {
             (Engine::Ready(_), true) => {
                 self.config = new_config;
                 info!("Configuration updated (no model change).");
-                let _ = response_tx.send(Ok(()));
+                let _ = response_tx.send(Ok(ok));
                 None
             }
             (Engine::Loading, true) => {
                 self.config = new_config;
-                self.reload_waiters.push(response_tx);
-                None
-            }
-            _ if self.phase != Phase::Idle => {
-                self.config.model_path = new_config.model_path;
-                let _ = response_tx.send(Err(anyhow::anyhow!(
-                    "hay una grabación en curso; vuelve a intentarlo al terminar"
-                )));
+                self.reload_waiters.push((response_tx, ok));
                 None
             }
             _ => {
-                for waiter in self.reload_waiters.drain(..) {
-                    let _ =
-                        waiter.send(Err(anyhow::anyhow!("reemplazado por un REFRESH posterior")));
+                for (waiter, _) in self.reload_waiters.drain(..) {
+                    let _ = waiter.send(Err("reemplazado por un REFRESH posterior".to_string()));
                 }
-                // Drop the old engine before loading the new one so both
-                // never sit in (V)RAM at once.
                 self.engine = Engine::Loading;
                 new_config.model_path = String::new();
                 self.config = new_config.clone();
                 self.load_generation += 1;
-                self.reload_waiters.push(response_tx);
+                self.reload_waiters.push((response_tx, ok));
                 Some(Effect::LoadEngine {
                     generation: self.load_generation,
                     config: new_config,
@@ -380,11 +415,12 @@ impl<A: AudioSource> Daemon<A> {
                 Err(msg)
             }
         };
-        for waiter in self.reload_waiters.drain(..) {
+        for (waiter, ok) in self.reload_waiters.drain(..) {
             let _ = waiter.send(
                 reply
                     .clone()
-                    .map_err(|msg| anyhow::anyhow!("Failed to load model: {msg}")),
+                    .map(|()| ok)
+                    .map_err(|msg| format!("no se pudo cargar el modelo: {msg}")),
             );
         }
     }
@@ -409,6 +445,7 @@ pub type LoadFuture = Pin<Box<dyn Future<Output = LoadResult> + Send>>;
 /// The work [`run`] delegates to the outside world.
 pub struct Hooks {
     pub load_engine: Box<dyn Fn(SttConfig) -> LoadFuture + Send + Sync>,
+    pub read_config: Box<dyn Fn() -> Result<DaemonConfig, String> + Send + Sync>,
     pub notify_auto_stop: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -484,6 +521,18 @@ fn execute(effect: Effect, hooks: &Hooks, done_tx: &mpsc::Sender<Event>) {
             });
         }
         Effect::NotifyAutoStop => (hooks.notify_auto_stop)(),
+        Effect::ReadConfig { response_tx } => {
+            let result = (hooks.read_config)();
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                let _ = done_tx
+                    .send(Event::ConfigRead {
+                        result,
+                        response_tx,
+                    })
+                    .await;
+            });
+        }
     }
 }
 
@@ -498,6 +547,7 @@ mod tests {
         queue: VecDeque<f32>,
         open: bool,
         broken: bool,
+        device: String,
     }
 
     /// Microphone the test feeds while the daemon owns it. Like the real
@@ -520,9 +570,16 @@ mod tests {
         fn unplug(&self) {
             self.0.lock().unwrap().broken = true;
         }
+
+        fn device(&self) -> String {
+            self.0.lock().unwrap().device.clone()
+        }
     }
 
     impl AudioSource for FakeMic {
+        fn set_config(&mut self, config: AudioConfig) {
+            self.0.lock().unwrap().device = config.input_device;
+        }
         fn start(&mut self) -> Result<(), String> {
             let mut m = self.0.lock().unwrap();
             m.queue.clear();
@@ -567,13 +624,21 @@ mod tests {
         }
     }
 
+    fn full(stt: SttConfig) -> DaemonConfig {
+        DaemonConfig {
+            stt,
+            paths: PathsConfig::default(),
+            audio: AudioConfig::default(),
+        }
+    }
+
     fn loaded(path: &str) -> LoadResult {
         Ok((Arc::new(CountingTranscriber), path.to_string()))
     }
 
     fn ready_daemon() -> (Daemon<FakeMic>, FakeMic) {
         let mic = FakeMic::default();
-        let (mut d, _) = Daemon::new(mic.clone(), config("modelo-a"));
+        let (mut d, _) = Daemon::new(mic.clone(), full(config("modelo-a")));
         d.handle(Event::EngineLoaded {
             generation: 1,
             result: loaded("/cache/modelo-a.bin"),
@@ -593,16 +658,24 @@ mod tests {
         (rx, effects)
     }
 
+    /// A REFRESH whose re-read of the configuration produced `cfg`.
+    fn refresh_with(
+        d: &mut Daemon<FakeMic>,
+        cfg: DaemonConfig,
+    ) -> (oneshot::Receiver<Result<String, String>>, Vec<Effect>) {
+        let (tx, rx) = oneshot::channel();
+        let effects = d.handle(Event::ConfigRead {
+            result: Ok(cfg),
+            response_tx: tx,
+        });
+        (rx, effects)
+    }
+
     fn refresh(
         d: &mut Daemon<FakeMic>,
         cfg: SttConfig,
-    ) -> (oneshot::Receiver<anyhow::Result<()>>, Vec<Effect>) {
-        let (tx, rx) = oneshot::channel();
-        let effects = d.handle(Event::Command(Command::ReloadConfig {
-            new_config: cfg,
-            response_tx: tx,
-        }));
-        (rx, effects)
+    ) -> (oneshot::Receiver<Result<String, String>>, Vec<Effect>) {
+        refresh_with(d, full(cfg))
     }
 
     fn status(d: &mut Daemon<FakeMic>) -> StatusResponse {
@@ -628,7 +701,7 @@ mod tests {
 
     #[test]
     fn start_is_refused_while_the_model_loads() {
-        let (mut d, effect) = Daemon::new(FakeMic::default(), config("modelo-a"));
+        let (mut d, effect) = Daemon::new(FakeMic::default(), full(config("modelo-a")));
         assert!(matches!(effect, Effect::LoadEngine { generation: 1, .. }));
         let err = start(&mut d).unwrap_err();
         assert!(err.contains("cargando"), "{err}");
@@ -637,7 +710,7 @@ mod tests {
 
     #[test]
     fn start_is_refused_when_the_model_failed_to_load() {
-        let (mut d, _) = Daemon::new(FakeMic::default(), config("modelo-a"));
+        let (mut d, _) = Daemon::new(FakeMic::default(), full(config("modelo-a")));
         d.handle(Event::EngineLoaded {
             generation: 1,
             result: Err("archivo corrupto".to_string()),
@@ -881,7 +954,7 @@ mod tests {
         cfg.language = "klingon".to_string();
         let (mut rx, effects) = refresh(&mut d, cfg);
         assert!(effects.is_empty(), "must not start loading");
-        let err = rx.try_recv().unwrap().unwrap_err().to_string();
+        let err = rx.try_recv().unwrap().unwrap_err();
         assert!(err.contains("klingon"), "{err}");
 
         let s = status(&mut d);
@@ -953,7 +1026,7 @@ mod tests {
             generation: load_generation(&effects),
             result: Err("no existe".to_string()),
         });
-        let err = rx.try_recv().unwrap().unwrap_err().to_string();
+        let err = rx.try_recv().unwrap().unwrap_err();
         assert!(err.contains("no existe"), "{err}");
         assert_eq!(status(&mut d).engine, "failed: no existe");
     }
@@ -981,7 +1054,7 @@ mod tests {
 
     #[test]
     fn refresh_of_the_model_being_loaded_waits_instead_of_loading_twice() {
-        let (mut d, _) = Daemon::new(FakeMic::default(), config("modelo-a"));
+        let (mut d, _) = Daemon::new(FakeMic::default(), full(config("modelo-a")));
         let (mut rx, effects) = refresh(&mut d, config("modelo-a"));
         assert!(effects.is_empty(), "must not start a second load");
         assert!(rx.try_recv().is_err(), "answered when the load finishes");
@@ -995,13 +1068,59 @@ mod tests {
 
     #[test]
     fn refresh_after_a_failed_load_retries_the_same_model() {
-        let (mut d, _) = Daemon::new(FakeMic::default(), config("modelo-a"));
+        let (mut d, _) = Daemon::new(FakeMic::default(), full(config("modelo-a")));
         d.handle(Event::EngineLoaded {
             generation: 1,
             result: Err("sin red".to_string()),
         });
         let (_rx, effects) = refresh(&mut d, config("modelo-a"));
         assert_eq!(load_generation(&effects), 2);
+    }
+
+    #[test]
+    fn refresh_rereads_the_config_instead_of_trusting_the_client() {
+        let (mut d, _mic) = ready_daemon();
+        let (tx, _rx) = oneshot::channel();
+        let effects = d.handle(Event::Command(Command::Refresh { response_tx: tx }));
+        assert!(matches!(effects.as_slice(), [Effect::ReadConfig { .. }]));
+    }
+
+    #[test]
+    fn an_unreadable_config_is_reported_and_changes_nothing() {
+        let (mut d, _mic) = ready_daemon();
+        let (tx, mut rx) = oneshot::channel();
+        let effects = d.handle(Event::ConfigRead {
+            result: Err("configuración inválida: line 2".to_string()),
+            response_tx: tx,
+        });
+        assert!(effects.is_empty());
+        assert!(rx.try_recv().unwrap().unwrap_err().contains("line 2"));
+        let s = status(&mut d);
+        assert_eq!(s.model_id, "modelo-a");
+        assert_eq!(s.engine, "ready");
+        assert!(start(&mut d).is_ok());
+    }
+
+    #[test]
+    fn refresh_applies_the_audio_section_to_the_next_recording() {
+        let (mut d, mic) = ready_daemon();
+        let mut cfg = full(config("modelo-a"));
+        cfg.audio.input_device = "Fifine".to_string();
+        let (mut rx, _) = refresh_with(&mut d, cfg);
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert_eq!(mic.device(), "Fifine");
+    }
+
+    #[test]
+    fn refresh_says_when_paths_need_a_restart() {
+        let (mut d, _mic) = ready_daemon();
+        let (mut rx, _) = refresh(&mut d, config("modelo-a"));
+        assert!(!rx.try_recv().unwrap().unwrap().contains("[paths]"));
+
+        let mut cfg = full(config("modelo-a"));
+        cfg.paths.socket_dir = Some("/run/user/1000/otro".to_string());
+        let (mut rx, _) = refresh_with(&mut d, cfg);
+        assert!(rx.try_recv().unwrap().unwrap().contains("[paths]"));
     }
 
     #[test]
@@ -1029,6 +1148,8 @@ mod tests {
     struct Harness {
         commands: mpsc::Sender<Command>,
         mic: FakeMic,
+        /// What the next REFRESH reads from "disk".
+        on_disk: Arc<Mutex<SttConfig>>,
         release: std::sync::mpsc::Sender<()>,
         _shutdown: watch::Sender<bool>,
     }
@@ -1038,10 +1159,13 @@ mod tests {
             let (release, gate) = std::sync::mpsc::channel();
             let engine: Arc<dyn Transcriber> = Arc::new(GatedTranscriber(Mutex::new(gate)));
             let mic = FakeMic::default();
-            let (daemon, initial) = Daemon::new(mic.clone(), config("modelo-a"));
+            let (daemon, initial) = Daemon::new(mic.clone(), full(config("modelo-a")));
             let (commands, rx) = mpsc::channel(8);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let on_disk = Arc::new(Mutex::new(config("modelo-a")));
+            let disk = Arc::clone(&on_disk);
             let hooks = Hooks {
+                read_config: Box::new(move || Ok(full(disk.lock().unwrap().clone()))),
                 load_engine: Box::new(move |_| {
                     let engine = Arc::clone(&engine);
                     Box::pin(async move { Ok((engine, "/cache/modelo-a.bin".to_string())) })
@@ -1059,6 +1183,7 @@ mod tests {
             Self {
                 commands,
                 mic,
+                on_disk,
                 release,
                 _shutdown: shutdown_tx,
             }
@@ -1092,6 +1217,18 @@ mod tests {
                 .await
                 .unwrap();
             rx
+        }
+
+        async fn refresh(&self) -> Result<String, String> {
+            let (tx, rx) = oneshot::channel();
+            self.commands
+                .send(Command::Refresh { response_tx: tx })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), rx)
+                .await
+                .expect("REFRESH must be answered")
+                .unwrap()
         }
 
         async fn wait_until_ready(&self) {
@@ -1138,5 +1275,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let late = h.stop().await;
         assert_eq!(late.await.unwrap(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_applies_what_the_daemon_reads_itself() {
+        let h = Harness::spawn();
+        h.wait_until_ready().await;
+        h.on_disk.lock().unwrap().language = "en".to_string();
+        assert_eq!(h.refresh().await.unwrap(), "configuración recargada");
+        assert_eq!(h.status().await.language, "en");
     }
 }

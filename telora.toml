@@ -8,6 +8,13 @@
 # `telora` CLI read the same layers. A file that does not parse stops
 # them with an error naming the file and line; a value the daemon cannot
 # use stops the daemon with an error naming the field.
+#
+# `telora-daemon refresh` makes the running daemon re-read these layers
+# with the options and environment it was started with. If the new
+# config is invalid nothing changes. A new model replaces the old one
+# only after the old one is unloaded, so if it fails to load the daemon
+# has no model (STATUS says why) until the next refresh. Changes to
+# [paths] need a restart.
 
 # Engine family. One of:
 #   "whisper"    — whisper.cpp via voxora-whisper (ggml-*.bin files)
