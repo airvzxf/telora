@@ -18,6 +18,8 @@
 //!     and the GUI both used to open-code. The shared helper applies
 //!     the daemon's stricter directory and permission checks to every
 //!     caller.
+//!   * [`protocol`] — the JSON-per-line protocol of the daemon and
+//!     GUI control sockets, with the client used by every binary.
 //!   * [`cache`] — the Voxora model-cache resolver shared by the daemon
 //!     and the legacy `telora-models` compatibility CLI. It keeps the
 //!     legacy `voxora/models/huggingface` layout and validates overrides.
@@ -26,12 +28,13 @@
 //! binary crates and pulls only the dependencies strictly needed to
 //! implement the shared surface (`anyhow`, `dirs`, `log`,
 //! `nix` with the minimum feature set, `tokio::net`, `socket2`,
-//! `config` for the env-var cascade).
+//! `config` for the env-var cascade, `serde_json` for the protocol).
 
 pub mod cache;
 pub mod config;
 pub mod env;
 pub mod paths;
+pub mod protocol;
 pub mod socket_bind;
 
 pub use cache::{default_voxora_cache_dir, resolve_voxora_cache, sanitize_voxora_cache_override};
