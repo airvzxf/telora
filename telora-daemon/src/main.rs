@@ -2,14 +2,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{Config, File};
 use log::{info, warn};
-use ringbuf::HeapRb;
 use std::path::PathBuf;
 use std::sync::Arc;
 use telora_common::cache::resolve_voxora_cache;
 use telora_common::env::telora_env_source;
 use telora_daemon::daemon::{self, Daemon, Hooks};
 use telora_daemon::{
-    AudioEngine, BridgeTranscriber, DaemonConfig, SocketServer, StatusResponse, SttConfig,
+    BridgeTranscriber, DaemonConfig, Microphone, SocketServer, StatusResponse, SttConfig,
     Transcriber, paths,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -485,15 +484,8 @@ async fn main() -> Result<()> {
     info!("Model id:   {}", stt_config.model_id);
     info!("Language:   {}", stt_config.language);
 
-    // Audio Engine initialization
-    let rb = HeapRb::<f32>::new(16000 * 30); // 30 seconds buffer
-    let (producer, consumer) = rb.split();
-
-    let mut audio_engine = AudioEngine::new().context("Failed to init audio engine")?;
-    audio_engine
-        .start(producer, &daemon_cfg.audio)
-        .context("Failed to start audio engine")?;
-    let (daemon, initial_load) = Daemon::new(consumer, stt_config);
+    let microphone = Microphone::new(daemon_cfg.audio.clone());
+    let (daemon, initial_load) = Daemon::new(microphone, stt_config);
 
     // Socket
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
