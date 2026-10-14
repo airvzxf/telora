@@ -20,6 +20,7 @@
 //! resolver live in `telora-common`; this crate retains only the
 //! daemon-specific configuration environment source.
 
+pub mod daemon;
 pub mod socket;
 
 mod audio;
