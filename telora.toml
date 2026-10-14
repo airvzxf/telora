@@ -1,9 +1,13 @@
 # Telora configuration.
 #
-# The daemon loads this file at startup. Fields can be overridden
-# with environment variables prefixed with `TELORA_` (e.g.
-# `TELORA_LANGUAGE=fr`) or with CLI flags
-# (`telora-daemon --language fr`).
+# Installed as /etc/telora.toml. Each later layer overrides the
+# previous one: this file, `$XDG_CONFIG_HOME/telora/config.toml`
+# (usually ~/.config/telora/config.toml), the daemon's `--config FILE`,
+# `TELORA_*` environment variables (e.g. `TELORA_LANGUAGE=fr`) and the
+# daemon's CLI flags (`--language fr`). The daemon, the GUI and the
+# `telora` CLI read the same layers. A file that does not parse stops
+# them with an error naming the file and line; a value the daemon cannot
+# use stops the daemon with an error naming the field.
 
 # Engine family. One of:
 #   "whisper"    — whisper.cpp via voxora-whisper (ggml-*.bin files)
@@ -30,22 +34,14 @@ model_kind = "whisper"
 # to `$XDG_CACHE_HOME/voxora/models/huggingface`.
 model_id = "ggerganov/whisper.cpp/ggml-base.bin"
 
-# Legacy field: kept so old telora.toml files keep working.
-# The daemon reads `model_id` (above) and falls back to this if
-# `model_id` is empty. New configs should set `model_id` directly.
-model_path = ""
-
-# Language code (ISO 639-1, e.g. "es", "en", "fr"). The daemon
-# translates this to the engine-specific vocabulary internally:
-#   - whisper: passed through as-is.
-#   - qwen3-asr: mapped to the full English name
-#     (`english`, `chinese`, `cantonese`, …).
+# Language code (ISO 639-1, e.g. "es", "en", "fr"), or "auto" to let
+# the engine detect it. Whisper accepts every language it knows;
+# qwen3-asr only its 20 (Spanish, English, Chinese, …). An unknown code
+# stops the daemon at startup.
 language = "es"
 
-# Maximum recording time in seconds.
-# The daemon will automatically stop and process the audio if this
-# limit is reached. Default is 600 seconds (10 minutes). Set to a
-# higher value for long dictations, or lower to prevent memory abuse.
+# Maximum recording time in seconds (1 to 3600). When reached, the
+# daemon stops and transcribes what it has. Default: 600.
 max_recording_seconds = 300
 
 # Socket and runtime paths.

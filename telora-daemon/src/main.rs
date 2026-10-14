@@ -1,15 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{Config, File};
 use log::{info, warn};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use telora_common::cache::resolve_voxora_cache;
-use telora_common::env::telora_env_source;
+use telora_common::config::Cascade;
 use telora_daemon::daemon::{self, Daemon, Hooks};
 use telora_daemon::{
     BridgeTranscriber, DaemonConfig, Microphone, SocketServer, StatusResponse, SttConfig,
-    Transcriber, paths,
+    Transcriber, engine_family, paths, validate_stt_config,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -71,50 +70,11 @@ enum Commands {
     Refresh,
 }
 
-/// Load and merge configuration from the four-tier cascade
-/// (`/etc/telora.toml`, `~/.config/telora/config.toml`, the
-/// `--config` CLI override, and `TELORA_*` env vars). Returns a
-/// [`DaemonConfig`] which wraps both the STT settings and the
-/// `[paths]` overrides added in sub-issue #33.
+/// The shared `telora.toml` cascade plus CLI overrides, validated.
+/// Any problem is fatal: running on defaults would load a different
+/// model than the one configured.
 fn load_config(args: &Args) -> Result<DaemonConfig> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-
-    // Load configuration from multiple sources in order of precedence (last one wins).
-    let mut builder = Config::builder();
-
-    // 1. System config (/etc/telora.toml) - Lowest priority
-    builder = builder.add_source(File::with_name("/etc/telora.toml").required(false));
-
-    // 2. User config (~/.config/telora/config.toml)
-    builder = builder.add_source(
-        File::with_name(&format!("{}/.config/telora/config.toml", home)).required(false),
-    );
-
-    // 3. Explicit config file via CLI --config
-    if let Some(cfg_path) = &args.config {
-        builder = builder.add_source(File::with_name(cfg_path));
-    }
-
-    // 4. Environment variables - Highest priority. The source
-    // construction is centralised in [`telora_common::env::telora_env_source`]
-    // (the daemon's `TELORA_*` environment-source helper) because
-    // `config` 0.13's defaults silently drop `TELORA_PATHS__SOCKET_DIR`;
-    // see that helper's rustdoc for the why. The integration test
-    // `telora-daemon/tests/config_env_cascade.rs` calls the same
-    // helper through `telora_daemon::telora_env_source` (a re-export
-    // of the `telora-common` helper that survives the move so the
-    // test does not have to change) to pin the behaviour.
-    builder = builder.add_source(telora_env_source());
-
-    let mut cfg: DaemonConfig = match builder.build() {
-        Ok(c) => c
-            .try_deserialize()
-            .context("loading telora config (telora.toml / --config / TELORA_*)")?,
-        Err(e) => {
-            warn!("Configuration warning: {}. Using defaults.", e);
-            DaemonConfig::default()
-        }
-    };
+    let mut cfg: DaemonConfig = Cascade::standard(args.config.as_deref().map(Path::new)).load()?;
 
     // CLI args override
     if let Some(m) = &args.model_id {
@@ -130,15 +90,9 @@ fn load_config(args: &Args) -> Result<DaemonConfig> {
         cfg.stt.max_recording_seconds = s;
     }
 
-    // Legacy compatibility: if the user's telora.toml only supplies
-    // `model_path`, treat it as a Whisper `model_id` so existing
-    // configs keep working. The `model_path` field was a local file
-    // path in the pre-voxora daemon; HF ids are forward-slash
-    // separated, so the two are unambiguous in practice.
-    if cfg.stt.model_id.is_empty() && !cfg.stt.model_path.is_empty() {
-        cfg.stt.model_id = cfg.stt.model_path.clone();
-    }
-
+    // Filled in from the loaded engine, never from the file.
+    cfg.stt.model_path = String::new();
+    validate_stt_config(&cfg.stt).map_err(|e| anyhow::anyhow!("configuración inválida: {e}"))?;
     Ok(cfg)
 }
 
@@ -303,15 +257,7 @@ async fn build_transcriber(
     config: &SttConfig,
     voxora_cache: std::path::PathBuf,
 ) -> Result<(Arc<dyn Transcriber>, String)> {
-    use voxora_bridge::EngineFamily;
-    let kind = EngineFamily::from_config(&config.model_kind)
-        .filter(|k| matches!(k, EngineFamily::Whisper | EngineFamily::Qwen3Asr))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "motor no soportado: {:?}; usa `whisper` o `qwen3-asr`",
-                config.model_kind
-            )
-        })?;
+    let kind = engine_family(&config.model_kind).map_err(|e| anyhow::anyhow!(e))?;
     let token = std::env::var("HF_TOKEN")
         .ok()
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());

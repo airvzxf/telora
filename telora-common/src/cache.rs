@@ -242,13 +242,10 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
+        crate::paths::tests::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

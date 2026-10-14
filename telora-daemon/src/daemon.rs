@@ -15,7 +15,7 @@ use log::{error, info, warn};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::socket::{Command, StatusResponse, SttConfig};
-use crate::transcriber::Transcriber;
+use crate::transcriber::{Transcriber, validate_stt_config};
 
 /// Samples per second the engines expect and the buffer is sized for.
 const SAMPLE_RATE: usize = 16_000;
@@ -313,6 +313,11 @@ impl<A: AudioSource> Daemon<A> {
             "Command: REFRESH (model_kind={} model_id={})",
             new_config.model_kind, new_config.model_id
         );
+        if let Err(e) = validate_stt_config(&new_config) {
+            warn!("REFRESH refused: {e}");
+            let _ = response_tx.send(Err(anyhow::anyhow!("configuración inválida: {e}")));
+            return None;
+        }
         let same_model = new_config.model_id == self.config.model_id
             && new_config.model_kind == self.config.model_kind;
         // The client does not know where the model lives on disk.
@@ -867,6 +872,23 @@ mod tests {
         assert_eq!(s.max_recording_seconds, 30);
         assert_eq!(s.model_path, "/cache/modelo-a.bin");
         assert_eq!(s.engine, "ready");
+    }
+
+    #[test]
+    fn an_invalid_refresh_is_refused_and_changes_nothing() {
+        let (mut d, _mic) = ready_daemon();
+        let mut cfg = config("modelo-b");
+        cfg.language = "klingon".to_string();
+        let (mut rx, effects) = refresh(&mut d, cfg);
+        assert!(effects.is_empty(), "must not start loading");
+        let err = rx.try_recv().unwrap().unwrap_err().to_string();
+        assert!(err.contains("klingon"), "{err}");
+
+        let s = status(&mut d);
+        assert_eq!(s.model_id, "modelo-a");
+        assert_eq!(s.language, "es");
+        assert_eq!(s.engine, "ready");
+        assert_eq!(s.model_path, "/cache/modelo-a.bin");
     }
 
     #[test]
