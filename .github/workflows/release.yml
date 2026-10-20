@@ -489,7 +489,7 @@ jobs:
         # action's own artifact upload is preserved (so the SBOM
         # remains downloadable via the run page); we just need the
         # file on disk too.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: telora.sbom.cdx.json
           path: ${{ github.workspace }}/
@@ -557,7 +557,7 @@ jobs:
         # (`build-aur-package`, `publish`) can address each variant
         # by name. The CUDA 12 entry is what the AUR job consumes
         # — see the matching `name:` filter below.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: telora-release-bundle-cuda${{ matrix.cuda_short }}
           path: ${{ runner.temp }}/release-artifacts/*
@@ -641,7 +641,7 @@ jobs:
         # a follow-up. When this filter is set the action only
         # matches the named artefact, so a missing cuda12 build
         # fails the AUR job loudly.
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: telora-release-bundle-cuda12
           path: release/
@@ -746,7 +746,7 @@ jobs:
             || { echo "ERROR: AUR package missing /etc/telora.toml"; exit 1; }
 
       - name: Upload AUR package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: telora-aur-package
           path: pkg/*.pkg.tar.zst
@@ -762,7 +762,7 @@ jobs:
       contents: write
     steps:
       - name: Download release bundle (cuda12)
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: telora-release-bundle-cuda12
           path: release/cuda12/
@@ -775,7 +775,7 @@ jobs:
       # cudarc upstream adds 13.4+ support. Tracking issue: #183.
 
       - name: Download AUR package
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: telora-aur-package
           path: aur/
