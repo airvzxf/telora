@@ -125,12 +125,9 @@ fn list_cmd(cache_root: &Path) -> Result<()> {
 }
 
 async fn download_cmd(source: &voxora_hf::HuggingFaceSource, model_id: &str) -> Result<()> {
-    // 8 GiB cap, adopted from voxora EPIC #148 (voxora 0.5.3+).
-    // Mirrors the daemon's resolve cap (`telora-daemon/src/transcriber.rs`)
+    // Same 8 GiB cap as the daemon (`telora-daemon/src/transcriber.rs`)
     // so telora-models and telora-daemon reject the same set of
-    // pathological model files. See the daemon-side comment for
-    // the honest framing of the voxora-hf gap (the cap is inert on
-    // the HF resolve path today; tracked in airvzxf/telora#148).
+    // pathological model files.
     let opts = ResolveOptions::with_max_bytes(8 * 1024 * 1024 * 1024);
     let dir = source
         .resolve(model_id, &opts)

@@ -111,25 +111,15 @@ impl BridgeTranscriber {
                 .context("failed to build HuggingFaceSource")?,
         );
 
-        // Cap resolved files at 8 GiB (closes voxora EPIC #148,
-        // adopted from voxora 0.5.3). 8 GiB clears the largest
+        // Cap resolved models at 8 GiB. 8 GiB clears the largest
         // legitimate artifact the daemon ever resolves
         // (Qwen/Qwen3-ASR-1.7B's BF16 `model.safetensors` is ~3.4
         // GB; ggml-large-v3 F32 is ~3.1 GB) with ~2.4x headroom
         // for future Qwen releases while staying well below any
         // "pathological 100 GB+" size.
         //
-        // HONEST GAP (closes #148): voxora-hf 0.6.2 (and 0.5.1+)
-        // does not yet honour `ResolveOptions::max_bytes` despite the
-        // voxora-traits CHANGELOG claiming it does — zero references
-        // to the field exist anywhere under voxora-hf/src/. The cap
-        // therefore does NOT activate on the daemon's HF resolve
-        // path today. It activates the moment voxora-hf plumbs
-        // `opts.max_bytes` through `HfClient::get_to_file` (tracked
-        // upstream). The cap is wired here so the daemon is
-        // already prepared when the upstream fix lands and to
-        // document the intended security posture to anyone reading
-        // this code.
+        // voxora-hf enforces `max_bytes` from 0.6.3 on (0.6.2 accepts
+        // it and ignores it), hence the `0.6.3` floor in Cargo.toml.
         let opts = ResolveOptions::with_max_bytes(8 * 1024 * 1024 * 1024);
 
         // Build the registry around the source we already configured.
