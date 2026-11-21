@@ -1,0 +1,35 @@
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # zip 7.x, only via voxora-qwen3asr -> qwen3-asr -> candle-core 0.9,
+    #   which requires zip ^7 (the fixes are in zip >= 9). candle builds
+    #   zip with `default-features = false` (no `aes-crypto`, no
+    #   `legacy-zip`) and only opens archives for `.npz` / `.pth`
+    #   checkpoints; voxora loads Qwen3-ASR from `.safetensors` only and
+    #   never calls `ZipArchive::extract` or `ZipStreamReader`.
+    "RUSTSEC-2026-0367", # SUID/SGID bits preserved on extract
+    "RUSTSEC-2026-0368", # extract creates symlinks outside the destination
+    "RUSTSEC-2026-0369", # extract applies permissions through symlinks
+    "RUSTSEC-2026-0429", # extract aborts on a large symlink entry
+    "RUSTSEC-2026-0545", # AES MAC unchecked on truncated entry (`aes-crypto`)
+    "RUSTSEC-2026-0546", # extract writes through chained symlinks
+    "RUSTSEC-2026-0547", # legacy decoders preallocate declared size (`legacy-zip`)
+    "RUSTSEC-2026-0548", # `ZipStreamReader` trusts local-header names
+    # paste: unmaintained proc-macro, via candle-core -> gemm. No
+    #   maintained release exists.
+    "RUSTSEC-2024-0436",
+    # ringbuf 0.3: the double free needs an element whose `Drop` panics
+    #   during `Consumer::skip` / `Consumer::clear`. The capture queue
+    #   holds `f32` (no `Drop`) and only calls `push` / `pop`.
+    "RUSTSEC-2026-0293",
+    # zbus_names / zvariant / zvariant_derive: unmaintained since they
+    #   moved into zbus 6. They come from ksni 0.3 (tray icon), whose
+    #   latest release is still on zbus 5.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]

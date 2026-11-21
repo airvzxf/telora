@@ -44,7 +44,6 @@ nix = { version = "0.27", features = ["fs", "signal", "user"] }
 rubato = "0.14"
 ringbuf = "0.3"
 clap = { version = "4.4", features = ["derive"] }
-config = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # `sd_notify` is required by `Type=notify` in the systemd unit; the
@@ -56,6 +55,10 @@ serde_json = "1.0"
 libsystemd = { workspace = true }
 
 [dev-dependencies]
+# Only `tests/config_env_cascade.rs` uses `config` directly. Without
+# `default-features = false` its default `yaml` feature unifies into
+# every build and pulls the unmaintained `yaml-rust`.
+config = { version = "0.13", default-features = false, features = ["toml"] }
 tempfile = "3"
 assert_fs = "1"
 tokio = { version = "1.36", features = ["full", "test-util"] }
