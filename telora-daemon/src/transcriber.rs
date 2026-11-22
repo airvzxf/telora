@@ -279,7 +279,11 @@ impl Transcriber for BridgeTranscriber {
         let lang =
             engine_language(self.model_kind, language.unwrap_or("auto")).map_err(|e| anyhow!(e))?;
 
-        let opts = TranscribeOptions::new(lang.clone(), false, true);
+        // Only the text is used. Whisper keeps timestamps on because the
+        // flag changes its decoding; Qwen3-ASR has none and rejects the
+        // flag with `Unsupported("timestamps")`.
+        let timestamps = self.model_kind == EngineFamily::Whisper;
+        let opts = TranscribeOptions::new(lang.clone(), false, timestamps);
         let result = self
             .engine
             .transcribe(audio_data, &opts)
