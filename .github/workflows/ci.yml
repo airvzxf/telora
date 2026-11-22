@@ -95,6 +95,11 @@ jobs:
     - name: Clippy (telora-daemon, CPU-only build)
       run: cargo clippy --locked -p telora-daemon --no-default-features --all-targets -- -D warnings
 
+    - name: Docs (broken intra-doc links fail the build)
+      run: cargo doc --locked --no-deps --workspace
+      env:
+        RUSTDOCFLAGS: -D warnings
+
     # Skipping full build for now as CUDA setup in GH Actions is complex/slow
     # - name: Build
     #   run: cargo build --verbose
