@@ -119,7 +119,7 @@ impl BridgeTranscriber {
         // "pathological 100 GB+" size.
         //
         // voxora-hf enforces `max_bytes` from 0.6.3 on (0.6.2 accepts
-        // it and ignores it), hence the `0.6.3` floor in Cargo.toml.
+        // it and ignores it).
         let opts = ResolveOptions::with_max_bytes(8 * 1024 * 1024 * 1024);
 
         // Build the registry around the source we already configured.
@@ -193,42 +193,13 @@ impl BridgeTranscriber {
                 // Whisper is unaffected because ggml-cuda ships
                 // forward-compat PTX in addition to SASS.
                 let device = pick_qwen3asr_device();
-                let engine = if device.is_cpu() {
-                    // CPU path: `from_hf` always loads on
-                    // `best_device()`, so load with `load_with_device`.
-                    // The official HF snapshot has no `tokenizer.json`,
-                    // and the voxora 0.6 release we depend on only
-                    // synthesises it inside `from_hf`. So on the first
-                    // run (file missing) we still call `from_hf` for that
-                    // side effect, which costs one throwaway load; once
-                    // the file exists we skip it. Switch to
-                    // `QwenAsrEngine::from_hf_with_device` once a voxora
-                    // release ships it (airvzxf/voxora#249).
-                    if !dir.path.join("tokenizer.json").is_file() {
-                        info!(
-                            "qwen3-asr: tokenizer.json missing; one-off preparation load \
-                             before loading on CPU"
-                        );
-                        if let Err(e) = voxora_bridge::QwenAsrEngine::from_hf(
-                            hf_source.as_ref(),
-                            model_id,
-                            &opts,
-                        )
-                        .await
-                        {
-                            log::warn!("qwen3-asr preparation load failed (continuing): {e}");
-                        }
-                    }
-                    voxora_bridge::QwenAsrEngine::load_with_device(&dir.path, device).with_context(
-                        || format!("failed to load Qwen3-ASR engine for {model_id:?}"),
-                    )?
-                } else {
-                    voxora_bridge::QwenAsrEngine::from_hf(hf_source.as_ref(), model_id, &opts)
-                        .await
-                        .with_context(|| {
-                            format!("failed to load Qwen3-ASR engine for {model_id:?}")
-                        })?
-                };
+                // The official HF snapshot has no `tokenizer.json`;
+                // `prepare_model_dir` synthesises it (no-op once present).
+                voxora_bridge::QwenAsrEngine::prepare_model_dir(&dir.path).with_context(|| {
+                    format!("failed to prepare Qwen3-ASR model dir for {model_id:?}")
+                })?;
+                let engine = voxora_bridge::QwenAsrEngine::load_with_device(&dir.path, device)
+                    .with_context(|| format!("failed to load Qwen3-ASR engine for {model_id:?}"))?;
                 (
                     Arc::new(engine) as Arc<dyn AsrEngine>,
                     dir.path.display().to_string(),
