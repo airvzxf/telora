@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info};
-use ringbuf::{Consumer, HeapRb, Producer};
-use std::sync::Arc;
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::daemon::AudioSource;
 use crate::resample::MonoResampler;
@@ -27,7 +27,7 @@ pub struct Microphone {
 struct Capture {
     // Dropping the stream closes the device.
     _stream: cpal::Stream,
-    queue: Consumer<f32, Arc<HeapRb<f32>>>,
+    queue: HeapCons<f32>,
 }
 
 impl AudioSource for Microphone {
@@ -51,7 +51,7 @@ impl AudioSource for Microphone {
             return;
         };
         while buffer.len() < limit {
-            match capture.queue.pop() {
+            match capture.queue.try_pop() {
                 Some(sample) => buffer.push(sample),
                 None => break,
             }
@@ -140,7 +140,7 @@ fn choose_stream_config(device: &cpal::Device) -> Result<(cpal::StreamConfig, cp
 fn build_stream<T: cpal::SizedSample + Send + 'static>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut producer: Producer<f32, Arc<HeapRb<f32>>>,
+    mut producer: HeapProd<f32>,
     to_f32: fn(T) -> f32,
 ) -> Result<cpal::Stream> {
     let channels = usize::from(config.channels);
@@ -151,7 +151,7 @@ fn build_stream<T: cpal::SizedSample + Send + 'static>(
             for frame in data.chunks(channels) {
                 let mono = frame.iter().map(|&s| to_f32(s)).sum::<f32>() / channels as f32;
                 resampler.push(mono, |s| {
-                    let _ = producer.push(s);
+                    let _ = producer.try_push(s);
                 });
             }
         },
