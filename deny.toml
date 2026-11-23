@@ -22,10 +22,6 @@ ignore = [
     # paste: unmaintained proc-macro, via candle-core -> gemm. No
     #   maintained release exists.
     "RUSTSEC-2024-0436",
-    # ringbuf 0.3: the double free needs an element whose `Drop` panics
-    #   during `Consumer::skip` / `Consumer::clear`. The capture queue
-    #   holds `f32` (no `Drop`) and only calls `push` / `pop`.
-    "RUSTSEC-2026-0293",
     # zbus_names / zvariant / zvariant_derive: unmaintained since they
     #   moved into zbus 6. They come from ksni 0.3 (tray icon), whose
     #   latest release is still on zbus 5.
