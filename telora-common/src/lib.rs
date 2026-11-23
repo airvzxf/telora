@@ -9,7 +9,7 @@
 //!     `/tmp/telora-<uid>/` precedence that `telora-daemon` shipped
 //!     pre-extraction.
 //!   * [`config`] — the `telora.toml` cascade every binary loads.
-//!   * [`env`] — the `config` 0.13 environment-source helper that
+//!   * [`mod@env`] — the `config` 0.13 environment-source helper that
 //!     decodes `TELORA_PATHS__SOCKET_DIR`-style keys into nested
 //!     `paths.socket_dir` fields. Moved here from `telora-daemon` in
 //!     EPIC #134/#64 so the GUI can mirror the daemon cascade without

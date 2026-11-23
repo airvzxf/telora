@@ -5,7 +5,7 @@
 //! binaries (the `config` crate's default key separator is empty, so a
 //! plain `Environment::with_prefix("TELORA")` silently drops the nested
 //! keys). The build helper used to live in `telora-daemon` only; lifting
-//! it into [`telora-common`] is what lets the GUI mirror the daemon's
+//! it into `telora-common` is what lets the GUI mirror the daemon's
 //! cascade without re-implementing the separators.
 
 use config::Environment;
