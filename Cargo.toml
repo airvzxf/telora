@@ -8,10 +8,12 @@ edition = "2024"
 rust-version = "1.88"
 
 [workspace.dependencies]
+# 0.6.5: `max_bytes` is enforced on downloads, and a second Whisper
+# model from an already cached repo is downloaded instead of failing.
 # 0.6.4: `QwenAsrEngine::prepare_model_dir`, and Qwen3-ASR transcripts
 # without the `<asr_text>` prefix when the language is forced.
-voxora-hf        = "0.6.4"
-voxora-bridge    = "0.6.4"
+voxora-hf        = "0.6.5"
+voxora-bridge    = "0.6.5"
 voxora-registry  = "0.6"
 voxora-traits    = "0.6"
 libsystemd      = "0.7"
