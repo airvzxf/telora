@@ -19,9 +19,10 @@
 //! The voxora 0.2.0 resolver shipped two independent fixes:
 //!
 //! 1. `voxora-hf::resolve_single_file` no longer trusts the
-//!    `.complete` marker blindly — if the marker is set but the
-//!    requested file is missing, it returns `AsrError::ModelNotFound`
-//!    instead of silently returning the directory.
+//!    `.complete` marker blindly: if the marker is set but the
+//!    requested file is missing, it never returns the directory (from
+//!    voxora 0.6.5 it downloads the file; before, it failed with
+//!    `AsrError::ModelNotFound`).
 //! 2. `ModelDir::entry: Option<PathBuf>` names the exact file the
 //!    caller asked for in 3-segment `org/repo/file` resolves, so the
 //!    daemon no longer has to scan the directory at all.
@@ -97,17 +98,16 @@ fn build_cache_with_marker_but_missing_file() -> TempDir {
 
 /// Build a `HuggingFaceSource` pinned at the test's cache root,
 /// plus a `Registry` that uses it. Returns both because the
-/// cache-marker test (`resolve_rejects_cache_with_marker_but_missing_file`)
-/// needs `source.resolve(...)` directly to assert on the underlying
-/// `AsrError::ModelNotFound` without going through `RegistryError::Parse`,
-/// and both tests need the registry for the canonical resolve path.
+/// missing-model test needs `source.resolve(...)` directly to assert
+/// on the underlying `AsrError` without going through
+/// `RegistryError::Parse`, and both tests need the registry for the
+/// canonical resolve path.
 fn build_source_and_registry(cache_root: &std::path::Path) -> (Arc<HuggingFaceSource>, Registry) {
     let source = Arc::new(
         HuggingFaceSource::builder()
             .cache_dir(cache_root.to_path_buf())
-            // Unreachable so the slow path (network re-download)
-            // can never succeed; the tests rely on the fast path
-            // (cache hit) exclusively.
+            // Unreachable, so a download can never succeed: a test
+            // either resolves from the cache or sees the download fail.
             .base_url("http://127.0.0.1:1")
             .build()
             .expect("build HuggingFaceSource"),
@@ -156,8 +156,12 @@ async fn resolve_picks_the_requested_ggml_large_v3_bin_not_lex_sort_base() {
     );
 }
 
+/// Switching to a model that is not cached yet must fetch that model,
+/// never fall back to another one in the same directory. The source
+/// points at an unreachable host, so the fetch fails naming the
+/// requested file, and the cached model stays as it was.
 #[tokio::test(flavor = "multi_thread")]
-async fn resolve_rejects_cache_with_marker_but_missing_file() {
+async fn resolve_fetches_a_missing_model_instead_of_using_another_cached_one() {
     let tmp = build_cache_with_marker_but_missing_file();
     let (source, registry) = build_source_and_registry(tmp.path());
     let opts = ResolveOptions::default();
@@ -166,43 +170,30 @@ async fn resolve_rejects_cache_with_marker_but_missing_file() {
     let registry_err = registry
         .resolve(&parsed, &opts)
         .await
-        .expect_err("registry must reject 3-segment id when the cache marker lies about the file");
-
-    // The registry wraps the source error in RegistryError::Parse;
-    // the underlying cause is `AsrError::ModelNotFound("...is marked
-    // complete but does not contain...")`. We surface that to
-    // `voxora_traits::AsrError::ModelNotFound` (re-exported through
-    // `voxora_bridge::AsrError` since voxora 0.4 dropped the
-    // `voxora-core` shim) via the source's own resolve so the
-    // assertion can be precise.
-    let direct = source
-        .resolve("ggerganov/whisper.cpp/ggml-tiny.en.bin", &opts)
-        .await
-        .expect_err("source.resolve must surface AsrError::ModelNotFound");
-    match direct {
-        AsrError::ModelNotFound(msg) => {
-            assert!(
-                msg.contains("ggml-tiny.en.bin"),
-                "error must name the missing file, got: {msg}",
-            );
-        }
-        other => panic!("expected AsrError::ModelNotFound, got {other:?}"),
-    }
-
-    // The registry error must itself reference the missing file
-    // (the source error is wrapped via `RegistryError::Parse`), so
-    // operators debugging a failed REFRESH see the offending file
-    // name without having to follow the chain by hand.
-    let display = format!("{registry_err:?}");
+        .expect_err("ggml-tiny.en.bin is neither cached nor downloadable here");
     assert!(
-        display.contains("ggml-tiny.en.bin") || display.contains("ModelNotFound"),
-        "registry error must name the missing file, got: {display}"
+        format!("{registry_err:?}").contains("ggml-tiny.en.bin"),
+        "the error must name the requested file, got: {registry_err:?}"
     );
-    // Belt and braces: confirm the variant shape we expect.
     assert!(
         matches!(registry_err, RegistryError::Parse(_)),
         "expected RegistryError::Parse, got {registry_err:?}"
     );
+
+    let direct = source
+        .resolve("ggerganov/whisper.cpp/ggml-tiny.en.bin", &opts)
+        .await
+        .expect_err("source.resolve must fail the same way");
+    match direct {
+        AsrError::Network { url, .. } => assert!(
+            url.ends_with("/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"),
+            "must try to download the requested file, got: {url}"
+        ),
+        other => panic!("expected a download attempt (AsrError::Network), got {other:?}"),
+    }
+
+    let base = tmp.path().join("ggerganov/whisper.cpp/main/ggml-base.bin");
+    assert_eq!(std::fs::read(base).expect("base still cached"), b"b");
 }
 
 // ---- Daemon-API regression tests for F2 follow-up (S1, B2, etc.) ----
