@@ -16,10 +16,3 @@ voxora-registry  = "0.6"
 voxora-traits    = "0.6"
 libsystemd      = "0.7"
 telora-common    = { path = "telora-common" }
-
-[workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "warn"
-expect_used = "warn"
-cast_possible_truncation = "allow"
-cast_precision_loss = "allow"
