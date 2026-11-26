@@ -1,9 +1,33 @@
+# pacman runs these hooks as root, outside any user session, so
+# `systemctl --user` here would reach root's user manager, never the user's.
+# The hooks only print the commands each user runs in their own session.
+
+# Older [Install] sections enabled the units under default.target, which
+# starts them before the graphical session exists.
+_telora_stale_links() {
+    getent passwd | while IFS=: read -r _ _ uid _ _ home _; do
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        for link in "$home"/.config/systemd/user/default.target.wants/telora*.service; do
+            [ -L "$link" ] && echo "$link"
+        done
+    done
+}
+
+_telora_report_stale_links() {
+    local links units
+    links="$(_telora_stale_links)"
+    [ -n "$links" ] || return 0
+    units="$(echo "$links" | xargs -n1 basename | sort -u | xargs)"
+    echo ":: Old enablement links start Telora before the graphical session:"
+    echo "$links" | while read -r link; do echo "::     $link"; done
+    echo ":: Each affected user should run:"
+    echo "::     systemctl --user reenable $units"
+}
+
 post_install() {
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
     # Encourage linger so /run/user/<uid>/telora/ persists across logouts.
-    # pacman runs the install hook as root, so derive the real user from
-    # $SUDO_USER (set by sudo / preserved by pacman) and fall back to id -un
-    # for the rare direct-root install.
+    # The hook runs as root, so derive the real user from $SUDO_USER and fall
+    # back to id -un for the rare direct-root install.
     local telora_user="${SUDO_USER:-$(id -un)}"
     if ! loginctl show-user "${telora_user}" 2>/dev/null | grep -q 'Linger=yes'; then
         echo ":: Tip: enable linger so telora-daemon survives logout:"
@@ -18,32 +42,18 @@ post_install() {
     echo ":: You can also list available models with 'telora-models list'."
     echo ":: To enable socket activation, run:"
     echo "::     systemctl --user enable --now telora-daemon.socket telora.service"
-}
-
-pre_upgrade() {
-    # Stop the daemon so the running binary is not replaced under its feet.
-    if systemctl --user is-active --quiet telora-daemon.service 2>/dev/null; then
-        systemctl --user stop telora-daemon.service || true
-    fi
+    _telora_report_stale_links
 }
 
 post_upgrade() {
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-    if systemctl --user is-enabled --quiet telora-daemon.service 2>/dev/null; then
-        systemctl --user try-reload-or-restart telora-daemon.service || true
-    fi
-    echo ":: Telora has been upgraded."
+    echo ":: Telora has been upgraded. To run the new version, in your session:"
+    echo "::     systemctl --user daemon-reload"
+    echo "::     systemctl --user restart telora-daemon.service telora.service"
     echo ":: If you changed the model, run 'telora-models download <id>' to refresh weights."
+    _telora_report_stale_links
 }
 
 pre_remove() {
-    # Disable everything the package owns so we never leave a dangling
-    # symlink in graphical-session.target.wants/ pointing at the deleted
-    # binary. disable --now catches the socket (always pullable) and the
-    # GUI service even when inactive; telora-daemon.service gets the same
-    # treatment for symmetry. All calls ignore exit status so a missing
-    # user manager (rare in `pacman -R` context) doesn't fail the removal.
-    systemctl --user disable --now telora-daemon.socket >/dev/null 2>&1 || true
-    systemctl --user disable --now telora.service       >/dev/null 2>&1 || true
-    systemctl --user disable --now telora-daemon.service >/dev/null 2>&1 || true
+    echo ":: Before removing Telora, each user should run in their session:"
+    echo "::     systemctl --user disable --now telora-daemon.socket telora.service telora-daemon.service"
 }
