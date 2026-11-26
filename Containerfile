@@ -172,7 +172,7 @@ RUN cargo clippy --release --workspace --locked -- -D warnings \
 # AVX-512, so host-tuned ggml code would pass every CI step and then
 # die with SIGILL on users' CPUs. The empty-list guard keeps a renamed
 # build directory from turning this into a silent pass.
-RUN libs=$(find target/release/build -path '*/whisper-rs-sys-*/out/*' -name 'libggml*.a') \
+RUN libs=$(find target/release/build -path '*/whisper-rs-sys*/out/lib/*' -name 'libggml*.a') \
  && [ -n "$libs" ] \
  && sh scripts/check-no-avx512 $libs
 
