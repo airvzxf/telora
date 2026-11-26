@@ -36,7 +36,7 @@ Asigna estos comandos a atajos de teclado:
 
 ```bash
 telora toggle-copy   # empezar/terminar de grabar; el texto queda en el portapapeles
-telora cancel        # descartar la grabación en curso
+telora cancel        # descartar el dictado en curso (grabando o transcribiendo)
 telora last          # volver a copiar la última transcripción
 telora-daemon status # estado del daemon y modelo cargado
 ```
@@ -63,7 +63,6 @@ Están en proceso de corrección; ver los issues abiertos.
 
 - Después de reiniciar el equipo, el daemon puede quedar inalcanzable hasta ejecutar `systemctl --user restart telora-daemon.socket telora-daemon.service telora.service`.
 - Si el daemon no está disponible, el OSD muestra "GRABANDO" de todos modos y falla en silencio.
-- Mientras transcribe, el daemon no responde a `status` ni a `cancel`.
 - Qwen3-ASR con CUDA requiere una GPU sm_70 o superior; en GPUs más antiguas corre en CPU.
 
 ## Licencia

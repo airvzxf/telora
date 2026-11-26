@@ -111,7 +111,7 @@ impl Session {
                 self.phase = Phase::Idle;
                 self.error(&format!("✘ {reason}"))
             }
-            (Phase::Starting | Phase::Recording, Event::Cancel) => {
+            (Phase::Starting | Phase::Recording | Phase::Processing, Event::Cancel) => {
                 self.phase = Phase::Idle;
                 let mut effects = vec![Effect::SendCancel];
                 effects.extend(self.show("Cancelado", COLOR_NEUTRAL));
@@ -154,7 +154,7 @@ impl Session {
                 vec![Effect::HideOsd, Effect::Tray(tray)]
             }
             // Everything else (double toggles while busy, duplicate
-            // AUTO_STOP, late results) is ignored on purpose.
+            // AUTO_STOP, the STOP reply after a cancel) is ignored on purpose.
             _ => Vec::new(),
         }
     }

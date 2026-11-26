@@ -160,11 +160,7 @@ impl ksni::Tray for TeloraTray {
         };
         vec![
             item("Grabar / detener", "media-record", TrayCommand::Toggle),
-            item(
-                "Cancelar grabación",
-                "process-stop",
-                TrayCommand::MenuCancel,
-            ),
+            item("Cancelar dictado", "process-stop", TrayCommand::MenuCancel),
             MenuItem::Separator,
             item(
                 "Copiar última transcripción",

@@ -17,7 +17,7 @@ enum Commands {
     /// Start recording, or stop it and copy the transcription to the clipboard
     #[command(alias = "toggle")]
     ToggleCopy,
-    /// Cancel the current recording
+    /// Cancel the current dictation: the recording or its transcription
     Cancel,
     /// Copy the last transcription to the clipboard again
     Last,
