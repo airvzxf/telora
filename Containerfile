@@ -168,6 +168,14 @@ RUN touch telora-common/src/lib.rs \
 RUN cargo clippy --release --workspace --locked -- -D warnings \
  && cargo build --release --workspace --locked
 
+# The binaries must run on any AVX2 CPU, and this build host has
+# AVX-512, so host-tuned ggml code would pass every CI step and then
+# die with SIGILL on users' CPUs. The empty-list guard keeps a renamed
+# build directory from turning this into a silent pass.
+RUN libs=$(find target/release/build -path '*/whisper-rs-sys-*/out/*' -name 'libggml*.a') \
+ && [ -n "$libs" ] \
+ && sh scripts/check-no-avx512 $libs
+
 # ─── Stage 3: runtime ─────────────────────────────────────────────
 # Re-declare CUDA_VERSION/CUDA_FLAVOR: ARG scope is per-stage, so a
 # build-arg forwarded to the chef stage does not reach this FROM.
