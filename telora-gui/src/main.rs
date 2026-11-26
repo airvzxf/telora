@@ -535,6 +535,64 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// STOP stays open for the whole transcription; a CANCEL sent meanwhile
+    /// must reach the daemon then, not after STOP returns.
+    #[tokio::test]
+    async fn cancel_reaches_the_daemon_while_stop_is_waiting() {
+        use super::{AppAction, DaemonCommand, handle_daemon_commands, session::Event};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use telora_common::paths::ResolvedPaths;
+        use telora_common::protocol;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let daemon = tokio::spawn(async move {
+            let (mut stop, _) = listener.accept().await.unwrap();
+            let request = protocol::read_message(&mut stop).await.unwrap();
+            assert_eq!(protocol::decode_request(&request).unwrap(), "stop");
+            let (mut cancel, _) = listener.accept().await.unwrap();
+            let request = protocol::read_message(&mut cancel).await.unwrap();
+            assert_eq!(protocol::decode_request(&request).unwrap(), "cancel");
+            cancel
+                .write_all(&protocol::encode_reply(&Ok(Default::default())))
+                .await
+                .unwrap();
+            let cancelled = Err(Error::new(ErrorCode::Cancelled, "transcripción cancelada"));
+            stop.write_all(&protocol::encode_reply(&cancelled))
+                .await
+                .unwrap();
+        });
+
+        let paths = Arc::new(ResolvedPaths {
+            socket_dir: dir.path().to_path_buf(),
+            daemon_sock: sock.clone(),
+            control_sock: dir.path().join("control.sock"),
+        });
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(handle_daemon_commands(cmd_rx, paths));
+        let (response_tx, response_rx) = async_channel::unbounded();
+        cmd_tx.send(DaemonCommand::Stop { response_tx }).unwrap();
+        cmd_tx.send(DaemonCommand::Cancel).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("CANCEL never reached the daemon while STOP was open")
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), response_rx.recv())
+            .await
+            .expect("STOP never answered")
+            .unwrap();
+        assert!(
+            matches!(reply, AppAction::Event(Event::Finished { .. })),
+            "{reply:?}"
+        );
+        worker.abort();
+    }
+
     #[test]
     fn status_summary_names_model_and_engine_state() {
         let reply = fields(

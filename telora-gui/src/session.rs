@@ -331,6 +331,36 @@ mod tests {
         assert_eq!(s.phase(), Phase::Idle);
     }
 
+    /// A long dictation can take minutes to transcribe; cancel must still
+    /// reach the daemon, and its late STOP reply must not show an error.
+    #[test]
+    fn cancel_while_processing_tells_daemon_and_ignores_the_late_result() {
+        let mut s = Session::default();
+        s.handle(toggle());
+        s.handle(Event::StartAccepted);
+        s.handle(toggle());
+        assert_eq!(s.phase(), Phase::Processing);
+
+        let effects = s.handle(Event::Cancel);
+        assert!(effects.contains(&Effect::SendCancel));
+        assert!(shows_text(&effects, "Cancelado"));
+        assert!(effects.contains(&Effect::Tray(TrayState::Idle)));
+        assert_eq!(s.phase(), Phase::Idle);
+        let generation = hide_generation(&effects);
+
+        let late = s.handle(Event::Finished {
+            message: "✘ transcripción cancelada".into(),
+            color: COLOR_ERROR.into(),
+            hold_secs: ERROR_HOLD_SECS,
+            error: true,
+        });
+        assert!(late.is_empty(), "late STOP reply changed the UI: {late:?}");
+        assert_eq!(
+            s.handle(Event::HideOsd { generation }),
+            vec![Effect::HideOsd, Effect::Tray(TrayState::Idle)]
+        );
+    }
+
     #[test]
     fn auto_stop_stops_with_limit_message() {
         let mut s = Session::default();
