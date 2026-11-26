@@ -138,6 +138,11 @@ ARG CMAKE_CUDA_ARCHITECTURES=61
 # in `.github/workflows/release.yml:281`.
 ENV CUDA_COMPUTE_CAP=80
 
+# ggml defaults to GGML_NATIVE=ON, which tunes it to the build host's
+# CPU. OFF is ggml's portable profile: SSE4.2/AVX/AVX2/BMI2/FMA/F16C,
+# no AVX-512 or AMX. whisper-rs-sys forwards GGML_* env vars to CMake.
+ENV GGML_NATIVE=OFF
+
 WORKDIR /app
 
 # Cook layer: compiles ONLY the dependency graph needed for the four
