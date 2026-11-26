@@ -111,7 +111,7 @@ impl Session {
                 self.phase = Phase::Idle;
                 self.error(&format!("✘ {reason}"))
             }
-            (Phase::Starting | Phase::Recording, Event::Cancel) => {
+            (Phase::Starting | Phase::Recording | Phase::Processing, Event::Cancel) => {
                 self.phase = Phase::Idle;
                 let mut effects = vec![Effect::SendCancel];
                 effects.extend(self.show("Cancelado", COLOR_NEUTRAL));
@@ -154,7 +154,7 @@ impl Session {
                 vec![Effect::HideOsd, Effect::Tray(tray)]
             }
             // Everything else (double toggles while busy, duplicate
-            // AUTO_STOP, late results) is ignored on purpose.
+            // AUTO_STOP, the STOP reply after a cancel) is ignored on purpose.
             _ => Vec::new(),
         }
     }
@@ -329,6 +329,36 @@ mod tests {
         assert!(effects.contains(&Effect::SendCancel));
         assert_eq!(s.handle(Event::StartAccepted), vec![Effect::SendCancel]);
         assert_eq!(s.phase(), Phase::Idle);
+    }
+
+    /// A long dictation can take minutes to transcribe; cancel must still
+    /// reach the daemon, and its late STOP reply must not show an error.
+    #[test]
+    fn cancel_while_processing_tells_daemon_and_ignores_the_late_result() {
+        let mut s = Session::default();
+        s.handle(toggle());
+        s.handle(Event::StartAccepted);
+        s.handle(toggle());
+        assert_eq!(s.phase(), Phase::Processing);
+
+        let effects = s.handle(Event::Cancel);
+        assert!(effects.contains(&Effect::SendCancel));
+        assert!(shows_text(&effects, "Cancelado"));
+        assert!(effects.contains(&Effect::Tray(TrayState::Idle)));
+        assert_eq!(s.phase(), Phase::Idle);
+        let generation = hide_generation(&effects);
+
+        let late = s.handle(Event::Finished {
+            message: "✘ transcripción cancelada".into(),
+            color: COLOR_ERROR.into(),
+            hold_secs: ERROR_HOLD_SECS,
+            error: true,
+        });
+        assert!(late.is_empty(), "late STOP reply changed the UI: {late:?}");
+        assert_eq!(
+            s.handle(Event::HideOsd { generation }),
+            vec![Effect::HideOsd, Effect::Tray(TrayState::Idle)]
+        );
     }
 
     #[test]

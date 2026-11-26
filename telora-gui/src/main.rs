@@ -3,7 +3,8 @@ use gtk4::prelude::*;
 use gtk4::{Application, glib};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -345,7 +346,11 @@ async fn handle_daemon_commands(
     let daemon_sock: PathBuf = resolved_paths.daemon_sock.clone();
     // Safety net: the last delivered text can be copied again from the tray
     // or with `telora last` if the clipboard was overwritten meanwhile.
-    let mut last_text: Option<String> = None;
+    let last_text: Arc<Mutex<Option<String>>> = Arc::default();
+    // Bumped by every CANCEL. A STOP that started before the bump drops its
+    // result, even when the daemon finished the transcription just before
+    // the CANCEL reached it.
+    let cancels = Arc::new(AtomicU64::new(0));
     while let Some(cmd) = rx.recv().await {
         match cmd {
             DaemonCommand::Start { response_tx } => {
@@ -363,11 +368,23 @@ async fn handle_daemon_commands(
                 let _ = response_tx.send(AppAction::Event(event)).await;
             }
             DaemonCommand::Stop { response_tx } => {
-                let event = stop_and_deliver(&daemon_sock, &mut last_text).await;
-                let _ = response_tx.send(AppAction::Event(event)).await;
+                // STOP stays open for the whole transcription, so it runs on
+                // its own task and a CANCEL can reach the daemon meanwhile.
+                let epoch = cancels.load(Ordering::SeqCst);
+                let daemon_sock = daemon_sock.clone();
+                let last_text = Arc::clone(&last_text);
+                let cancels = Arc::clone(&cancels);
+                tokio::spawn(async move {
+                    let event = stop_and_deliver(&daemon_sock, &last_text, || {
+                        cancels.load(Ordering::SeqCst) != epoch
+                    })
+                    .await;
+                    let _ = response_tx.send(AppAction::Event(event)).await;
+                });
             }
             DaemonCommand::CopyLast { response_tx } => {
-                let message = match &last_text {
+                let last = last_text.lock().unwrap().clone();
+                let message = match &last {
                     None => "No hay transcripción previa".to_string(),
                     Some(text) => match clipboard::copy(text) {
                         Ok(()) => "Última transcripción copiada".to_string(),
@@ -378,11 +395,14 @@ async fn handle_daemon_commands(
                     .send(AppAction::Event(Event::Info(message)))
                     .await;
             }
-            DaemonCommand::Cancel => match protocol::call(&daemon_sock, "cancel").await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => log::error!("Daemon refused CANCEL: {e}"),
-                Err(e) => log::error!("Failed to send CANCEL: {e:#}"),
-            },
+            DaemonCommand::Cancel => {
+                cancels.fetch_add(1, Ordering::SeqCst);
+                match protocol::call(&daemon_sock, "cancel").await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => log::error!("Daemon refused CANCEL: {e}"),
+                    Err(e) => log::error!("Failed to send CANCEL: {e:#}"),
+                }
+            }
             DaemonCommand::Status { response_tx } => {
                 let text = match protocol::call(&daemon_sock, "status").await {
                     Ok(reply) => describe_status(reply),
@@ -397,10 +417,25 @@ async fn handle_daemon_commands(
     }
 }
 
-/// Run STOP and put the text on the clipboard; the returned event says
-/// what the user should see.
-async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) -> Event {
-    let raw_text = match protocol::call(daemon_sock, "stop").await {
+/// Run STOP and put the text on the clipboard unless `cancelled()` says the
+/// user cancelled meanwhile; the returned event says what the user should see.
+async fn stop_and_deliver(
+    daemon_sock: &Path,
+    last_text: &Mutex<Option<String>>,
+    cancelled: impl Fn() -> bool,
+) -> Event {
+    let reply = protocol::call(daemon_sock, "stop").await;
+    let cancelled_by_daemon = matches!(&reply, Ok(Err(e)) if e.code == ErrorCode::Cancelled);
+    if cancelled() || cancelled_by_daemon {
+        info!("Transcription cancelled; nothing is copied");
+        return Event::Finished {
+            message: "Cancelado".to_string(),
+            color: session::COLOR_NEUTRAL.to_string(),
+            hold_secs: 1,
+            error: false,
+        };
+    }
+    let raw_text = match reply {
         Ok(reply) => match transcription(reply) {
             Ok(Transcript::Text(text)) => text,
             Ok(Transcript::NoSpeech) => {
@@ -430,7 +465,7 @@ async fn stop_and_deliver(daemon_sock: &Path, last_text: &mut Option<String>) ->
         };
     }
     let cleaned = text::clean_transcription(&raw_text);
-    *last_text = Some(cleaned.clone());
+    *last_text.lock().unwrap() = Some(cleaned.clone());
     match clipboard::copy(&cleaned) {
         Ok(()) => Event::Finished {
             message: "Copiado".to_string(),
@@ -528,11 +563,103 @@ fn control_action(cmd: &str) -> Result<AppAction, protocol::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_status, transcription};
-    use telora_common::protocol::{Error, ErrorCode, Transcript};
+    use super::{AppAction, describe_status, session::Event, transcription};
+    use std::sync::Arc;
+    use telora_common::protocol::{self, Error, ErrorCode, Reply, Transcript};
 
     fn fields(json: &str) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// A daemon that holds STOP open until a CANCEL arrives, then answers
+    /// STOP with `stop_reply`, like a long transcription being cancelled.
+    async fn cancel_during_stop(stop_reply: Reply) -> (AppAction, String) {
+        use super::{DaemonCommand, handle_daemon_commands};
+        use std::time::Duration;
+        use telora_common::paths::ResolvedPaths;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (stop_seen_tx, stop_seen_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            let (mut stop, _) = listener.accept().await.unwrap();
+            let request = protocol::read_message(&mut stop).await.unwrap();
+            assert_eq!(protocol::decode_request(&request).unwrap(), "stop");
+            stop_seen_tx.send(()).unwrap();
+            let (mut cancel, _) = listener.accept().await.unwrap();
+            let request = protocol::read_message(&mut cancel).await.unwrap();
+            assert_eq!(protocol::decode_request(&request).unwrap(), "cancel");
+            cancel
+                .write_all(&protocol::encode_reply(&Ok(Default::default())))
+                .await
+                .unwrap();
+            stop.write_all(&protocol::encode_reply(&stop_reply))
+                .await
+                .unwrap();
+        });
+
+        let paths = Arc::new(ResolvedPaths {
+            socket_dir: dir.path().to_path_buf(),
+            daemon_sock: sock.clone(),
+            control_sock: dir.path().join("control.sock"),
+        });
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(handle_daemon_commands(cmd_rx, paths));
+        let (response_tx, response_rx) = async_channel::unbounded();
+        cmd_tx
+            .send(DaemonCommand::Stop {
+                response_tx: response_tx.clone(),
+            })
+            .unwrap();
+        stop_seen_rx.await.unwrap();
+        cmd_tx.send(DaemonCommand::Cancel).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("CANCEL never reached the daemon while STOP was open")
+            .unwrap();
+        let wait = Duration::from_secs(5);
+        let stop_event = tokio::time::timeout(wait, response_rx.recv())
+            .await
+            .expect("STOP never answered")
+            .unwrap();
+        cmd_tx
+            .send(DaemonCommand::CopyLast { response_tx })
+            .unwrap();
+        let last = match tokio::time::timeout(wait, response_rx.recv()).await {
+            Ok(Ok(AppAction::Event(Event::Info(text)))) => text,
+            other => panic!("unexpected CopyLast answer: {other:?}"),
+        };
+        worker.abort();
+        (stop_event, last)
+    }
+
+    fn is_quiet_cancel(action: &AppAction) -> bool {
+        matches!(
+            action,
+            AppAction::Event(Event::Finished { message, error: false, .. }) if message == "Cancelado"
+        )
+    }
+
+    #[tokio::test]
+    async fn cancel_reaches_the_daemon_while_stop_is_waiting() {
+        let cancelled = Err(Error::new(ErrorCode::Cancelled, "transcripción cancelada"));
+        let (stop_event, last) = cancel_during_stop(cancelled).await;
+        assert!(is_quiet_cancel(&stop_event), "{stop_event:?}");
+        assert_eq!(last, "No hay transcripción previa");
+    }
+
+    /// The daemon may finish the transcription just before the CANCEL
+    /// reaches it; the user still asked to discard that text.
+    #[tokio::test]
+    async fn text_that_arrives_after_a_cancel_is_not_kept() {
+        let text = Ok(fields(r#"{"text":"hola"}"#));
+        let (stop_event, last) = cancel_during_stop(text).await;
+        assert!(is_quiet_cancel(&stop_event), "{stop_event:?}");
+        assert_eq!(last, "No hay transcripción previa");
     }
 
     #[test]
