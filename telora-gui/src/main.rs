@@ -1,12 +1,10 @@
 use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{Application, glib};
-use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -29,44 +27,17 @@ use telora_common::protocol::{self, ErrorCode, Reply, Transcript};
 use tray::{TrayCommand, TrayHandle, TrayState};
 use ui::Osd;
 
-fn wait_for_wayland_display(max_wait_secs: u64) -> Result<(), String> {
-    let xdg_runtime_dir =
-        std::env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR is not set".to_string())?;
-
-    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
-
-    let socket_path = Path::new(&xdg_runtime_dir).join(&display);
-
-    let start = Instant::now();
-    let mut attempt: u32 = 0;
-
-    loop {
-        if let Ok(meta) = std::fs::metadata(&socket_path)
-            && meta.file_type().is_socket()
-        {
-            info!("Wayland display ready at {}", socket_path.display());
-            return Ok(());
-        }
-
-        let elapsed = start.elapsed().as_secs();
-        if elapsed >= max_wait_secs {
-            return Err(format!(
-                "Wayland display {} not available after {}s",
-                socket_path.display(),
-                elapsed
-            ));
-        }
-
-        attempt += 1;
-        let delay = (1u64 << attempt).min(10); // 1, 2, 4, 8, 10, 10, ...
-        let remaining = max_wait_secs.saturating_sub(elapsed);
-        let wait = delay.min(remaining);
-
-        info!(
-            "Waiting for Wayland compositor (attempt {})... retrying in {}s",
-            attempt, wait
-        );
-        thread::sleep(Duration::from_secs(wait));
+/// The Wayland display this GUI must use. systemd starts the GUI only inside
+/// the graphical session, whose compositor exports `WAYLAND_DISPLAY`; without
+/// it there is no display to guess, since the socket name varies by setup.
+fn wayland_display(value: Option<String>) -> Result<String, String> {
+    match value {
+        Some(display) if !display.trim().is_empty() => Ok(display),
+        _ => Err(
+            "WAYLAND_DISPLAY is not set; start telora-gui inside a Wayland session \
+                  (telora.service runs only with graphical-session.target)"
+                .to_string(),
+        ),
     }
 }
 
@@ -117,7 +88,7 @@ fn main() {
              Daemon (connect):  {daemon_sock}\n\
              \n\
              ENVIRONMENT:\n\
-             WAYLAND_DISPLAY     Wayland socket name (default: wayland-0)\n\
+             WAYLAND_DISPLAY     Wayland display to use (required)\n\
              XDG_RUNTIME_DIR     Runtime directory for Wayland socket\n\
              GSK_RENDERER        GTK render backend (set to \"gl\" by systemd service)\n\
              RUST_LOG            Log filter (default: info)\n\
@@ -133,9 +104,12 @@ fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    if let Err(e) = wait_for_wayland_display(60) {
-        log::error!("{}", e);
-        std::process::exit(1);
+    match wayland_display(std::env::var("WAYLAND_DISPLAY").ok()) {
+        Ok(display) => info!("Using Wayland display {display}"),
+        Err(e) => {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
     }
 
     let resolved_paths = match telora_common::config::resolve_paths() {
@@ -660,6 +634,19 @@ mod tests {
         let (stop_event, last) = cancel_during_stop(text).await;
         assert!(is_quiet_cancel(&stop_event), "{stop_event:?}");
         assert_eq!(last, "No hay transcripción previa");
+    }
+
+    /// The socket name varies (KWin on the reference host listens on
+    /// `wayland-1`), so it must come from the session, never a default.
+    #[test]
+    fn the_wayland_display_is_never_guessed() {
+        use super::wayland_display;
+        assert!(wayland_display(None).is_err());
+        assert!(wayland_display(Some(String::new())).is_err());
+        assert_eq!(
+            wayland_display(Some("wayland-1".into())).unwrap(),
+            "wayland-1"
+        );
     }
 
     #[test]
