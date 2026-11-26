@@ -138,6 +138,11 @@ ARG CMAKE_CUDA_ARCHITECTURES=61
 # in `.github/workflows/release.yml:281`.
 ENV CUDA_COMPUTE_CAP=80
 
+# ggml defaults to GGML_NATIVE=ON, which tunes it to the build host's
+# CPU. OFF is ggml's portable profile: SSE4.2/AVX/AVX2/BMI2/FMA/F16C,
+# no AVX-512 or AMX. whisper-rs-sys forwards GGML_* env vars to CMake.
+ENV GGML_NATIVE=OFF
+
 WORKDIR /app
 
 # Cook layer: compiles ONLY the dependency graph needed for the four
@@ -167,6 +172,14 @@ RUN touch telora-common/src/lib.rs \
 # also passes `make lint` locally.
 RUN cargo clippy --release --workspace --locked -- -D warnings \
  && cargo build --release --workspace --locked
+
+# The binaries must run on any AVX2 CPU, and this build host has
+# AVX-512, so host-tuned ggml code would pass every CI step and then
+# die with SIGILL on users' CPUs. The empty-list guard keeps a renamed
+# build directory from turning this into a silent pass.
+RUN libs=$(find target/release/build -path '*/whisper-rs-sys*/out/lib/*' -name 'libggml*.a') \
+ && [ -n "$libs" ] \
+ && sh scripts/check-no-avx512 $libs
 
 # ─── Stage 3: runtime ─────────────────────────────────────────────
 # Re-declare CUDA_VERSION/CUDA_FLAVOR: ARG scope is per-stage, so a
