@@ -1,5 +1,10 @@
 [Unit]
 Description=Telora Assistant UI
+# The GUI needs the compositor, which exists only inside the graphical
+# session: refuse to start outside it (even if an old enablement pulls the
+# unit from default.target) and stop together with it at logout.
+Requisite=graphical-session.target
+PartOf=graphical-session.target
 After=graphical-session.target telora-daemon.socket
 # The GUI consumes the socket activation FDs that `telora-daemon.socket`
 # hands to `telora-daemon.service`. Depending on the socket unit (and not
