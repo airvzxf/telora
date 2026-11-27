@@ -90,7 +90,6 @@ fn main() {
              ENVIRONMENT:\n\
              WAYLAND_DISPLAY     Wayland display to use (required)\n\
              XDG_RUNTIME_DIR     Runtime directory for Wayland socket\n\
-             GSK_RENDERER        GTK render backend (set to \"gl\" by systemd service)\n\
              RUST_LOG            Log filter (default: info)\n\
              \n\
              SEE ALSO:\n\

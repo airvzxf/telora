@@ -16,10 +16,6 @@ RequiresMountsFor=%t/telora
 
 [Service]
 Type=simple
-# The GSK_RENDERER solves the error:
-#   vkQueuePresentKHR(): A swapchain no longer matches the surface properties exactly,
-#   but can still be used to present to the surface successfully. (VK_SUBOPTIMAL_KHR) (1000001003)
-Environment=GSK_RENDERER=gl
 Environment=TELORA_DAEMON_SOCKET=%t/telora/daemon.sock
 Environment=TELORA_CONTROL_SOCKET=%t/telora/control.sock
 # No RuntimeDirectory= here: systemd deletes a service's RuntimeDirectory
